@@ -535,6 +535,7 @@ struct ShaderRegisters {
 
 	DepthShaderControl db_shader_control;
 	bool               alpha_to_mask_enable = false;
+	bool primitive_id_enable = false;
 
 	// DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE overrides DB_ALPHA_TO_MASK per shader.
 	[[nodiscard]] bool AlphaToMask() const {
@@ -809,6 +810,7 @@ public:
 	void SetMaxOutputPerSubgroup(uint32_t value) { m_sh_regs.m_geMaxOutputPerSubgroup = value; }
 	void SetGsMaxVertOut(uint32_t value) { m_sh_regs.m_vgtGsMaxVertOut = value; }
 	void SetGsOutPrimType(uint32_t value) { m_sh_regs.m_vgtGsOutPrimType = value; }
+	void SetPrimitiveIdEnable(bool enable) { m_sh_regs.primitive_id_enable = enable; }
 	void SetDrawPayloadControl(uint32_t value) { m_sh_regs.m_vgtDrawPayloadCntl = value; }
 	void SetObjprimIdControl(uint32_t value) { m_sh_regs.m_paClObjprimIdCntl = value; }
 	void SetLsHsConfig(uint32_t value) { m_sh_regs.m_vgtLsHsConfig = value; }

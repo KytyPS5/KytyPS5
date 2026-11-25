@@ -2139,7 +2139,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization,
-      {.begin = static_cast<u32>(pixel_info.object_primitive_id)});
+      ShaderRecompiler::IR::PushData::GraphicsWindow(false, pixel_info.object_primitive_id));
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -22622,7 +22622,8 @@ public:
               EncodeVop2(0x16, 11, InlineU32(18), 0), EncodeVop2(0x1a, 11, InlineU32(10), 11),
               EncodeVop2(0x1c, 10, Vgpr(11), 10), EncodeVop2(0x16, 11, InlineU32(2), 1),
               EncodeVop2(0x1a, 11, InlineU32(20), 11), EncodeVop2(0x1c, 10, Vgpr(11), 10),
-              EncodeExp0(0x14, 0x1, false), EncodeExp1(10, 0, 0, 0),
+              EncodeVop2(0x25, 12, InlineU32(37), 2),
+              EncodeExp0(0x14, 0x3, false), EncodeExp1(10, 12, 0, 0),
               EncodeVop2(0x25, 5, 8, 5), EncodeVop2(0x25, 8, 9, 8)};
           AppendVMovLiteral(&code, 1, 0xbf800000u);
           AppendVMovLiteral(&code, 2, 0x40400000u);
@@ -22718,7 +22719,28 @@ public:
         // The patched SGPRs replace user data 0/0 with the records' bases.
         shaders.SetGsUserSgpr(0, 0);
         shaders.SetGsUserSgpr(1, 0);
+        auto gs_resources = shaders.GetVs().gs_regs.rsrc1;
+        gs_resources.gs_vgpr_component_count = 2;
+        shaders.SetGsShaderResource1(gs_resources);
+        registers.SetPrimitiveIdEnable(true);
+        registers.SetColorBase(7, {.addr = depth_address + 0x2c000});
+        registers.SetColorInfo(7, {.format = Prospero::ChannelLayout::k32,
+                                   .channel_type = Prospero::ChannelType::kUInt});
+        registers.SetColorAttrib2(7, registers.GetRenderTarget(3).attrib2);
+        registers.SetColorAttrib3(7, registers.GetRenderTarget(3).attrib3);
+        registers.SetRenderTargetMask(0xf000f000);
+        registers.SetDrawPayloadControl(9);
+        registers.SetObjprimIdControl(2);
+        user_config.SetObjectId(0x1ffff);
         check("indexed subgroups", true, 0, 2, {0, 1});
+        RenderColorInfo ids{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), ids, 7);
+        const auto id_pixels = ReadCachedTexel(name, context, ids.image_id, {}, {extent, extent, 1});
+        Require("GpuMeshIndirectDraw", "register and exported primitive ID",
+                std::ranges::all_of(id_pixels, [](u32 id) { return id == 0x1ffff + 37 + 2; }),
+                "RT7 did not add the register object ID to the mesh primitive payload");
+        registers.SetDrawPayloadControl(0);
+        registers.SetRenderTargetMask(0xf000);
         check("first index and instances", true, 2, 1, {0, 1});
         check("auto subgroups", false, 4, 2, {0, 1});
         // Index reads stop at INDEX_BUFFER_SIZE: two of the record's three indices remain.
@@ -23277,7 +23299,7 @@ public:
       if (push_constant_range.size != 0) {
         ShaderRecompiler::IR::PushData push_data;
         if (object_id) {
-          push_data.dwords[0] = test.object_ids[draw];
+          push_data.dwords[ShaderRecompiler::IR::PushData::ObjectIdDword] = test.object_ids[draw];
         }
         if (fragment_bind.UsesPushData()) {
           std::copy(test.push_constants.begin(), test.push_constants.end(),

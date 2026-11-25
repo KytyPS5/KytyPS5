@@ -10514,13 +10514,13 @@ void TestAutomaticObjectPrimitiveId() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.input_info.pixel = &pixel;
   options.user_data = user_data;
-  const auto prefix = PushData::GraphicsDrawDwords(false, true);
-  Check(prefix == 1 && PushData::GraphicsDrawDwords(false, false) == 0 &&
-            PushData::GraphicsDrawDwords(true, false) == PushData::MeshDrawDwordCount,
-        "graphics draw data reserved an incorrect prefix");
-  for (const uint32_t start : {prefix, PushData::DwordCount}) {
-    const auto result = RecompileForTest(shader, options, {.begin = start});
-    Check(result.program.bindings.UsesPushData() == (start == prefix),
+  const auto window = PushData::GraphicsWindow(false, true);
+  Check(window.begin == 0 && window.end == PushData::ObjectIdDword &&
+            PushData::GraphicsWindow(true, true).begin == PushData::MeshDrawDwordCount,
+        "object ID and mesh draw parameters need separate push constants");
+  for (const uint32_t start : {window.begin, window.end}) {
+    const auto result = RecompileForTest(shader, options, {.begin = start, .end = window.end});
+    Check(result.program.bindings.UsesPushData() == (start == window.begin),
           "object ID changed shader-data push/spill selection");
     Check(std::ranges::any_of(result.program.info.outputs, [](const StageOutput& output) {
             return output.kind == StageOutputKind::Mrt && output.location == 0;
@@ -10536,7 +10536,7 @@ void TestAutomaticObjectPrimitiveId() {
   }
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   pixel.target_shader_mask = 0xf0000000u;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options, {.begin = prefix}); },
+  ExpectFatal([&] { (void)RecompileForTest(shader, options, window); },
               "automatic RT7 silently overlapped an explicit MRT7 export");
 #endif
 }

@@ -1791,7 +1791,6 @@ static constexpr auto MakeContextIndirectTable() {
 	                             Pm4::VGT_HOS_MAX_TESS_LEVEL,
 	                             Pm4::VGT_HOS_MIN_TESS_LEVEL,
 	                             Pm4::VGT_ESGS_RING_ITEMSIZE,
-	                             Pm4::VGT_PRIMITIVEID_EN,
 	                             Pm4::VGT_REUSE_OFF,
 	                             Pm4::VGT_TESS_DISTRIBUTION,
 	                             Pm4::VGT_PRIMITIVEID_RESET,
@@ -1828,6 +1827,7 @@ static constexpr auto MakeContextIndirectTable() {
 		cp.GetCtx().SetGsOutPrimType(value);
 	};
 	table[Pm4::VGT_TF_PARAM]          = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetTfParam(value); };
+	table[Pm4::VGT_PRIMITIVEID_EN] = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetPrimitiveIdEnable(value & 1u); };
 	table[Pm4::VGT_DRAW_PAYLOAD_CNTL] = [](KYTY_HW_REG_ARGS) {
 		cp.GetCtx().SetDrawPayloadControl(value);
 	};

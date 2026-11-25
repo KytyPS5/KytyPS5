@@ -1298,10 +1298,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
 					first = u32(0);
 					input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
-				} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
-					const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
-					first = entry_ir.IAdd(first, parity);
-					second = entry_ir.ISub(second, parity);
+				}
+				const bool strip = mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip);
+				if (strip || mesh.input_primitive_id) {
+					const auto primitive_id = entry_ir.IAdd(primitive_chunk, local);
+					if (strip) {
+						const auto parity = entry_ir.BitwiseAnd(primitive_id, u32(1));
+						first = entry_ir.IAdd(first, parity);
+						second = entry_ir.ISub(second, parity);
+					}
+					if (mesh.input_primitive_id) {
+						entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2), primitive_id);
+					}
 				}
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
 				                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),

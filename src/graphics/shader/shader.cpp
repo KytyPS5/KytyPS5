@@ -459,7 +459,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.output_primitive_size, mesh.primitives_per_group,
 		                       mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
-		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch)});
+		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch),
+		                       static_cast<uint32_t>(mesh.input_primitive_id),
+		                       static_cast<uint32_t>(mesh.output_primitive_id)});
 	}
 	// Each tessellation stage keys only the layout fields its module depends on.
 	const auto& tess = info.tess;
@@ -579,6 +581,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());
+	mesh.input_primitive_id  = sh.primitive_id_enable && regs.gs_regs.rsrc1.gs_vgpr_component_count >= 2;
 	mesh.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 	mesh.max_vertices        = sh.m_geMaxOutputPerSubgroup;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;

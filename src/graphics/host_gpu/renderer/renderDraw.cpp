@@ -1158,24 +1158,25 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 	using ShaderRecompiler::IR::PushData;
-	const auto draw_dwords =
-	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
-	if (draw_dwords != 0) {
+	if (mesh_active) {
 		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
 		if (mesh_task) {
 			draw_data[0] = static_cast<uint32_t>(task_params);
 			draw_data[1] = static_cast<uint32_t>(task_params >> 32u);
-		} else if (mesh_active) {
+		} else {
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
 			             index_source.guest_element_size,
 			             static_cast<uint32_t>(mesh_indices),
 			             static_cast<uint32_t>(mesh_indices >> 32u)};
-		} else {
-			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
-		                        draw_dwords * sizeof(uint32_t), draw_data.data());
+		                        sizeof(draw_data), draw_data.data());
+	}
+	if (state.ps_input_info.object_primitive_id) {
+		const auto object_id = buffer.GetUserConfig().GetObjectId();
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+		                        PushData::ObjectIdDword * sizeof(uint32_t), sizeof(object_id), &object_id);
 	}
 	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,

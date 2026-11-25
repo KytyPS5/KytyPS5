@@ -145,7 +145,8 @@ struct EmitterState {
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
 	uint32_t                   mesh_allocation                       = 0;
-	uint32_t                   mesh_primitive_data                   = 0;
+	std::array<uint32_t, 2>    mesh_primitive_data                   {};
+	uint32_t                   mesh_primitive_id                     = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
 	uint32_t                   mesh_payload                          = 0;
@@ -373,7 +374,7 @@ void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                            uint32_t cull_distance_count);
 void     EmitMeshEntryPoint(EmitterState& state);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
-uint32_t MeshPrimitivePointer(EmitterState& state);
+uint32_t MeshPrimitivePointer(EmitterState& state, uint32_t component);
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
 

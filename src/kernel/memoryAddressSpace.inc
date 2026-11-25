@@ -25,6 +25,139 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+// Ranges whose guest mapping is briefly absent while the emulator replaces it: a guest mmap with
+// MAP_FIXED over an existing mapping (unmapped, then mapped again), and, on Windows, the parts of a
+// file view that stay mapped when part of it is unmapped (Windows splits a view only by unmapping
+// all of it). On the console these replacements are atomic, so guest threads keep using the
+// memory: GTA V's streamer decompresses into buffers whose 64 KiB pages are mapped again or
+// neighbour an unmap. A fault inside such a range waits until the mapping is back and is retried
+// instead of being reported as an access violation.
+struct TransientUnmapWindow {
+	std::atomic<uint64_t> id {0};
+	std::atomic<uint64_t> start {0};
+	std::atomic<uint64_t> end {0};
+	std::atomic<int64_t>  closed_ns {0}; // 0 while the range is being remapped
+	std::atomic<bool>     owned {false}; // an open Scope holds this entry
+};
+
+class TransientUnmapWindows {
+public:
+	using Window = TransientUnmapWindow;
+
+	class Scope {
+	public:
+		Scope(uint64_t start, uint64_t end) noexcept: m_window(Open(start, end)) {}
+		~Scope() {
+			m_window->closed_ns.store(Now(), std::memory_order_release);
+			m_window->owned.store(false, std::memory_order_release);
+		}
+		KYTY_CLASS_NO_COPY(Scope);
+
+	private:
+		Window* m_window;
+	};
+
+	// The newest range being remapped recently that holds vaddr (0: none). Waits while it still
+	// is being remapped.
+	static uint64_t Wait(uint64_t vaddr) noexcept {
+		constexpr int64_t Second  = 1000000000;
+		uint64_t          matched = 0;
+		for (auto& window: s_windows) {
+			// The id names one opening of this entry (Open's seqlock). Read it with the range until
+			// both belong to the same opening: the entry may be reopening for a range that holds
+			// vaddr. id 0 on an owned entry means Open is writing it.
+			uint64_t id    = 0;
+			uint64_t start = 0;
+			uint64_t end   = 0;
+			for (;;) {
+				id    = window.id.load(std::memory_order_acquire);
+				start = window.start.load(std::memory_order_relaxed);
+				end   = window.end.load(std::memory_order_relaxed);
+				std::atomic_thread_fence(std::memory_order_acquire);
+				const bool stable = window.id.load(std::memory_order_relaxed) == id;
+				if (stable && (id != 0 || !window.owned.load(std::memory_order_acquire))) {
+					break;
+				}
+#if defined(_M_X64) || defined(__x86_64__)
+				_mm_pause();
+#endif
+			}
+			if (id == 0 || vaddr < start || vaddr >= end) {
+				continue;
+			}
+			const auto begin  = Now();
+			int64_t    closed = 0;
+			for (uint32_t spins = 0;; spins++) {
+				closed = window.closed_ns.load(std::memory_order_acquire);
+				if (closed != 0) {
+					break;
+				}
+				// Reuse needs the original Scope to have closed first.
+				if (window.id.load(std::memory_order_acquire) != id) {
+					closed = Now();
+					break;
+				}
+				if (Now() - begin > Second * 10) {
+					return 0; // never closed: report the fault
+				}
+				if (spins < 4096) {
+#if defined(_M_X64) || defined(__x86_64__)
+					_mm_pause();
+#endif
+				} else {
+					std::this_thread::yield();
+				}
+			}
+			// The fault may be handled after the mapping is already back.
+			if (Now() - closed < Second) {
+				matched = std::max(matched, id);
+			}
+		}
+		return matched;
+	}
+
+private:
+	// Claims an entry no open Scope holds, so an open range is never overwritten. Scopes only
+	// span one remap, so when every entry is open one frees up shortly.
+	static Window* Claim() noexcept {
+		for (;;) {
+			for (size_t i = 0; i < s_windows.size(); i++) {
+				auto& window =
+				    s_windows[s_next.fetch_add(1, std::memory_order_relaxed) % s_windows.size()];
+				bool expected = false;
+				if (window.owned.compare_exchange_strong(expected, true,
+				                                         std::memory_order_acquire)) {
+					return &window;
+				}
+			}
+			std::this_thread::yield();
+		}
+	}
+
+	static Window* Open(uint64_t start, uint64_t end) noexcept {
+		auto& window = *Claim();
+		// Seqlock: id 0 while the range changes, then the new id publishes the range.
+		window.id.store(0, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		window.closed_ns.store(0, std::memory_order_relaxed);
+		window.start.store(start, std::memory_order_relaxed);
+		window.end.store(end, std::memory_order_relaxed);
+		window.id.store(s_opened.fetch_add(1, std::memory_order_relaxed) + 1,
+		                std::memory_order_seq_cst);
+		return &window;
+	}
+
+	static int64_t Now() noexcept {
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(
+		           std::chrono::steady_clock::now().time_since_epoch())
+		    .count();
+	}
+
+	inline static std::array<Window, 64> s_windows {};
+	inline static std::atomic<uint32_t>  s_next {0};
+	inline static std::atomic<uint64_t>  s_opened {0};
+};
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -363,6 +496,16 @@ private:
 		QueryProtections(view.base, left_size, mode, &protections);
 		QueryProtections(right_addr, right_size, mode, &protections);
 
+		// The survivors are briefly unmapped too: their faults wait and are retried until they are
+		// back with their protections.
+		std::optional<TransientUnmapWindows::Scope> left_window;
+		std::optional<TransientUnmapWindows::Scope> right_window;
+		if (left_size != 0) {
+			left_window.emplace(view.base, vaddr);
+		}
+		if (right_size != 0) {
+			right_window.emplace(right_addr, right_addr + right_size);
+		}
 		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view.base), view.size));
 		ClearPages(vaddr, size);
 		EXIT_IF(left_size != 0 && !SplitPlaceholder(view.base, left_size));

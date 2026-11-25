@@ -314,9 +314,16 @@ jobs:
       - name: Install build dependencies
         shell: bash
         run: |
+          llvm_version=23
+          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/keyrings/llvm.asc > /dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-$llvm_version main" |
+            sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
-            clang \
+            "clang-$llvm_version" \
+            "lld-$llvm_version" \
+            "llvm-$llvm_version" \
             glslang-tools \
             libasound2-dev \
             libdbus-1-dev \
@@ -333,9 +340,9 @@ jobs:
             libxrandr-dev \
             libxss-dev \
             libxtst-dev \
-            lld \
             pkg-config \
             wayland-protocols
+          echo "/usr/lib/llvm-$llvm_version/bin" >> "$GITHUB_PATH"
 
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4

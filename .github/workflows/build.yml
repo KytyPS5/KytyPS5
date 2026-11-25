@@ -314,10 +314,16 @@ jobs:
       - name: Install build dependencies
         shell: bash
         run: |
+          llvm_version=23
+          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/keyrings/llvm.asc > /dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-$llvm_version main" |
+            sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
-            clang-19 \
-            llvm-19 \
+            "clang-$llvm_version" \
+            "lld-$llvm_version" \
+            "llvm-$llvm_version" \
             glslang-tools \
             libasound2-dev \
             libdbus-1-dev \
@@ -334,9 +340,9 @@ jobs:
             libxrandr-dev \
             libxss-dev \
             libxtst-dev \
-            lld-19 \
             pkg-config \
             wayland-protocols
+          echo "/usr/lib/llvm-$llvm_version/bin" >> "$GITHUB_PATH"
 
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
@@ -356,8 +362,8 @@ jobs:
           git --version
           cmake --version
           ninja --version
-          clang++-19 --version
-          ld.lld-19 --version
+          clang++ --version
+          ld.lld --version
           glslangValidator --version
           echo "Qt6_DIR=$Qt6_DIR"
 
@@ -372,8 +378,8 @@ jobs:
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DCMAKE_C_COMPILER=clang-19 \
-            -DCMAKE_CXX_COMPILER=clang++-19 \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log

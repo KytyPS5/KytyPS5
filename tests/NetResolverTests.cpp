@@ -98,17 +98,21 @@ TEST_F(NetResolverTest, NtoaStoresFirstAddress) {
   EXPECT_EQ(addr, 0x0100007fu);
 }
 
-TEST_F(NetResolverTest, SocketReuseAddressOption) {
-  const int s = Network::Net::Socket(2, 1, 6);
-  ASSERT_GE(s, 0);
-  const int enable = 1;
-  EXPECT_EQ(Network::Net::Setsockopt(s, 0xffff, 0x4, &enable, sizeof(enable)),
-            0);
-  int value = 0;
-  uint32_t length = sizeof(value);
-  EXPECT_EQ(Network::Net::Getsockopt(s, 0xffff, 0x4, &value, &length), 0);
-  EXPECT_NE(value, 0);
-  EXPECT_EQ(Network::Net::SocketClose(s), 0);
+TEST_F(NetResolverTest, BooleanSocketOptions) {
+  const auto check = [](int family, int level, int option) {
+    const int s = Network::Net::Socket(family, 1, 6);
+    ASSERT_GE(s, 0);
+    for (const int enabled : {1, 0}) {
+      EXPECT_EQ(Network::Net::Setsockopt(s, level, option, &enabled, sizeof(enabled)), 0);
+      int value = -1;
+      uint32_t length = sizeof(value);
+      EXPECT_EQ(Network::Net::Getsockopt(s, level, option, &value, &length), 0);
+      EXPECT_EQ(value != 0, enabled != 0);
+    }
+    EXPECT_EQ(Network::Net::SocketClose(s), 0);
+  };
+  check(2, 0xffff, 0x4); // SO_REUSEADDR
+  check(28, 41, 27);     // IPV6_V6ONLY
 }
 
 TEST_F(NetResolverTest, SslMemoryPoolStatsReportInitPoolSize) {

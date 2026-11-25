@@ -2398,7 +2398,10 @@ public:
     constexpr uint32_t width = 1024;
     constexpr uint32_t height = 2048;
     constexpr uint64_t image_size = uint64_t{width} * height * sizeof(uint32_t);
-    constexpr uint64_t size = image_size * 2;
+    constexpr uint32_t small_extent = 16;
+    constexpr uint64_t small_bytes = uint64_t{small_extent} * small_extent * sizeof(uint32_t);
+    constexpr uint64_t small_offset = image_size * 2;
+    constexpr uint64_t size = image_size * 4;
     constexpr VkDeviceSize slack = 256ull << 20;
     constexpr VkDeviceSize hole = 1ull << 20;
     constexpr uint32_t written = 0x5a3c5a3cu;
@@ -2457,6 +2460,16 @@ public:
         }
       };
       fill(image_size * 2);
+      auto small_desc = MakeLinearDesc(base + small_offset, small_bytes, vk::Format::eR8G8B8A8Unorm,
+                                       Prospero::BufferFormat::k8_8_8_8UNorm,
+                                       Prospero::ImageType::kColor2D,
+                                       {small_extent, small_extent, 1}, 1, 4, 1);
+      const auto small_image = cache.FindImage(small_desc);
+      Require(name, "written small image",
+              cache.ClearImageFromBuffer(scheduler.Current(), base + small_offset, small_bytes,
+                                         written),
+              "failed to write the small image the allocation retires");
+      LibKernel::Memory::WriteBacking(base + small_offset, &stale, sizeof(stale));
       auto desc = MakeLinearDesc(base, image_size, vk::Format::eR8G8B8A8Unorm,
                                  Prospero::BufferFormat::k8_8_8_8UNorm,
                                  Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
@@ -2469,6 +2482,23 @@ public:
       vmaGetAllocationInfo(graphics.allocator, cache.GetImage(idle).backing.allocation,
                            &allocation);
       fill(allocation.size / 2);
+      const auto requirements =
+          graphics.device.getImageMemoryRequirements(cache.GetImage(idle).backing.image);
+      VmaBudget filled[VK_MAX_MEMORY_HEAPS]{};
+      vmaGetHeapBudgets(graphics.allocator, filled);
+      bool pressured = true;
+      for (uint32_t type = 0; type < m_memory_properties.memoryTypeCount; ++type) {
+        const auto heap = m_memory_properties.memoryTypes[type].heapIndex;
+        if ((requirements.memoryTypeBits & (1u << type)) != 0 &&
+            limits[heap] - filled[heap].statistics.blockBytes >= requirements.size) {
+          pressured = false;
+        }
+      }
+      Require(name, "allocation pressure", pressured,
+              "the fill left room for another image, so the test cannot check a release");
+      cache.InvalidateMemory(base + small_offset + small_bytes, sizeof(stale));
+      Require(name, "maybe-dirty small image", cache.GetImage(small_image).IsMaybeCpuDirty(),
+              "a CPU write next to the small image did not leave it maybe-dirty");
       TextureCacheTestAccess::SkipFrames(cache, 1);
       scheduler.DeferPriorityOperation(
           [earlier_publication] { std::this_thread::sleep_for(earlier_publication); });
@@ -2476,12 +2506,19 @@ public:
       const auto created = cache.FindImage(desc);
       uint32_t published = 0;
       LibKernel::Memory::TryReadBacking(base, &published, sizeof(published));
+      uint32_t published_small = 0;
+      LibKernel::Memory::TryReadBacking(base + small_offset, &published_small,
+                                        sizeof(published_small));
       Require(name, "retired idle image",
               created && cache.GetImage(created).backing.image != nullptr &&
                   !TextureCacheTestAccess::Contains(cache, idle),
               "the new image did not take the memory of the idle one");
       Require(name, "published GPU write", published == written,
               "an image was released before its GPU write reached guest memory");
+      Require(name, "retired small image", !TextureCacheTestAccess::Contains(cache, small_image),
+              "the small image was not released");
+      Require(name, "published maybe-dirty GPU write", published_small == written,
+              "a maybe-dirty image was released without its GPU write");
       for (const auto filler : fillers) {
         vmaFreeMemory(graphics.allocator, filler);
       }

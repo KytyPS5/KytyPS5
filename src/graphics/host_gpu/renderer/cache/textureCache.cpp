@@ -241,6 +241,10 @@ bool TextureCache::ReleaseIdleImages(GuestRange requested) {
 		    image->Overlaps(requested.address, requested.size)) {
 			continue;
 		}
+		if (image->IsGpuModified() && image->IsMaybeCpuDirty()) {
+			TrackImage(id);
+			image->ResolveMaybeCpuHash(image->HashGuestEdges());
+		}
 		if (image->SafeToDownload() && (image->info.HasStencil() || !DownloadImageMemory(id))) {
 			continue;
 		}

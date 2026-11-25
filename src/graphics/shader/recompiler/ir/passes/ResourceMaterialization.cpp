@@ -266,8 +266,8 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 			return SpecializationFail("indirect formatted buffers require aligned full-format records");
 	} else if ((!indexed && descriptor.Stride() != 1u) ||
 	           (indexed && resource.max_byte_extent != 1u &&
-	            descriptor.Stride() != resource.max_byte_extent)) {
-		return SpecializationFail("indirect buffer stores require exact linear DWORD or byte bounds");
+	            (descriptor.Stride() < resource.max_byte_extent || (descriptor.Stride() & 3u) != 0u))) {
+		return SpecializationFail("indirect buffer stores require byte addressing or aligned records covering the write");
 	}
 	return true;
 }

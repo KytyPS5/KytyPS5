@@ -7506,6 +7506,65 @@ void TestFiniteBufferSelection() {
   }
 }
 
+void TestGuardedCarriedBufferKey() {
+  enum class Key { Carried, Bypass, Masked };
+  const auto make = [](Key kind) {
+    Fixture f;
+    const auto table = f.Address(f.UserData(0u), f.UserData(1u));
+    const auto count = f.UserData(2u);
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    Value selected;
+    if (kind == Key::Masked) {
+      const auto row = f.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(1u)});
+      const auto below = f.Emit(ValueOpcode::ULessThan32, {row, count});
+      selected = f.Emit(ValueOpcode::SelectU32, {below, row, Value(0u)});
+    } else {
+      auto* entry = f.block;
+      f.block = f.AddBlock();
+      entry->AddBranch(f.block);
+      f.block->AddBranch(f.block);
+      auto& carried = f.block->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      carried.AddPhiOperand(entry, kind == Key::Bypass ? lane : Value(0u));
+      const auto below = f.Emit(ValueOpcode::ULessThan32, {lane, count});
+      carried.AddPhiOperand(f.block, f.Emit(ValueOpcode::SelectU32, {below, lane, Value(&carried)}));
+      selected = Value(&carried);
+      if (kind == Key::Carried) {
+        const auto in_table = f.Emit(ValueOpcode::ULessThan32, {selected, Value(2u)});
+        selected = f.Emit(ValueOpcode::SelectU32, {in_table, selected, Value(0u)});
+      }
+    }
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+    std::array<Value, 4> words;
+    for (uint32_t i = 0; i < words.size(); ++i)
+      words[i] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+          f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = i * 4u,
+                       .component_index = i, .component_count = 4u}, 0x10u));
+    const auto pair = f.Emit(ValueOpcode::CompositeConstructU32x2, {lane, lane});
+    f.Emit(ValueOpcode::StoreBufferU32x2, {f.Buffer(words), lane, Value(0u), Value(0u), pair, Value(true)},
+           f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .idxen = true}, 0x18u));
+    f.PlanAndTrack();
+    return ExtractResourcePlan(f.program);
+  };
+  CheckFatal([&] { make(Key::Bypass); }, "not a valid runtime value",
+             "unchecked incoming lane borrowed the bound of another Phi arm");
+  TestMemory memory;
+  std::array<uint32_t, 3> data{uint32_t(memory.base), 0u, 0u};
+  SrtRuntime runtime{.user_data = data, .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto kind : {Key::Carried, Key::Masked}) {
+    auto plan = make(kind);
+    for (auto count : {0u, 1u, UINT32_MAX}) {
+      data[2] = count;
+      memory.reads = 0u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                memory.reads == std::clamp(count, 1u, 2u),
+            "guarded lane key lost its zero row or read beyond its static range");
+    }
+  }
+}
+
 void TestPackedScalarBufferSelection() {
   const auto make = [](uint32_t shift_mask = 24u, bool cycle = false, uint32_t store_offset = 0u,
                        bool byte_store = false) {
@@ -7597,7 +7656,9 @@ void TestPackedScalarBufferSelection() {
   Check(materialize() && specialization == initial && memory.reads == 20u,
         "packed table refresh changed shader specialization or repeated scalar reads");
   memory.words[17] = 8u << 16u;
-  Check(!materialize(), "indexed DWORD write accepted an incompatible descriptor stride");
+  Check(materialize() && specialization != initial, "padded record stride was not specialized");
+  memory.words[17] = 6u << 16u;
+  Check(!materialize(), "indexed DWORD write accepted an unaligned record stride");
   memory.words[17] = 4u << 16u;
   memory.words[19] |= 3u << 28u;
   Check(!materialize(), "indexed DWORD write accepted raw byte bounds");
@@ -9408,6 +9469,7 @@ int main() {
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
+    Run("guarded carried buffer key", TestGuardedCarriedBufferKey);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);

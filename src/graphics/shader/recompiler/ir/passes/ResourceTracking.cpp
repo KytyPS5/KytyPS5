@@ -2975,14 +2975,12 @@ private:
 		if (opcode == ValueOpcode::StoreBufferU32)
 			return !memory.formatted || (memory.idxen && memory.data_bits == 32u && memory.data_dwords == 1u);
 		if (!memory.idxen) return false;
-		if (opcode == ValueOpcode::StoreBufferU32x2)
-			return !memory.formatted && memory.data_bits == 32u && memory.data_dwords == 2u;
 		if (opcode == ValueOpcode::StoreBufferU8)
 			return !memory.formatted && memory.data_bits == 8u;
-		if (opcode == ValueOpcode::StoreBufferU32x4)
-			return memory.formatted && memory.data_bits == 32u && memory.data_dwords == 4u &&
-			       memory.component_count == 4u;
 		const auto components = BufferComponentCount(opcode);
+		if (opcode == ValueOpcode::StoreBufferU32x2 || opcode == ValueOpcode::StoreBufferU32x4)
+			return memory.data_bits == 32u && memory.data_dwords == components &&
+			       (!memory.formatted || (components == 4u && memory.component_count == 4u));
 		return memory.formatted && memory.data_dwords == components &&
 		       ((memory.data_bits == 32u && memory.component_count == components) ||
 		        (opcode == ValueOpcode::LoadBufferU32x2 && memory.data_bits == 16u &&
@@ -3496,6 +3494,56 @@ private:
 		return true;
 	}
 
+	// A lane may retain a previously selected row across loop iterations. Each assignment
+	// must supply either zero or a value explicitly checked against the same uniform count.
+	Value GuardedLaneCount(Value key, uint32_t maximum) {
+		const auto* lane = key.Resolve().TryInstruction();
+		if (lane == nullptr || lane->GetOpcode() != ValueOpcode::ReadFirstLane) return {};
+		auto selected = lane->Arg(0).Resolve();
+		uint32_t limit = maximum == UINT32_MAX ? UINT32_MAX : maximum + 1u;
+		while (const auto* choice = selected.TryInstruction()) {
+			if (choice->GetOpcode() != ValueOpcode::SelectU32 || choice->Arg(2).Resolve() != Value(0u))
+				break;
+			const auto bound = UnsignedBound(choice->Arg(0), choice->Arg(1));
+			uint32_t immediate;
+			if (!bound.IsEmpty()) {
+				if (!ImmediateU32(bound, immediate)) break;
+				limit = std::min(limit, immediate);
+			}
+			selected = choice->Arg(1).Resolve();
+		}
+		Value count;
+		std::vector<Value> pending {selected};
+		for (size_t i = 0; i < pending.size(); ++i) {
+			if (pending[i] == Value(0u)) continue;
+			const auto* choice = pending[i].TryInstruction();
+			if (choice == nullptr) return {};
+			const bool select = choice->GetOpcode() == ValueOpcode::SelectU32;
+			if (!select && (choice->GetOpcode() != ValueOpcode::Phi || choice->NumArgs() == 0u)) return {};
+			for (size_t arm = select ? 1u : 0u; arm < choice->NumArgs(); ++arm) {
+				const auto value = choice->Arg(arm).Resolve();
+				const auto bound = select ? UnsignedBound(choice->Arg(0), value, arm == 1u) : Value {};
+				if (!bound.IsEmpty() && value != Value(0u)) {
+					if (!ValidateRuntimeValue(m_program, bound, RuntimeValueType::Integer) ||
+					    (!count.IsEmpty() && !EquivalentValue(m_program, count, bound))) return {};
+					count = bound;
+				} else if (std::ranges::find(pending, value) == pending.end()) {
+					pending.push_back(value);
+				}
+			}
+		}
+		if (count.IsEmpty()) return {};
+		const auto adjust = [&](ValueOpcode op, uint32_t immediate) {
+			auto& node = m_program.value_storage.emplace_back(op);
+			node.SetArg(0, count);
+			node.SetArg(1, Value(immediate));
+			count = Value(&node);
+		};
+		if (limit != UINT32_MAX) adjust(ValueOpcode::UMin32, limit);
+		adjust(ValueOpcode::UMax32, 1u);
+		return count;
+	}
+
 	bool TryMakeIndirectBuffer(Inst& handle, const DescriptorSource& descriptor,
 	                           IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
@@ -3573,6 +3621,8 @@ private:
 		if (!legacy_store) {
 			if (table_source.dword_count == 2u && !plan.split_offsets) {
 				const auto maximum = SelectorMaximum(key);
+				indirect.key_count = GuardedLaneCount(key, maximum);
+				if (!indirect.key_count.IsEmpty()) return finish();
 				if (maximum >= MaxIndirectDescriptorProbes) return false;
 				indirect.key_count = Value(maximum + 1u);
 				return finish();

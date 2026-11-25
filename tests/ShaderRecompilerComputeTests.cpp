@@ -37618,10 +37618,11 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(1u);
 }
 
-TestCase BufferStoreWorkgroupDescriptors(u32 groups, bool guarded_pair = false) {
+TestCase BufferStoreWorkgroupDescriptors(u32 groups, u32 components = 1u) {
   TestCase test;
-  test.name = guarded_pair ? "BufferStoreDwordx2WorkgroupDescriptors"
-                           : groups == 1u ? "BufferStoreOneWorkgroupDescriptor" : "BufferStoreTwoWorkgroupDescriptors";
+  test.name = components == 4u ? "BufferStoreDwordx4PaddedDescriptors"
+            : components == 2u ? "BufferStoreDwordx2WorkgroupDescriptors"
+            : groups == 1u ? "BufferStoreOneWorkgroupDescriptor" : "BufferStoreTwoWorkgroupDescriptors";
   test.has_user_data = test.has_compute_info = true;
   test.user_data[0] = 128u;
   test.compute_info.workgroup_register = 10u;
@@ -37631,16 +37632,26 @@ TestCase BufferStoreWorkgroupDescriptors(u32 groups, bool guarded_pair = false) 
   test.compute_info.thread_ids_num = 1u;
   test.dispatch_z = groups;
   auto &code = test.code;
-  if (guarded_pair) code = {EncodeSopc(0x0a, 10, InlineU32(2)), 0u};
-  code.insert(code.end(), {EncodeSop2(0x31, 4, 10, 255), 0x2a0u,
+  u32 key = 10u;
+  if (components == 2u) code = {EncodeSopc(0x0a, key, InlineU32(2)), 0u};
+  if (components == 4u) {
+    test.user_data[6] = 2u;
+    // Lane zero selects the group row. Other lanes have different local selectors.
+    code = {EncodeVop2(0x1d, 6, key, 0), EncodeVopc(0xc4, 6, 6),
+            EncodeVop2(0x01, 7, InlineU32(0), 6), EncodeVop1(0x02, 11, Vgpr(7))};
+    key = 11u;
+  }
+  code.insert(code.end(), {EncodeSop2(0x31, 4, key, 255), 0x2a0u,
       EncodeSmem0(0x02, 12), EncodeSmem1(0u, 4), EncodeSopp(0x0c, 0),
       EncodeVop1(0x01, 2, 10)});
-  if (guarded_pair) code.push_back(EncodeVop1(0x01, 3, InlineU32(7)));
-  code.insert(code.end(), {EncodeMubuf0(guarded_pair ? 0x1d : 0x1c, 0, true, false), EncodeMubuf1(2, 3, 0)});
-  if (guarded_pair) code[1] = EncodeSopp(0x04, code.size() - 2u);
+  for (u32 word = 1u; word < components; ++word)
+    code.push_back(EncodeVop1(0x01, 2u + word, InlineU32(6u + word)));
+  const u32 opcode = components == 4u ? 0x1eu : components == 2u ? 0x1du : 0x1cu;
+  code.insert(code.end(), {EncodeMubuf0(opcode, 0, true, false), EncodeMubuf1(2, 3, 0)});
+  if (components == 2u) code[1] = EncodeSopp(0x04, code.size() - 2u);
   AppendEnd(&code);
   test.initial.assign(2064u, 0xdeadbeefu);
-  const u32 stride = guarded_pair ? 8u : 4u;
+  const u32 stride = components == 4u ? 32u : components * 4u;
   test.expected_buffer_resources.emplace();
   for (u32 row = 0; row < 2u; ++row) {
     const u32 output = 4096u * (row + 1u);
@@ -37649,13 +37660,17 @@ TestCase BufferStoreWorkgroupDescriptors(u32 groups, bool guarded_pair = false) 
               test.initial.begin() + (test.user_data[0] + 0x2a0u + row * 16u) / 4u);
     if (row < groups) {
       test.expected_buffer_resources->push_back(row);
-      test.storage_buffer_ranges.emplace_back(output, guarded_pair && row == 1u ? 12u : 2u * stride);
+      const u32 bytes = components > 1u && row == 1u ? stride + (components - 1u) * 4u : 2u * stride;
+      test.storage_buffer_ranges.emplace_back(output, bytes);
     }
   }
   test.expected = test.initial;
   for (const auto &[output, bytes] : test.storage_buffer_ranges)
-    for (u32 word = 0; word < bytes / 4u; ++word)
-      test.expected[output / 4u + word] = guarded_pair && word % 2u != 0u ? 7u : output / 4096u - 1u;
+    for (u32 word = 0; word < bytes / 4u; ++word) {
+      const u32 component = word % (stride / 4u);
+      if (component < components)
+        test.expected[output / 4u + word] = component == 0u ? output / 4096u - 1u : 6u + component;
+    }
   return test;
 }
 
@@ -50466,7 +50481,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
-  cases.push_back(BufferStoreWorkgroupDescriptors(3u, true));
+  cases.push_back(BufferStoreWorkgroupDescriptors(2u, 4u));
+  cases.push_back(BufferStoreWorkgroupDescriptors(3u, 2u));
   for (u32 groups : {1u, 2u}) cases.push_back(BufferStoreWorkgroupDescriptors(groups));
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
@@ -58456,7 +58472,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckBoundedFormattedBufferCopy(vulkan);
-    RunCase(&vulkan, BufferStoreWorkgroupDescriptors(3u, true));
+    RunCase(&vulkan, BufferStoreWorkgroupDescriptors(2u, 4u));
+    RunCase(&vulkan, BufferStoreWorkgroupDescriptors(3u, 2u));
     for (u32 groups : {1u, 2u}) RunCase(&vulkan, BufferStoreWorkgroupDescriptors(groups));
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);

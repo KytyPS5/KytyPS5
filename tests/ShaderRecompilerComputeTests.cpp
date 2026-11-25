@@ -2403,6 +2403,7 @@ public:
     constexpr VkDeviceSize hole = 1ull << 20;
     constexpr uint32_t written = 0x5a3c5a3cu;
     constexpr uint32_t stale = 0;
+    constexpr auto earlier_publication = std::chrono::milliseconds(200);
     EnsureRuntimeContext();
     VmaBudget runtime[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(m_runtime_context.allocator, runtime);
@@ -2469,18 +2470,18 @@ public:
                            &allocation);
       fill(allocation.size / 2);
       TextureCacheTestAccess::SkipFrames(cache, 1);
+      scheduler.DeferPriorityOperation(
+          [earlier_publication] { std::this_thread::sleep_for(earlier_publication); });
       desc.info.data.address += image_size;
       const auto created = cache.FindImage(desc);
+      uint32_t published = 0;
+      LibKernel::Memory::TryReadBacking(base, &published, sizeof(published));
       Require(name, "retired idle image",
               created && cache.GetImage(created).backing.image != nullptr &&
                   !TextureCacheTestAccess::Contains(cache, idle),
               "the new image did not take the memory of the idle one");
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
-      uint32_t published = 0;
-      LibKernel::Memory::TryReadBacking(base, &published, sizeof(published));
       Require(name, "published GPU write", published == written,
-              "the retired image dropped its GPU write");
+              "an image was released before its GPU write reached guest memory");
       for (const auto filler : fillers) {
         vmaFreeMemory(graphics.allocator, filler);
       }

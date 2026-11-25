@@ -251,7 +251,9 @@ bool TextureCache::ReleaseIdleImages(GuestRange requested) {
 	if (released.empty()) {
 		return false;
 	}
-	m_scheduler.Wait(m_scheduler.CurrentTick());
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
 	for (const auto id: released) {
 		m_slot_images[id].ReleaseBacking();
 	}

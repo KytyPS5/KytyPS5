@@ -37621,6 +37621,7 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
 TestCase BufferStoreWorkgroupDescriptors(u32 groups, u32 components = 1u) {
   TestCase test;
   test.name = components == 4u ? "BufferStoreDwordx4PaddedDescriptors"
+            : components == 2u && groups == 1u ? "BufferStoreDwordx2SingleGuardedWorkgroup"
             : components == 2u ? "BufferStoreDwordx2WorkgroupDescriptors"
             : groups == 1u ? "BufferStoreOneWorkgroupDescriptor" : "BufferStoreTwoWorkgroupDescriptors";
   test.has_user_data = test.has_compute_info = true;
@@ -37653,16 +37654,14 @@ TestCase BufferStoreWorkgroupDescriptors(u32 groups, u32 components = 1u) {
   test.initial.assign(2064u, 0xdeadbeefu);
   const u32 stride = components == 4u ? 32u : components * 4u;
   test.expected_buffer_resources.emplace();
-  for (u32 row = 0; row < 2u; ++row) {
+  for (u32 row = 0; row < std::min(groups, 2u); ++row) {
     const u32 output = 4096u * (row + 1u);
     const std::array descriptor{output, stride << 16u, 2u, 0x5204u};
     std::copy(descriptor.begin(), descriptor.end(),
               test.initial.begin() + (test.user_data[0] + 0x2a0u + row * 16u) / 4u);
-    if (row < groups) {
-      test.expected_buffer_resources->push_back(row);
-      const u32 bytes = components > 1u && row == 1u ? stride + (components - 1u) * 4u : 2u * stride;
-      test.storage_buffer_ranges.emplace_back(output, bytes);
-    }
+    test.expected_buffer_resources->push_back(row);
+    const u32 bytes = components > 1u && row == 1u ? stride + (components - 1u) * 4u : 2u * stride;
+    test.storage_buffer_ranges.emplace_back(output, bytes);
   }
   test.expected = test.initial;
   for (const auto &[output, bytes] : test.storage_buffer_ranges)
@@ -50482,7 +50481,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   cases.push_back(BufferStoreWorkgroupDescriptors(2u, 4u));
-  cases.push_back(BufferStoreWorkgroupDescriptors(3u, 2u));
+  for (u32 groups : {1u, 3u}) cases.push_back(BufferStoreWorkgroupDescriptors(groups, 2u));
   for (u32 groups : {1u, 2u}) cases.push_back(BufferStoreWorkgroupDescriptors(groups));
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
@@ -58473,7 +58472,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckBoundedFormattedBufferCopy(vulkan);
     RunCase(&vulkan, BufferStoreWorkgroupDescriptors(2u, 4u));
-    RunCase(&vulkan, BufferStoreWorkgroupDescriptors(3u, 2u));
+    for (u32 groups : {1u, 3u}) RunCase(&vulkan, BufferStoreWorkgroupDescriptors(groups, 2u));
     for (u32 groups : {1u, 2u}) RunCase(&vulkan, BufferStoreWorkgroupDescriptors(groups));
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);

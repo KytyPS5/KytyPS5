@@ -294,14 +294,16 @@ bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offse
 
 bool EvaluateIndirectCount(const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
                            const SrtRuntime& runtime, uint32_t& count) {
+	count = UINT32_MAX;
 	if (indirect.workgroup_axis != UINT32_MAX) {
 		if (runtime.workgroup_counts.size() != 3u || indirect.workgroup_axis >= 3u) return false;
 		count = std::ranges::find(runtime.workgroup_counts, 0u) != runtime.workgroup_counts.end()
 		    ? 0u : runtime.workgroup_counts[indirect.workgroup_axis];
-		return true;
+		if (indirect.key_count.IsEmpty()) return true;
 	}
-	if (!WalkedValue(program, indirect.key_count, count)) return false;
-	if (indirect.signed_count && std::bit_cast<int32_t>(count) < 0) count = 0;
+	uint32_t bound;
+	if (!WalkedValue(program, indirect.key_count, bound)) return false;
+	count = indirect.signed_count && std::bit_cast<int32_t>(bound) < 0 ? 0u : std::min(count, bound);
 	return true;
 }
 

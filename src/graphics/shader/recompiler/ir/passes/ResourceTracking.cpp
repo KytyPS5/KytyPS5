@@ -3611,12 +3611,9 @@ private:
 		}
 		const auto axis = table_source.dword_count == 2u ? WorkgroupAxis(key) : UINT32_MAX;
 		if (!plan.split_offsets && (!legacy_store || axis != UINT32_MAX)) {
+			indirect.workgroup_axis = axis;
 			indirect.key_count = UnsignedResourceBound(key, handle);
-			if (!indirect.key_count.IsEmpty()) return finish();
-			if (axis != UINT32_MAX) {
-				indirect.workgroup_axis = axis;
-				return finish();
-			}
+			if (axis != UINT32_MAX || !indirect.key_count.IsEmpty()) return finish();
 		}
 		if (!legacy_store) {
 			if (table_source.dword_count == 2u && !plan.split_offsets) {

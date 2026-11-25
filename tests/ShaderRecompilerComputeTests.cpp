@@ -24895,7 +24895,13 @@ private:
             available_features.shaderImageGatherExtended == true &&
                 available_features.shaderResourceMinLod == true,
             "image gather or MinLod are not supported");
-    m_derivative_quads = available_derivatives.computeDerivativeGroupQuads == true;
+    m_derivative_quads =
+        std::ranges::any_of(extensions,
+                            [](const vk::ExtensionProperties &extension) {
+                              return std::strcmp(extension.extensionName.data(),
+                                                 VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) == 0;
+                            }) &&
+        available_derivatives.computeDerivativeGroupQuads == true;
     if (!m_derivative_quads) {
       std::printf(
           "[host]    ComputeDerivativeQuads    unavailable, compute derivative cases "
@@ -24997,7 +25003,9 @@ private:
     device_features13.synchronization2 = true;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
-    derivatives.computeDerivativeGroupQuads = m_derivative_quads;
+    derivatives.computeDerivativeGroupQuads = true;
+    void *derivative_chain = m_derivative_quads ? static_cast<void *>(&derivatives)
+                                                : static_cast<void *>(&device_features13);
     // Requesting a feature the device does not support fails device creation, so the
     // rasterization feature chain is only chained in when every part is available.
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
@@ -25006,7 +25014,7 @@ private:
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
     if (m_rasterization_supported) {
-      depth_clip.pNext = &derivatives;
+      depth_clip.pNext = derivative_chain;
       depth_clip.depthClipEnable = true;
       clip_control.pNext = &depth_clip;
       clip_control.depthClipControl = true;
@@ -25021,7 +25029,7 @@ private:
     min_lod.minLod = true;
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
-                        : static_cast<void *>(&derivatives);
+                        : derivative_chain;
     vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8{};
     maintenance8.maintenance8 = true;
     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock{};
@@ -25065,7 +25073,6 @@ private:
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
@@ -25080,6 +25087,9 @@ private:
         VK_KHR_RAY_QUERY_EXTENSION_NAME};
     if (m_robust_pipelines) {
       device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+    }
+    if (m_derivative_quads) {
+      device_extensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);

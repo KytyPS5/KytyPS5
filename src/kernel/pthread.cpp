@@ -380,6 +380,8 @@ struct PthreadGuestData {
 
 static_assert(sizeof(PthreadGuestData) == 4096);
 
+enum class PthreadState : uint8_t { Retired, Running, Exiting };
+
 struct PthreadPrivate {
 	PthreadGuestData      guest;
 	std::string           name;
@@ -391,8 +393,7 @@ struct PthreadPrivate {
 	void*                 arg;
 	int                   unique_id;
 	std::atomic_bool      detached;
-	std::atomic_bool      almost_done;
-	std::atomic_bool      free {true};
+	std::atomic<PthreadState> state {PthreadState::Retired};
 	uint64_t              host_thread_id;
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
@@ -990,9 +991,8 @@ void PthreadInitSelfForMainThread() {
 	g_pthread_self->name            = "MainThread";
 	g_pthread_self->guest.thread_id = ++g_pthread_thread_id;
 	g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
-	g_pthread_self->free            = false;
+	g_pthread_self->state           = PthreadState::Running;
 	g_pthread_self->detached        = false;
-	g_pthread_self->almost_done     = false;
 	g_pthread_self->entry           = nullptr;
 	g_pthread_self->arg             = nullptr;
 
@@ -1516,7 +1516,7 @@ void PthreadPool::FreeDetachedThreads() {
 	Common::LockGuard lock(m_mutex);
 
 	for (auto* p: m_threads) {
-		if (!p->free && p->detached && p->almost_done) {
+		if (p->state == PthreadState::Exiting && p->detached) {
 			PthreadJoin(p, nullptr);
 		}
 	}
@@ -3052,7 +3052,7 @@ bool PthreadKillHost(Pthread thread, int host_signal) {
 		return false;
 	}
 	std::lock_guard lock(thread->native_mutex);
-	if (thread->free || thread->almost_done) {
+	if (thread->state != PthreadState::Running) {
 		return false;
 	}
 
@@ -3079,7 +3079,7 @@ bool PthreadHasPendingSignal(Pthread thread, int signum) {
 }
 
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
-	if (thread == nullptr || thread->almost_done || signum < 0 || signum >= 64) {
+	if (thread == nullptr || thread->state != PthreadState::Running || signum < 0 || signum >= 64) {
 		return false;
 	}
 
@@ -3145,7 +3145,7 @@ static void CleanupThread(void* arg) {
 	// Guest signal handlers stop here: they would run on freed TLS.
 	{
 		std::lock_guard lock(thread->native_mutex);
-		thread->almost_done = true;
+		thread->state = PthreadState::Exiting;
 	}
 	Loader::RuntimeLinker::DeleteThreadTls();
 }
@@ -3257,10 +3257,9 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->arg             = arg;
 		created_thread->guest.thread_id = ++g_pthread_thread_id;
 		created_thread->pending_signal_mask.store(0, std::memory_order_relaxed);
-		created_thread->almost_done     = false;
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
-		created_thread->free            = false;
+		created_thread->state           = PthreadState::Running;
 
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);
@@ -3275,7 +3274,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 
 	PthreadAttrDbgPrint(&created_thread->attr);
 	if (result != 0) {
-		created_thread->free = true;
+		created_thread->state = PthreadState::Retired;
 		native_lock.unlock();
 		pthread_pool->Retire(created_thread);
 	}
@@ -3322,7 +3321,7 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		return KERNEL_ERROR_EOPNOTSUPP;
 	}
 	std::unique_lock native_lock(thread->native_mutex);
-	if (thread->free) {
+	if (thread->state == PthreadState::Retired) {
 		return KERNEL_ERROR_ESRCH;
 	}
 	const auto native_thread = thread->p;
@@ -3337,7 +3336,7 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 	if (result == 0) {
 		FreeGuestStack(thread->attr);
 		thread->pending_signal_mask.store(0, std::memory_order_relaxed);
-		thread->free = true;
+		thread->state = PthreadState::Retired;
 		joining.unlock();
 		g_pthread_context->GetPthreadPool()->Retire(thread);
 	}
@@ -3359,7 +3358,7 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 	}
 
 	std::lock_guard lock(thread->native_mutex);
-	if (thread->free || thread->almost_done) {
+	if (thread->state != PthreadState::Running) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
@@ -3466,7 +3465,7 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 
 	EXIT_NOT_IMPLEMENTED(prio == nullptr);
 
-	if (thread->free) {
+	if (thread->state == PthreadState::Retired) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
@@ -3483,7 +3482,7 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	}
 
 	std::lock_guard lock(thread->native_mutex);
-	if (thread->free || thread->almost_done) {
+	if (thread->state != PthreadState::Running) {
 		return KERNEL_ERROR_ESRCH;
 	}
 

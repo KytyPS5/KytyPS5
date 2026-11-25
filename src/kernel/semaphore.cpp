@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -70,6 +71,7 @@ private:
 };
 
 KernelSemaPrivate::~KernelSemaPrivate() {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	while (m_status != Status::Set) {
@@ -96,6 +98,7 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 }
 
 KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_waiting_threads) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	if (set_count > m_max_count) {
@@ -126,6 +129,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 }
 
 KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	if (m_status == Status::Deleted) {
@@ -175,6 +179,7 @@ void KernelSemaPrivate::WakeWaiters() {
 }
 
 KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_micros) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	if (need_count < 1 || need_count > m_max_count) {
@@ -219,7 +224,10 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 			return Result::TimedOut;
 		}
 
-		waiter.cond_var.WaitFor(&m_mutex, infinitely ? SIGNAL_APC_POLL_MICROS : micros - elapsed);
+		waiter.cond_var.WaitFor(&m_mutex, infinitely
+		                                      ? SIGNAL_APC_POLL_MICROS
+		                                      : std::min(micros - elapsed, SIGNAL_APC_POLL_MICROS));
+		block.RunPending([this] { m_mutex.Unlock(); }, [this] { m_mutex.Lock(); });
 
 		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
 	}
@@ -382,7 +390,8 @@ public:
 	}
 
 	int Wait(uint32_t* micros) {
-		Common::LockGuard lock(m_mutex);
+		LibKernel::GuestSignalBlock block;
+		Common::LockGuard           lock(m_mutex);
 
 		uint32_t      elapsed    = 0;
 		const bool    timed_wait = (micros != nullptr);
@@ -398,12 +407,13 @@ public:
 			SyncGuest();
 
 			if (timed_wait) {
-				m_cond_var.WaitFor(&m_mutex, *micros - elapsed);
+				m_cond_var.WaitFor(&m_mutex, std::min(*micros - elapsed, SIGNAL_APC_POLL_MICROS));
 			} else {
 				m_cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
 			}
 
 			m_waiters--;
+			block.RunPending([this] { m_mutex.Unlock(); }, [this] { m_mutex.Lock(); });
 			elapsed = static_cast<uint32_t>(timer.GetTimeS() * 1000000.0);
 		}
 
@@ -414,7 +424,8 @@ public:
 	}
 
 	int TryWait() {
-		Common::LockGuard lock(m_mutex);
+		LibKernel::GuestSignalBlock block;
+		Common::LockGuard           lock(m_mutex);
 
 		if (m_count <= 0) {
 			SyncGuest();
@@ -428,7 +439,8 @@ public:
 	}
 
 	int Post() {
-		Common::LockGuard lock(m_mutex);
+		LibKernel::GuestSignalBlock block;
+		Common::LockGuard           lock(m_mutex);
 
 		if (m_count == POSIX_SEM_VALUE_MAX) {
 			return POSIX_EOVERFLOW;
@@ -442,7 +454,8 @@ public:
 	}
 
 	int GetValue() {
-		Common::LockGuard lock(m_mutex);
+		LibKernel::GuestSignalBlock block;
+		Common::LockGuard           lock(m_mutex);
 
 		return m_count;
 	}
@@ -480,7 +493,8 @@ static PosixSemPrivate* GetSem(void* sem) {
 		return nullptr;
 	}
 
-	Common::LockGuard lock(g_posix_sem_mutex);
+	LibKernel::GuestSignalBlock block;
+	Common::LockGuard           lock(g_posix_sem_mutex);
 
 	const auto it = g_posix_sems.find(static_cast<PosixSemGuest*>(sem));
 	return (it != g_posix_sems.end() ? it->second : nullptr);
@@ -500,7 +514,8 @@ static int SemInitImpl(void* sem, int pshared, unsigned int value, const char* n
 	auto* obj   = new PosixSemPrivate(guest, value, static_cast<uint32_t>(pshared));
 
 	{
-		Common::LockGuard lock(g_posix_sem_mutex);
+		LibKernel::GuestSignalBlock block;
+		Common::LockGuard           lock(g_posix_sem_mutex);
 
 		if (auto it = g_posix_sems.find(guest); it != g_posix_sems.end()) {
 			delete it->second;
@@ -529,7 +544,8 @@ static int SemDestroyImpl(void* sem) {
 	PosixSemPrivate* obj   = nullptr;
 
 	{
-		Common::LockGuard lock(g_posix_sem_mutex);
+		LibKernel::GuestSignalBlock block;
+		Common::LockGuard           lock(g_posix_sem_mutex);
 
 		const auto it = g_posix_sems.find(guest);
 		if (it == g_posix_sems.end()) {

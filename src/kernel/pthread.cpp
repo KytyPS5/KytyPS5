@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -788,6 +789,18 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 	       first_capacity_unchanged && second_owned && second_private &&
 	       second_capacity_unchanged && unmapped && final_capacity_unchanged;
 }
+
+static std::atomic<void (*)()> g_test_mutex_wait_hook {nullptr};
+
+void TestSetMutexWaitHook(void (*hook)()) {
+	g_test_mutex_wait_hook = hook;
+}
+
+static std::atomic<Loader::Program*> g_test_static_object_program {nullptr};
+
+void TestSetStaticObjectProgram(Loader::Program* program) {
+	g_test_static_object_program = program;
+}
 #endif
 
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
@@ -1240,6 +1253,7 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	auto* self = g_pthread_self;
 	EXIT_NOT_IMPLEMENTED(self == nullptr);
 
+	GuestSignalBlock block;
 	std::unique_lock lock(mutex->m);
 
 	if (mutex->owner == self) {
@@ -1280,6 +1294,11 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	                          : std::chrono::steady_clock::time_point::max();
 	int result = OK;
 	while (mutex->owner != self) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (auto* hook = g_test_mutex_wait_hook.load()) {
+			hook();
+		}
+#endif
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) {
 			NativeMutexRemoveWaiter(mutex, &waiter);
@@ -1288,6 +1307,7 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		}
 		waiter.cv.wait_until(lock, std::min(deadline, now +
 		    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		block.RunPending([&lock] { lock.unlock(); }, [&lock] { lock.lock(); });
 	}
 	lock.unlock();
 	pthread_setcancelstate(previous_cancel_state, nullptr);
@@ -1300,6 +1320,7 @@ static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
 	auto* self = g_pthread_self;
 	EXIT_NOT_IMPLEMENTED(self == nullptr);
 
+	GuestSignalBlock block;
 	std::unique_lock lock(mutex->m);
 
 	if (mutex->owner == self) {
@@ -1328,6 +1349,7 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 	auto* self = g_pthread_self;
 	EXIT_NOT_IMPLEMENTED(self == nullptr);
 
+	GuestSignalBlock block;
 	std::unique_lock lock(mutex->m);
 
 	if (mutex->owner != self) {
@@ -1363,7 +1385,8 @@ static int NativeMutexLockRecurse(PthreadMutexPrivate* mutex, uint32_t recurse) 
 
 	int result = NativeMutexLock(mutex, nullptr);
 	if (result == OK) {
-		std::lock_guard lock(mutex->m);
+		GuestSignalBlock block;
+		std::lock_guard  lock(mutex->m);
 		mutex->count = std::max<uint32_t>(recurse, 1);
 	}
 	return result;
@@ -1404,6 +1427,7 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 		return addr;
 	}
 
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	current_value = current_ref.load(std::memory_order_acquire);
@@ -1418,6 +1442,11 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 	auto* rt      = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	auto  vaddr   = reinterpret_cast<uint64_t>(addr);
 	auto* program = rt->FindProgramByAddr(vaddr);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (auto* test_program = g_test_static_object_program.load()) {
+		program = test_program;
+	}
+#endif
 
 	std::string name = fmt::format("Static{:016x}", vaddr);
 
@@ -1461,6 +1490,7 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 }
 
 void PthreadStaticObjects::DeleteObjects(Loader::Program* program) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	for (auto& obj: m_objects) {
@@ -2244,7 +2274,8 @@ int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 	}
 
 	{
-		std::lock_guard lock((*rwlock)->m);
+		GuestSignalBlock block;
+		std::lock_guard  lock((*rwlock)->m);
 		if ((*rwlock)->writer != nullptr || (*rwlock)->reader_count != 0) {
 			return KERNEL_ERROR_EBUSY;
 		}
@@ -2343,6 +2374,7 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 		}
 	};
 
+	GuestSignalBlock block;
 	std::unique_lock lock(rwlock->m);
 	for (;;) {
 		if (write) {
@@ -2385,6 +2417,7 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 		} else {
 			rwlock->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 		}
+		block.RunPending([&lock] { lock.unlock(); }, [&lock] { lock.lock(); });
 	}
 }
 
@@ -2459,7 +2492,8 @@ int KYTY_SYSV_ABI PthreadRwlockTryrdlock(PthreadRwlock* rwlock) {
 	}
 
 	{
-		std::lock_guard lock((*rwlock)->m);
+		GuestSignalBlock block;
+		std::lock_guard  lock((*rwlock)->m);
 		const bool      already_reader = (RwlockFindReader(*rwlock, self) != nullptr);
 		if (((*rwlock)->writer == nullptr && ((*rwlock)->waiting_writers == 0 || already_reader)) ||
 		    (*rwlock)->writer == self) {
@@ -2486,7 +2520,8 @@ int KYTY_SYSV_ABI PthreadRwlockTrywrlock(PthreadRwlock* rwlock) {
 	}
 
 	{
-		std::lock_guard lock((*rwlock)->m);
+		GuestSignalBlock block;
+		std::lock_guard  lock((*rwlock)->m);
 		if ((*rwlock)->writer == self || RwlockFindReader(*rwlock, self) != nullptr) {
 			return KERNEL_ERROR_EDEADLK;
 		}
@@ -2520,7 +2555,8 @@ int KYTY_SYSV_ABI PthreadRwlockUnlock(PthreadRwlock* rwlock) {
 	}
 
 	{
-		std::lock_guard lock((*rwlock)->m);
+		GuestSignalBlock block;
+		std::lock_guard  lock((*rwlock)->m);
 		if (RwlockRemoveReader(*rwlock, self)) {
 			(*rwlock)->cv.notify_all();
 			return OK;
@@ -2701,7 +2737,8 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	std::lock_guard lock((*cond)->m);
+	GuestSignalBlock block;
+	std::lock_guard  lock((*cond)->m);
 	for (auto* thread: (*cond)->waiters) {
 		thread->cond_sequence++;
 		thread->cond_cv.notify_one();
@@ -2791,7 +2828,8 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	std::lock_guard lock((*cond)->m);
+	GuestSignalBlock block;
+	std::lock_guard  lock((*cond)->m);
 	CondWakeWaiter(*cond, nullptr);
 	return OK;
 }
@@ -2810,7 +2848,8 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	std::lock_guard lock((*cond)->m);
+	GuestSignalBlock block;
+	std::lock_guard  lock((*cond)->m);
 	CondWakeWaiter(*cond, thread);
 	return OK;
 }
@@ -2840,7 +2879,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		return KERNEL_ERROR_EPERM;
 	}
 
-	std::unique_lock cond_lock(cond_value->m);
+	std::optional<GuestSignalBlock> block(std::in_place);
+	std::unique_lock                cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -2870,12 +2910,15 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 			                            : std::chrono::steady_clock::duration(
 			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 			thread->cond_cv.wait_for(cond_lock, poll);
+			block->RunPending([&cond_lock] { cond_lock.unlock(); },
+			                  [&cond_lock] { cond_lock.lock(); });
 		}
 
 		result = (ready() ? OK : ETIMEDOUT);
 	}
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
+	block.reset();
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
 	if (result == OK) {
@@ -2923,7 +2966,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return KERNEL_ERROR_EPERM;
 	}
 
-	std::unique_lock cond_lock(cond_value->m);
+	std::optional<GuestSignalBlock> block(std::in_place);
+	std::unique_lock                cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -2949,11 +2993,13 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		                            : std::chrono::steady_clock::duration(
 		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 		thread->cond_cv.wait_for(cond_lock, poll);
+		block->RunPending([&cond_lock] { cond_lock.unlock(); }, [&cond_lock] { cond_lock.lock(); });
 	}
 
 	result = (ready() ? OK : ETIMEDOUT);
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
+	block.reset();
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
 	if (result == OK) {
@@ -2993,7 +3039,8 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return KERNEL_ERROR_EPERM;
 	}
 
-	std::unique_lock cond_lock(cond_value->m);
+	std::optional<GuestSignalBlock> block(std::in_place);
+	std::unique_lock                cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3009,9 +3056,11 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 
 	while (!ready()) {
 		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+		block->RunPending([&cond_lock] { cond_lock.unlock(); }, [&cond_lock] { cond_lock.lock(); });
 	}
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
+	block.reset();
 
 	result = NativeMutexLockRecurse(mutex_value, recurse);
 
@@ -3035,12 +3084,6 @@ Pthread PthreadSelfOrNull() {
 	return g_pthread_self;
 }
 
-Pthread PthreadSwapSelfForSignal(Pthread thread) {
-	auto* previous = g_pthread_self;
-	g_pthread_self = thread;
-	return previous;
-}
-
 uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }
@@ -3060,13 +3103,18 @@ bool PthreadKillHost(Pthread thread, int host_signal) {
 }
 #endif
 
-void PthreadQueuePendingSignal(Pthread thread, int signum) {
+bool PthreadQueuePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
-		return;
+		return false;
 	}
 
-	thread->pending_signal_mask.fetch_or(1ull << static_cast<uint32_t>(signum),
-	                                     std::memory_order_release);
+	const auto mask = 1ull << static_cast<uint32_t>(signum);
+	thread->pending_signal_mask.fetch_or(mask);
+	if (thread->state != PthreadState::Running) {
+		thread->pending_signal_mask.fetch_and(~mask);
+		return false;
+	}
+	return true;
 }
 
 bool PthreadHasPendingSignal(Pthread thread, int signum) {
@@ -3085,6 +3133,11 @@ bool PthreadTakePendingSignal(Pthread thread, int signum) {
 
 	const auto mask = 1ull << static_cast<uint32_t>(signum);
 	return (thread->pending_signal_mask.fetch_and(~mask, std::memory_order_acq_rel) & mask) != 0;
+}
+
+bool PthreadHasAnyPendingSignal(Pthread thread) {
+	return thread != nullptr && thread->state == PthreadState::Running &&
+	       thread->pending_signal_mask.load(std::memory_order_acquire) != 0;
 }
 
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size) {
@@ -3969,7 +4022,8 @@ int KYTY_SYSV_ABI pthread_once(void* once_control, void(KYTY_SYSV_ABI* init_rout
 	auto* once = static_cast<PthreadOnce*>(once_control);
 
 	{
-		std::unique_lock lock(g_pthread_once_mutex);
+		LibKernel::GuestSignalBlock block;
+		std::unique_lock            lock(g_pthread_once_mutex);
 
 		for (;;) {
 			switch (once->state) {
@@ -3981,6 +4035,7 @@ int KYTY_SYSV_ABI pthread_once(void* once_control, void(KYTY_SYSV_ABI* init_rout
 					while (once->state == PTHREAD_ONCE_WAIT) {
 						g_pthread_once_cv.wait_for(
 						    lock, std::chrono::microseconds(LibKernel::SIGNAL_APC_POLL_MICROS));
+						block.RunPending([&lock] { lock.unlock(); }, [&lock] { lock.lock(); });
 					}
 					break;
 				default: return POSIX_EINVAL;
@@ -3992,7 +4047,8 @@ run_init:
 	init_routine();
 
 	{
-		std::lock_guard lock(g_pthread_once_mutex);
+		LibKernel::GuestSignalBlock block;
+		std::lock_guard             lock(g_pthread_once_mutex);
 		once->state = PTHREAD_ONCE_DONE_INIT;
 	}
 	g_pthread_once_cv.notify_all();

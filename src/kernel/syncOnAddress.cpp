@@ -1,6 +1,7 @@
 #include "kernel/syncOnAddress.h"
 
 #include "common/threads.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -183,6 +184,8 @@ void UnregisterPortableWaiter(volatile void*                               addre
 
 template <typename T>
 int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline) {
+	GuestSignalBlock block;
+
 	PortableWaiter waiter;
 	auto           entry      = RegisterPortableWaiter(address, &waiter);
 	bool           first_wait = true;
@@ -200,6 +203,7 @@ int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline) 
 		}
 
 		(void)waiter.condition.WaitFor(&entry->mutex, slice_micros);
+		block.RunPending([&entry] { entry->mutex.Unlock(); }, [&entry] { entry->mutex.Lock(); });
 
 		if (deadline.finite && Clock::now() >= deadline.end && ReadWord(address) == expected &&
 		    !waiter.wake_requested) {
@@ -217,6 +221,8 @@ int WakePortable(volatile void* address, int32_t count) {
 	if (count == 0) {
 		return OK;
 	}
+	GuestSignalBlock block;
+
 	auto&            registry = GetPortableRegistry();
 	std::unique_lock registry_lock(registry.mutex);
 	const auto       it = registry.entries.find(reinterpret_cast<uintptr_t>(address));

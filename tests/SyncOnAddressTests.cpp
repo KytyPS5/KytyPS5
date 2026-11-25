@@ -1,5 +1,6 @@
 #include "kernel/syncOnAddress.h"
 
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <atomic>
@@ -9,6 +10,13 @@
 #include <cstdlib>
 #include <thread>
 #include <vector>
+
+namespace Libs::LibKernel {
+Pthread PthreadSelfOrNull() { return nullptr; }
+bool PthreadHasAnyPendingSignal(Pthread) { return false; }
+bool BlockGuestSignals() { return false; }
+void RestoreGuestSignals(bool) {}
+} // namespace Libs::LibKernel
 
 namespace {
 

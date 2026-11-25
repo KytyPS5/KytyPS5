@@ -6432,6 +6432,49 @@ void TestRaisedSignalSkipsExitedTarget() {
 	Check(test, result == KERNEL_ERROR_ESRCH, "a raise to an exited thread did not fail with ESRCH");
 }
 
+std::atomic<int> g_raised_without_self_result {0};
+
+void* KYTY_SYSV_ABI RunTargetWithoutSelf(void* arg) {
+	using namespace Libs::LibKernel;
+	auto& target = *static_cast<SignalTarget*>(arg);
+	target.id    = std::this_thread::get_id();
+	auto* self   = PthreadSelfOrNull();
+	TestSetSelf(nullptr);
+	g_raised_without_self_result = RaisedSignalSetup("RaisedSignalRunsOnlyOnItsTarget")(self, 30);
+	target.progress              = 1;
+	while (!target.stop) {
+		std::this_thread::yield();
+	}
+	TestSetSelf(self);
+	target.progress = 2;
+	WaitUntil([] { return g_raised_signal_entries.load() != 0; });
+	return nullptr;
+}
+
+void TestRaisedSignalRunsOnlyOnItsTarget() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalRunsOnlyOnItsTarget";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	ResetRaisedSignal(false);
+	g_raised_signal_release = true;
+	StartSignalTarget(test, target, RunTargetWithoutSelf);
+	CheckOk(test, g_raised_without_self_result.load(), "raise exception from the target");
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	const int entries_without_self = g_raised_signal_entries.load();
+	target.stop                    = true;
+	Check(test, entries_without_self == 0,
+	      "a raised signal ran on a thread that is not its target");
+	Check(test, WaitUntil([] { return target.progress.load() == 2; }),
+	      "the target did not take its thread back");
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception again");
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test,
+	      g_raised_signal_entries.load() == 1 && g_raised_signal_thread.load() == target.id.load(),
+	      "the pending signal did not run once on its target");
+}
+
 std::atomic<bool>             g_mutex_wait_held {false};
 std::atomic<bool>             g_mutex_wait_raised {false};
 Libs::LibKernel::PthreadMutex g_signal_mutex = nullptr;
@@ -6752,6 +6795,7 @@ int main(int argc, char** argv) {
 	RunTest(TestRaisedSignalLeavesTargetSleepIntact);
 	RunTest(TestRaisedSignalWaitsForItsHandler);
 	RunTest(TestRaisedSignalSkipsExitedTarget);
+	RunTest(TestRaisedSignalRunsOnlyOnItsTarget);
 	RunTest(TestRaisedSignalRunsOutsideMutexLock);
 	RunTest(TestRaisedSignalRunsOutsideStaticObjectRegistry);
 

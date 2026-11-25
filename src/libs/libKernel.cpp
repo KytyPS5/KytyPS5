@@ -1050,6 +1050,9 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 
 static void SignalApcHandler(void* arg1, void* /*arg2*/, void* /*arg3*/, PCONTEXT context) {
 	auto* thread = static_cast<Pthread>(arg1);
+	if (PthreadSelfOrNull() != thread) {
+		return;
+	}
 	DispatchPendingSignals(thread, [thread, context](exception_handler_func_t handler, int signum) {
 		auto ctx = CreateSignalUcontext(context);
 		if (Loader::IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
@@ -1113,7 +1116,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		if (!PthreadQueuePendingSignal(thread, signum)) {
 			return KERNEL_ERROR_ESRCH;
 		}
-		if (target_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
+		if (thread == PthreadSelfOrNull()) {
 			const auto return_address = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 			DispatchPendingSignals(
 			    thread, [return_address](exception_handler_func_t handler, int raised) {

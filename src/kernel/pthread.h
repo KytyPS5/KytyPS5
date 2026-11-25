@@ -123,6 +123,7 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
                                   uint64_t* map_size);
 void TestSetMutexWaitHook(void (*hook)());
 void TestSetStaticObjectProgram(Loader::Program* program);
+void TestSetSelf(Pthread thread);
 #endif
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 bool PthreadKillHost(Pthread thread, int host_signal);

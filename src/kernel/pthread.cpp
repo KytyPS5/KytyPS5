@@ -801,6 +801,10 @@ static std::atomic<Loader::Program*> g_test_static_object_program {nullptr};
 void TestSetStaticObjectProgram(Loader::Program* program) {
 	g_test_static_object_program = program;
 }
+
+void TestSetSelf(Pthread thread) {
+	g_pthread_self = thread;
+}
 #endif
 
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {

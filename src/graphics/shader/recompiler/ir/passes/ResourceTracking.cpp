@@ -1740,6 +1740,8 @@ private:
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
 	                                DescriptorSource& material_source, MaterialKey kind) {
+		if (m_program.stage != ShaderType::Compute &&
+		    (kind == MaterialKey::Indexed || kind == MaterialKey::Heap)) return false;
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
 		const auto active = selected->Arg(0).Resolve();
@@ -1753,7 +1755,7 @@ private:
 			// buffers are checked at dispatch, storage images and address writes here. Pointer
 			// tables have no such domain, so a key that a same-dispatch write changes selects
 			// the root descriptor. Graphics heaps retain their full domain.
-			if (read == nullptr || (kind != MaterialKey::Guarded && m_program.stage != ShaderType::Compute) ||
+			if (read == nullptr ||
 			    (kind == MaterialKey::Heap && std::ranges::any_of(m_program.blocks, [](const Block* block) {
 				    return std::ranges::any_of(*block, [](const Inst& inst) {
 					    const auto op = inst.GetOpcode();

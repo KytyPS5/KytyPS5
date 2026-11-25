@@ -7,7 +7,9 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -96,6 +98,7 @@ private:
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
+	std::atomic<uint64_t>        m_next_pending_tick {std::numeric_limits<uint64_t>::max()};
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
 	OperationState               m_operation_state      = OperationState::Open;
 };

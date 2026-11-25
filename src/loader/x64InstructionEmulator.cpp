@@ -845,4 +845,139 @@ void CompleteLoad(void* native_context, size_t length, uint32_t value) {
 	context.Advance(length);
 }
 
+bool TryEmulateLoadFromBacking(void* native_context, const void* data, size_t size) {
+	if (native_context == nullptr || data == nullptr || size == 0) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Context context {static_cast<PCONTEXT>(native_context)};
+#elif defined(__APPLE__)
+	auto* saved_context = static_cast<ucontext_t*>(native_context);
+	if (saved_context->uc_mcontext == nullptr) {
+		return false;
+	}
+	Context context {saved_context};
+#else
+	Context context {static_cast<ucontext_t*>(native_context)};
+#endif
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) ||
+	    !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(context.Rip()),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction,
+	                                         operands))) {
+		return false;
+	}
+	if (instruction.operand_count_visible != 2 ||
+	    operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+		return false;
+	}
+	const auto mem_bytes = static_cast<size_t>(operands[1].size / 8u);
+	if (mem_bytes == 0 || mem_bytes > 16 || mem_bytes > size) {
+		return false;
+	}
+	const auto reg_class = ZydisRegisterGetClass(operands[0].reg.value);
+	const auto index     = ZydisRegisterGetId(operands[0].reg.value);
+	if (index < 0 || index >= 16) {
+		return false;
+	}
+	if (reg_class == ZYDIS_REGCLASS_XMM) {
+		auto* dest_xmm = context.Xmm(static_cast<uint8_t>(index));
+		if (dest_xmm == nullptr) {
+			return false;
+		}
+		switch (instruction.mnemonic) {
+			case ZYDIS_MNEMONIC_MOVSS:
+			case ZYDIS_MNEMONIC_MOVSD: {
+				std::memcpy(dest_xmm, data, mem_bytes);
+				context.Advance(instruction.length);
+				return true;
+			}
+			case ZYDIS_MNEMONIC_MOVD:
+			case ZYDIS_MNEMONIC_MOVQ:
+			case ZYDIS_MNEMONIC_MOVUPS:
+			case ZYDIS_MNEMONIC_MOVUPD:
+			case ZYDIS_MNEMONIC_MOVDQU:
+			case ZYDIS_MNEMONIC_MOVAPS:
+			case ZYDIS_MNEMONIC_MOVAPD:
+			case ZYDIS_MNEMONIC_MOVDQA:
+			case ZYDIS_MNEMONIC_VMOVSS:
+			case ZYDIS_MNEMONIC_VMOVSD:
+			case ZYDIS_MNEMONIC_VMOVD:
+			case ZYDIS_MNEMONIC_VMOVQ:
+			case ZYDIS_MNEMONIC_VMOVUPS:
+			case ZYDIS_MNEMONIC_VMOVUPD:
+			case ZYDIS_MNEMONIC_VMOVDQU:
+			case ZYDIS_MNEMONIC_VMOVAPS:
+			case ZYDIS_MNEMONIC_VMOVAPD:
+			case ZYDIS_MNEMONIC_VMOVDQA: {
+				uint8_t reg_bytes[16] {};
+				std::memcpy(reg_bytes, data, mem_bytes);
+				std::memcpy(dest_xmm, reg_bytes, sizeof(reg_bytes));
+				if (instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX) {
+					context.ClearUpperYmm(static_cast<uint8_t>(index));
+				}
+				context.Advance(instruction.length);
+				return true;
+			}
+			default: return false;
+		}
+	}
+	if (mem_bytes > 8) {
+		return false;
+	}
+	uint64_t raw = 0;
+	std::memcpy(&raw, data, mem_bytes);
+	uint64_t result = 0;
+	switch (instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_MOV:
+		case ZYDIS_MNEMONIC_MOVZX:
+			result = raw;
+			break;
+		case ZYDIS_MNEMONIC_MOVSX:
+		case ZYDIS_MNEMONIC_MOVSXD:
+			switch (mem_bytes) {
+				case 1:
+					result = static_cast<uint64_t>(
+					    static_cast<int64_t>(static_cast<int8_t>(raw)));
+					break;
+				case 2:
+					result = static_cast<uint64_t>(
+					    static_cast<int64_t>(static_cast<int16_t>(raw)));
+					break;
+				case 4:
+					result = static_cast<uint64_t>(
+					    static_cast<int64_t>(static_cast<int32_t>(raw)));
+					break;
+				default: return false;
+			}
+			break;
+		default: return false;
+	}
+	auto& dst = context.Gpr(static_cast<uint8_t>(index));
+	using GprValue = std::remove_reference_t<decltype(dst)>;
+	if (reg_class == ZYDIS_REGCLASS_GPR64) {
+		dst = static_cast<GprValue>(result);
+	} else if (reg_class == ZYDIS_REGCLASS_GPR32) {
+		dst = static_cast<GprValue>(static_cast<uint32_t>(result));
+	} else if (reg_class == ZYDIS_REGCLASS_GPR16) {
+		dst = static_cast<GprValue>((static_cast<uint64_t>(dst) & ~uint64_t {0xffffu}) |
+		                            (result & 0xffffu));
+	} else if (reg_class == ZYDIS_REGCLASS_GPR8) {
+		if (operands[0].reg.value >= ZYDIS_REGISTER_AH &&
+		    operands[0].reg.value <= ZYDIS_REGISTER_BH) {
+			return false;
+		}
+		dst = static_cast<GprValue>((static_cast<uint64_t>(dst) & ~uint64_t {0xffu}) |
+		                            (result & 0xffu));
+	} else {
+		return false;
+	}
+	context.Advance(instruction.length);
+	return true;
+}
+
 } // namespace Loader::X64InstructionEmulator

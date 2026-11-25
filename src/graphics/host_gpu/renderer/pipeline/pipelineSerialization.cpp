@@ -41,24 +41,13 @@ struct Frame {
 	uint64_t checksum        = 0; // XXH3 of the compressed bytes.
 };
 
-// Changes with every build, so records never meet code that encodes them differently. Zero when
-// the executable cannot be found.
+// Changes whenever serialized shader/pipeline record layouts change.
 uint64_t BuildStamp() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::array<wchar_t, 32768> name {};
-	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
-	const std::filesystem::path path = name.data();
-#elif defined(__APPLE__)
-	std::array<char, 4096> name {};
-	auto size = static_cast<uint32_t>(name.size());
-	_NSGetExecutablePath(name.data(), &size);
-	const std::filesystem::path path = name.data();
-#else
-	const std::filesystem::path path = "/proc/self/exe";
-#endif
-	std::error_code error;
-	const auto      time = std::filesystem::last_write_time(path, error).time_since_epoch().count();
-	return error ? 0 : static_cast<uint64_t>(time);
+	return uint64_t {0x4b59545953484441ull} ^
+	       (static_cast<uint64_t>(sizeof(ShaderModule)) << 1u) ^
+	       (static_cast<uint64_t>(sizeof(ShaderRecompiler::Spirv::Profile)) << 9u) ^
+	       (static_cast<uint64_t>(sizeof(GraphicsPipelineKey)) << 17u) ^
+	       (static_cast<uint64_t>(sizeof(ShaderTessellationInputInfo)) << 25u);
 }
 
 // What every record depends on besides its own fields; empty when the build is unknown.

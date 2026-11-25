@@ -105,7 +105,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(flush_draws);
 	KYTY_CFG_GET(tessellation_enabled);
 	KYTY_CFG_GET(occlusion_queries_enabled);
-	KYTY_CFG_GET(relaxed_shader_float);
+	relaxed_shader_float = s.value("relaxed_shader_float", true).toBool();
 	KYTY_CFG_GET(native_rt);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
 	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();

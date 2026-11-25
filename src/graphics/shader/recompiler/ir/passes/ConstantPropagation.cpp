@@ -220,6 +220,72 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	return false;
 }
 
+uint32_t KnownNonzeroBits(Value value, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value.IsEmpty() || depth > 8u) {
+		return 0xffffffffu;
+	}
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32 ? value.U32() : 0xffffffffu;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return 0xffffffffu;
+	}
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::BitwiseAnd32:
+			return KnownNonzeroBits(inst->Arg(0), depth + 1u) &
+			       KnownNonzeroBits(inst->Arg(1), depth + 1u);
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+			return KnownNonzeroBits(inst->Arg(0), depth + 1u) |
+			       KnownNonzeroBits(inst->Arg(1), depth + 1u);
+		case ValueOpcode::ShiftLeftLogical32: {
+			const auto shift = Arg(*inst, 1);
+			if (IsImmediate(shift, Type::U32) && shift.U32() < 32u) {
+				return KnownNonzeroBits(inst->Arg(0), depth + 1u) << shift.U32();
+			}
+			return 0xffffffffu;
+		}
+		case ValueOpcode::ShiftRightLogical32: {
+			const auto shift = Arg(*inst, 1);
+			if (IsImmediate(shift, Type::U32) && shift.U32() < 32u) {
+				return KnownNonzeroBits(inst->Arg(0), depth + 1u) >> shift.U32();
+			}
+			return 0xffffffffu;
+		}
+		case ValueOpcode::BitFieldUExtract: {
+			const auto width = Arg(*inst, 2);
+			if (IsImmediate(width, Type::U32) && width.U32() < 32u) {
+				return width.U32() == 0u ? 0u : ((1u << width.U32()) - 1u);
+			}
+			return 0xffffffffu;
+		}
+		case ValueOpcode::SelectU32:
+			return KnownNonzeroBits(inst->Arg(1), depth + 1u) |
+			       KnownNonzeroBits(inst->Arg(2), depth + 1u);
+		case ValueOpcode::ConvertU32U8:
+			return 0xffu;
+		case ValueOpcode::ConvertU32U16:
+			return 0xffffu;
+		default: return 0xffffffffu;
+	}
+}
+
+bool FoldKnownBitsComparison(Inst& inst) {
+	const bool equal = inst.GetOpcode() == ValueOpcode::IEqual32;
+	for (uint32_t arm = 0; arm < 2u; ++arm) {
+		const auto imm = Arg(inst, arm);
+		if (!IsImmediate(imm, Type::U32)) continue;
+		const auto other = Arg(inst, arm ^ 1u);
+		if ((imm.U32() & ~KnownNonzeroBits(other)) != 0u) {
+			Replace(inst, Value(!equal));
+			return true;
+		}
+	}
+	return false;
+}
+
 void FoldZeroComparison(Block& block, Block::iterator instruction, FoldWorklist& worklist) {
 	auto& inst = *instruction;
 	Value value;
@@ -254,6 +320,10 @@ void FoldZeroComparison(Block& block, Block::iterator instruction, FoldWorklist&
 	}
 }
 
+bool MatchEqualityImmediate(Value cond, Value& out_x, uint32_t& out_c);
+bool TrySimplifyEqualityMuxChain(Block& block, Block::iterator root_it,
+                                 FoldWorklist* worklist = nullptr);
+
 void FoldInstruction(Block& block, Block::iterator instruction,
 	                      FoldWorklist& worklist) {
 	auto& inst = *instruction;
@@ -273,7 +343,11 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: FoldSelect(inst); return;
+		case ValueOpcode::SelectF32:
+			if (!FoldSelect(inst) && inst.GetOpcode() == ValueOpcode::SelectU32) {
+				TrySimplifyEqualityMuxChain(block, instruction, &worklist);
+			}
+			return;
 		case ValueOpcode::FPCmpClass32: {
 			const auto mask = Arg(inst, 1);
 			if (!IsImmediate(mask, Type::U32)) {
@@ -569,11 +643,17 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			for (uint32_t arm = 0; arm < 2u; ++arm) {
 				const auto mask = Arg(inst, arm);
 				if (!IsImmediate(mask, Type::U32)) continue;
-				if (mask.U32() == 0u) {
+				const auto other = Arg(inst, arm ^ 1u);
+				const auto known = KnownNonzeroBits(other);
+				if ((mask.U32() & known) == 0u) {
 					Replace(inst, Value(0u));
 					return;
 				}
-				const auto* shifted = Arg(inst, arm ^ 1u).TryInstruction();
+				if ((known & ~mask.U32()) == 0u) {
+					Replace(inst, other);
+					return;
+				}
+				const auto* shifted = other.TryInstruction();
 				if (shifted == nullptr || shifted->GetOpcode() != ValueOpcode::ShiftLeftLogical32) continue;
 				const auto shift = Arg(*shifted, 1);
 				if (!IsImmediate(shift, Type::U32)) continue;
@@ -655,11 +735,13 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			FoldBinary(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });
 			return;
 		case ValueOpcode::IEqual32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a == b; }))
+			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a == b; }) &&
+			    !FoldKnownBitsComparison(inst))
 				FoldZeroComparison(block, instruction, worklist);
 			return;
 		case ValueOpcode::INotEqual32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a != b; }))
+			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a != b; }) &&
+			    !FoldKnownBitsComparison(inst))
 				FoldZeroComparison(block, instruction, worklist);
 			return;
 		case ValueOpcode::ULessThan32:
@@ -1002,6 +1084,888 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 			if (source == nullptr) continue;
 			const auto [entry, inserted] = bitcasts.try_emplace(source, &inst);
 			if (!inserted) Replace(inst, Value(entry->second));
+		}
+	}
+}
+
+namespace {
+
+bool IsPurePerLaneAlu(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::Phi:
+		case ValueOpcode::Identity:
+		case ValueOpcode::BitCastU16F16:
+		case ValueOpcode::BitCastF16U16:
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32:
+		case ValueOpcode::BitCastU64F64:
+		case ValueOpcode::BitCastF64U64:
+		case ValueOpcode::ConvertU16U32:
+		case ValueOpcode::ConvertU32U16:
+		case ValueOpcode::ConvertU8U32:
+		case ValueOpcode::ConvertU32U8:
+		case ValueOpcode::ConvertF32F16:
+		case ValueOpcode::ConvertF16F32:
+		case ValueOpcode::ConvertS32F32:
+		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertF32S32:
+		case ValueOpcode::ConvertF64S32:
+		case ValueOpcode::ConvertF32F64:
+		case ValueOpcode::ConvertF64F32:
+		case ValueOpcode::ConvertF32U32:
+		case ValueOpcode::ConvertF64U32:
+		case ValueOpcode::CompositeConstructU64:
+		case ValueOpcode::CompositeConstructU32x2:
+		case ValueOpcode::CompositeConstructU32x3:
+		case ValueOpcode::CompositeConstructF32x2:
+		case ValueOpcode::CompositeConstructU32x4:
+		case ValueOpcode::CompositeExtractU64:
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x3:
+		case ValueOpcode::CompositeExtractU32x4:
+		case ValueOpcode::PackHalf2x16:
+		case ValueOpcode::PackSnorm2x16:
+		case ValueOpcode::PackUnorm2x16:
+		case ValueOpcode::PackFloat2x16Rtz:
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::BitFieldInsert:
+		case ValueOpcode::BitFieldUExtract:
+		case ValueOpcode::BitFieldSExtract:
+		case ValueOpcode::SelectU1:
+		case ValueOpcode::SelectF32:
+		case ValueOpcode::SelectF64:
+		case ValueOpcode::SelectU32:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IAdd64:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::ISub64:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::SMulHi:
+		case ValueOpcode::UMulHi:
+		case ValueOpcode::IAbs32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftLeftLogical64:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::ShiftRightLogical64:
+		case ValueOpcode::ShiftRightArithmetic32:
+		case ValueOpcode::ShiftRightArithmetic64:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseAnd64:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitReverse32:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindUMsb32:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::SMin32:
+		case ValueOpcode::UMin32:
+		case ValueOpcode::SMax32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::SMinTri32:
+		case ValueOpcode::UMinTri32:
+		case ValueOpcode::SMaxTri32:
+		case ValueOpcode::UMaxTri32:
+		case ValueOpcode::SMedTri32:
+		case ValueOpcode::UMedTri32:
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThan64:
+		case ValueOpcode::SLessThanEqual64:
+		case ValueOpcode::ULessThanEqual64:
+		case ValueOpcode::UGreaterThanEqual64:
+		case ValueOpcode::ULessThan32:
+		case ValueOpcode::ULessThan64:
+		case ValueOpcode::IEqual32:
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::SLessThanEqual32:
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::SGreaterThan32:
+		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThan64:
+		case ValueOpcode::INotEqual32:
+		case ValueOpcode::INotEqual64:
+		case ValueOpcode::SGreaterThanEqual32:
+		case ValueOpcode::UGreaterThanEqual32:
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalXor:
+		case ValueOpcode::LogicalNot:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPOrdEqual64:
+		case ValueOpcode::FPOrdLessThanEqual64:
+		case ValueOpcode::FPOrdGreaterThanEqual64:
+		case ValueOpcode::FPOrdNotEqual64:
+		case ValueOpcode::FPOrdLessThan64:
+		case ValueOpcode::FPOrdGreaterThan64:
+		case ValueOpcode::FPUnordEqual64:
+		case ValueOpcode::FPUnordNotEqual64:
+		case ValueOpcode::FPUnordLessThan64:
+		case ValueOpcode::FPUnordGreaterThan64:
+		case ValueOpcode::FPUnordLessThanEqual64:
+		case ValueOpcode::FPUnordGreaterThanEqual64:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::FPIsNan64:
+		case ValueOpcode::FPCmpClass32:
+		case ValueOpcode::FPCmpClass16:
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMad32:
+		case ValueOpcode::FPMul32:
+		case ValueOpcode::FPAdd64:
+		case ValueOpcode::FPMul64:
+		case ValueOpcode::FPFma64:
+		case ValueOpcode::FPRecip64:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPMin64:
+		case ValueOpcode::FPMax64:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipIFlag32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPSin:
+		case ValueOpcode::FPCos:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2:
+		case ValueOpcode::FPLdexp:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPTrunc32:
+		case ValueOpcode::FPFloor64:
+		case ValueOpcode::FPCeil64:
+		case ValueOpcode::FPTrunc64:
+		case ValueOpcode::FPFract32:
+		case ValueOpcode::FPFract64:
+			return true;
+		default:
+			return false;
+	}
+}
+
+bool IsExecPredicatedOp(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::SetAttribute:
+		case ValueOpcode::WriteSharedU8:
+		case ValueOpcode::WriteSharedU16:
+		case ValueOpcode::WriteSharedU32:
+		case ValueOpcode::WriteSharedU32x2:
+		case ValueOpcode::WriteSharedU32x3:
+		case ValueOpcode::WriteSharedU32x4:
+		case ValueOpcode::LoadSharedU8:
+		case ValueOpcode::LoadSharedU16:
+		case ValueOpcode::LoadSharedU32:
+		case ValueOpcode::LoadSharedU32x2:
+		case ValueOpcode::LoadSharedU32x3:
+		case ValueOpcode::LoadSharedU32x4:
+		case ValueOpcode::LoadBufferU8:
+		case ValueOpcode::LoadBufferU16:
+		case ValueOpcode::LoadBufferU32:
+		case ValueOpcode::LoadBufferU32x2:
+		case ValueOpcode::LoadBufferU32x3:
+		case ValueOpcode::LoadBufferU32x4:
+		case ValueOpcode::StoreBufferU8:
+		case ValueOpcode::StoreBufferU16:
+		case ValueOpcode::StoreBufferU32:
+		case ValueOpcode::StoreBufferU32x2:
+		case ValueOpcode::StoreBufferU32x3:
+		case ValueOpcode::StoreBufferU32x4:
+		case ValueOpcode::LoadAddressU8:
+		case ValueOpcode::LoadAddressU16:
+		case ValueOpcode::LoadAddressU32:
+		case ValueOpcode::LoadDeviceAddressU32:
+		case ValueOpcode::StoreAddressU8:
+		case ValueOpcode::StoreAddressU16:
+		case ValueOpcode::StoreAddressU32:
+		case ValueOpcode::ImageRead:
+		case ValueOpcode::ImageWrite:
+			return true;
+		default:
+			return false;
+	}
+}
+
+bool IsZeroBitsImmediate(Value value) {
+	value = value.Resolve();
+	if (!value.IsImmediate()) {
+		return false;
+	}
+	if (value.GetType() == Type::U32) {
+		return value.U32() == 0u;
+	}
+	if (value.GetType() == Type::F32) {
+		return std::bit_cast<uint32_t>(value.F32Value()) == 0u;
+	}
+	return false;
+}
+
+bool IsZeroWhenExecFalseLoad(const Inst& inst, Value& out_exec) {
+	switch (inst.GetOpcode()) {
+		case ValueOpcode::LoadSharedU8:
+		case ValueOpcode::LoadSharedU16:
+		case ValueOpcode::LoadSharedU32:
+		case ValueOpcode::LoadSharedU32x2:
+		case ValueOpcode::LoadSharedU32x3:
+		case ValueOpcode::LoadSharedU32x4:
+		case ValueOpcode::LoadBufferU8:
+		case ValueOpcode::LoadBufferU16:
+		case ValueOpcode::LoadBufferU32:
+		case ValueOpcode::LoadBufferU32x2:
+		case ValueOpcode::LoadBufferU32x3:
+		case ValueOpcode::LoadBufferU32x4:
+		case ValueOpcode::LoadAddressU8:
+		case ValueOpcode::LoadAddressU16:
+		case ValueOpcode::LoadAddressU32:
+		case ValueOpcode::LoadDeviceAddressU32:
+			if (inst.NumArgs() == 0) return false;
+			out_exec = Arg(inst, inst.NumArgs() - 1u);
+			return true;
+		default:
+			return false;
+	}
+}
+
+struct ActiveLaneSimplifier {
+	std::unordered_map<const Inst*, uint32_t> order_map;
+	std::unordered_map<uint64_t, Value>       false_imm_memo;
+	std::unordered_map<uint64_t, bool>        owt_memo;
+
+	static uint64_t MemoKey(uint32_t inst_order, Value cond) {
+		cond               = cond.Resolve();
+		const auto* c_inst = cond.TryInstruction();
+		const auto  c_tag  = c_inst != nullptr
+		                         ? reinterpret_cast<uintptr_t>(c_inst)
+		                         : static_cast<uintptr_t>(cond.IsImmediate() && cond.GetType() == Type::U1 && cond.U1() ? 1u : 2u);
+		return (static_cast<uint64_t>(inst_order) << 32u) ^
+		       static_cast<uint64_t>((c_tag >> 3u) ^ (c_tag >> 35u));
+	}
+
+	uint32_t OrderOf(const Inst* inst) const {
+		const auto found = order_map.find(inst);
+		return found != order_map.end() ? found->second : UINT32_MAX;
+	}
+
+	Value ResolveWhenFalseImmediate(Value value, Value cond) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			return value;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return {};
+		}
+		const auto v_ord = OrderOf(inst);
+		if (v_ord == UINT32_MAX) {
+			return {};
+		}
+		const auto key = MemoKey(v_ord, cond);
+		if (const auto found = false_imm_memo.find(key); found != false_imm_memo.end()) {
+			return found->second;
+		}
+		false_imm_memo.emplace(key, Value {});
+		const auto zero_for = [](Type type) -> Value {
+			switch (type) {
+				case Type::U8:  return Value(uint8_t {0});
+				case Type::U16: return Value(uint16_t {0});
+				case Type::U32: return Value(0u);
+				default:        return {};
+			}
+		};
+		Value result;
+		if (inst->GetOpcode() == ValueOpcode::SelectU32 &&
+		    PredicateImplies(Arg(*inst, 0), cond)) {
+			const auto arg2      = Arg(*inst, 2);
+			const auto* arg2_ins = arg2.TryInstruction();
+			if (arg2.IsImmediate()) {
+				result = arg2;
+			} else if (arg2_ins != nullptr && OrderOf(arg2_ins) < v_ord) {
+				result = ResolveWhenFalseImmediate(arg2, cond);
+			}
+		} else if (inst->GetOpcode() == ValueOpcode::Phi && inst->NumArgs() != 0) {
+			Value invariant;
+			bool  ok = true;
+			for (size_t i = 0; i < inst->NumArgs(); ++i) {
+				const auto  arm     = Arg(*inst, i);
+				const auto* arm_ins = arm.TryInstruction();
+				if (!arm.IsImmediate() && (arm_ins == nullptr || OrderOf(arm_ins) >= v_ord)) {
+					ok = false;
+					break;
+				}
+				const auto arm_imm = ResolveWhenFalseImmediate(arm, cond);
+				if (arm_imm.IsEmpty()) {
+					ok = false;
+					break;
+				}
+				if (invariant.IsEmpty()) {
+					invariant = arm_imm;
+				} else if (invariant != arm_imm) {
+					ok = false;
+					break;
+				}
+			}
+			if (ok) {
+				result = invariant;
+			}
+		} else if (Value load_exec;
+		           IsZeroWhenExecFalseLoad(*inst, load_exec) &&
+		           (inst->GetType() == Type::U32 || inst->GetType() == Type::U16 ||
+		            inst->GetType() == Type::U8) &&
+		           PredicateImplies(load_exec, cond)) {
+			result = zero_for(inst->GetType());
+		} else if ((inst->GetOpcode() == ValueOpcode::CompositeExtractU32x2 ||
+		            inst->GetOpcode() == ValueOpcode::CompositeExtractU32x3 ||
+		            inst->GetOpcode() == ValueOpcode::CompositeExtractU32x4) &&
+		           inst->NumArgs() >= 1u) {
+			if (const auto* comp_inst = Arg(*inst, 0).TryInstruction(); comp_inst != nullptr) {
+				if (Value load_exec;
+				    IsZeroWhenExecFalseLoad(*comp_inst, load_exec) &&
+				    PredicateImplies(load_exec, cond)) {
+					result = Value(0u);
+				} else if (comp_inst->GetOpcode() == ValueOpcode::ImageRead &&
+				           comp_inst->NumArgs() >= 1u &&
+				           PredicateImplies(Arg(*comp_inst, comp_inst->NumArgs() - 1u), cond)) {
+					result = Value(0u);
+				}
+			}
+		} else if ((inst->GetOpcode() == ValueOpcode::ConvertU32U8 ||
+		            inst->GetOpcode() == ValueOpcode::ConvertU32U16 ||
+		            inst->GetOpcode() == ValueOpcode::ConvertU8U32 ||
+		            inst->GetOpcode() == ValueOpcode::ConvertU16U32 ||
+		            inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 ||
+		            inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 ||
+		            inst->GetOpcode() == ValueOpcode::ShiftRightArithmetic32 ||
+		            inst->GetOpcode() == ValueOpcode::BitFieldUExtract ||
+		            inst->GetOpcode() == ValueOpcode::BitFieldSExtract ||
+		            inst->GetOpcode() == ValueOpcode::BitReverse32 ||
+		            inst->GetOpcode() == ValueOpcode::BitCount32 ||
+		            inst->GetOpcode() == ValueOpcode::IAbs32) &&
+		           inst->NumArgs() >= 1u) {
+			const auto a0     = Arg(*inst, 0);
+			const auto* a0_in = a0.TryInstruction();
+			if (a0.IsImmediate() || (a0_in != nullptr && OrderOf(a0_in) < v_ord)) {
+				if (IsZeroBitsImmediate(ResolveWhenFalseImmediate(a0, cond))) {
+					result = zero_for(inst->GetType());
+				}
+			}
+		} else if ((inst->GetOpcode() == ValueOpcode::BitwiseAnd32 ||
+		            inst->GetOpcode() == ValueOpcode::IMul32 ||
+		            inst->GetOpcode() == ValueOpcode::UMulHi ||
+		            inst->GetOpcode() == ValueOpcode::SMulHi ||
+		            inst->GetOpcode() == ValueOpcode::UMin32) &&
+		           inst->NumArgs() >= 2u) {
+			for (size_t i = 0; i < 2u; ++i) {
+				const auto ai     = Arg(*inst, i);
+				const auto* ai_in = ai.TryInstruction();
+				if (ai.IsImmediate() || (ai_in != nullptr && OrderOf(ai_in) < v_ord)) {
+					if (IsZeroBitsImmediate(ResolveWhenFalseImmediate(ai, cond))) {
+						result = Value(0u);
+						break;
+					}
+				}
+			}
+		} else if ((inst->GetOpcode() == ValueOpcode::IAdd32 ||
+		            inst->GetOpcode() == ValueOpcode::ISub32 ||
+		            inst->GetOpcode() == ValueOpcode::BitwiseOr32 ||
+		            inst->GetOpcode() == ValueOpcode::BitwiseXor32) &&
+		           inst->NumArgs() >= 2u) {
+			const auto a0     = Arg(*inst, 0);
+			const auto a1     = Arg(*inst, 1);
+			const auto* a0_in = a0.TryInstruction();
+			const auto* a1_in = a1.TryInstruction();
+			if ((a0.IsImmediate() || (a0_in != nullptr && OrderOf(a0_in) < v_ord)) &&
+			    (a1.IsImmediate() || (a1_in != nullptr && OrderOf(a1_in) < v_ord))) {
+				if (IsZeroBitsImmediate(ResolveWhenFalseImmediate(a0, cond)) &&
+				    IsZeroBitsImmediate(ResolveWhenFalseImmediate(a1, cond))) {
+					result = Value(0u);
+				}
+			}
+		}
+		false_imm_memo[key] = result;
+		return result;
+	}
+
+	bool IsZeroWhenFalse(Value value, Value cond, uint32_t depth = 0) {
+		if (depth > 5u) {
+			return false;
+		}
+		value = value.Resolve();
+		if (IsZeroBitsImmediate(value)) {
+			return true;
+		}
+		if (IsZeroBitsImmediate(ResolveWhenFalseImmediate(value, cond))) {
+			return true;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return false;
+		}
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitCastF32U32:
+			case ValueOpcode::BitCastU32F32:
+				return IsZeroWhenFalse(inst->Arg(0), cond, depth + 1u);
+			case ValueOpcode::FPMul32:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::BitwiseAnd32:
+				return IsZeroWhenFalse(inst->Arg(0), cond, depth + 1u) ||
+				       IsZeroWhenFalse(inst->Arg(1), cond, depth + 1u);
+			default:
+				return false;
+		}
+	}
+
+	bool PredicateImplies(Value sub, Value sup, uint32_t depth = 0) {
+		sub = sub.Resolve();
+		sup = sup.Resolve();
+		if (sub == sup) {
+			return true;
+		}
+		if (depth > 4u || sub.IsEmpty() || sup.IsEmpty()) {
+			return false;
+		}
+		if (const auto* sub_inst = sub.TryInstruction()) {
+			if (sub_inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+				if (PredicateImplies(sub_inst->Arg(0), sup, depth + 1u) ||
+				    PredicateImplies(sub_inst->Arg(1), sup, depth + 1u)) {
+					return true;
+				}
+			} else if (sub_inst->GetOpcode() == ValueOpcode::LogicalNot) {
+				if (const auto* eq = Arg(*sub_inst, 0).TryInstruction();
+				    eq != nullptr && eq->GetOpcode() == ValueOpcode::FPOrdEqual32) {
+					for (uint32_t arm = 0; arm < 2u; ++arm) {
+						if (IsZeroBitsImmediate(eq->Arg(arm)) &&
+						    IsZeroWhenFalse(eq->Arg(arm ^ 1u), sup)) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+		if (const auto* sup_inst = sup.TryInstruction();
+		    sup_inst != nullptr && sup_inst->GetOpcode() == ValueOpcode::LogicalOr) {
+			if (PredicateImplies(sub, sup_inst->Arg(0), depth + 1u) ||
+			    PredicateImplies(sub, sup_inst->Arg(1), depth + 1u)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool OnlyObservedWhenTrue(const Inst& node, Value cond) {
+		cond = cond.Resolve();
+		if (cond.IsEmpty()) {
+			return false;
+		}
+		const auto n_ord = OrderOf(&node);
+		if (n_ord == UINT32_MAX) {
+			return false;
+		}
+		const auto key = MemoKey(n_ord, cond);
+		if (const auto found = owt_memo.find(key); found != owt_memo.end()) {
+			return found->second;
+		}
+		owt_memo.emplace(key, false);
+		for (const auto& use: node.Uses()) {
+			const auto* user = use.user;
+			if (user == nullptr || user->Parent() == nullptr) {
+				return false;
+			}
+			const auto u_op    = user->GetOpcode();
+			const auto arg_idx = use.operand;
+			if (u_op == ValueOpcode::Identity) {
+				if (!user->HasUses()) {
+					continue;
+				}
+				if (OrderOf(user) <= n_ord || !OnlyObservedWhenTrue(*user, cond)) {
+					return false;
+				}
+				continue;
+			}
+			if (IsExecPredicatedOp(u_op)) {
+				if (user->NumArgs() >= 2u && arg_idx < user->NumArgs() - 1u &&
+				    PredicateImplies(user->Arg(user->NumArgs() - 1u), cond)) {
+					continue;
+				}
+				return false;
+			}
+			if (OrderOf(user) <= n_ord) {
+				return false;
+			}
+			if (u_op == ValueOpcode::SelectU32 || u_op == ValueOpcode::SelectF32 ||
+			    u_op == ValueOpcode::SelectU1 || u_op == ValueOpcode::SelectF64) {
+				const auto u_cond = Arg(*user, 0);
+				if (arg_idx == 1u && PredicateImplies(u_cond, cond)) {
+					continue;
+				}
+				if ((arg_idx == 1u || arg_idx == 2u) && OnlyObservedWhenTrue(*user, cond)) {
+					continue;
+				}
+				return false;
+			}
+			if (IsPurePerLaneAlu(u_op) && OnlyObservedWhenTrue(*user, cond)) {
+				continue;
+			}
+			return false;
+		}
+		owt_memo[key] = true;
+		return true;
+	}
+};
+
+bool MatchEqualityImmediate(Value cond, Value& out_x, uint32_t& out_c) {
+	const auto* inst = cond.Resolve().TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::IEqual32) {
+		return false;
+	}
+	const auto lhs = Arg(*inst, 0);
+	const auto rhs = Arg(*inst, 1);
+	Value      x;
+	uint32_t   c = 0;
+	if (IsImmediate(rhs, Type::U32) && !lhs.IsImmediate()) {
+		x = lhs;
+		c = rhs.U32();
+	} else if (IsImmediate(lhs, Type::U32) && !rhs.IsImmediate()) {
+		x = rhs;
+		c = lhs.U32();
+	} else {
+		return false;
+	}
+	if (const auto* shl = x.TryInstruction();
+	    shl != nullptr && shl->GetOpcode() == ValueOpcode::ShiftLeftLogical32) {
+		const auto shift = Arg(*shl, 1);
+		if (IsImmediate(shift, Type::U32) && shift.U32() > 0u && shift.U32() < 32u) {
+			const auto s = shift.U32();
+			if ((c & ((1u << s) - 1u)) == 0u &&
+			    ((KnownNonzeroBits(Arg(*shl, 0)) >> (32u - s)) == 0u)) {
+				x = Arg(*shl, 0);
+				c >>= s;
+			}
+		}
+	}
+	out_x = x;
+	out_c = c;
+	return true;
+}
+
+bool TrySimplifyEqualityMuxChain(Block& block, Block::iterator root_it, FoldWorklist* worklist) {
+	auto& root = *root_it;
+	if (root.GetOpcode() != ValueOpcode::SelectU32) {
+		return false;
+	}
+	Value    x;
+	uint32_t first_c = 0;
+	if (!MatchEqualityImmediate(Arg(root, 0), x, first_c)) {
+		return false;
+	}
+	// Only rewrite chains starting from a root SelectU32 that is not itself the false
+	// arm of another SelectU32 testing the same selector x.
+	for (const auto& use: root.Uses()) {
+		if (use.user == nullptr || use.user->GetOpcode() != ValueOpcode::SelectU32 ||
+		    use.operand != 2u) {
+			continue;
+		}
+		Value    parent_x;
+		uint32_t parent_c = 0;
+		if (MatchEqualityImmediate(Arg(*use.user, 0), parent_x, parent_c) && parent_x == x) {
+			return false;
+		}
+	}
+	struct MuxArm {
+		Inst*    select_inst = nullptr;
+		Value    cond;
+		uint32_t c = 0;
+		Value    v;
+	};
+	std::vector<MuxArm> arms;
+	arms.push_back({&root, Arg(root, 0), first_c, Arg(root, 1)});
+	Value curr = Arg(root, 2);
+	while (auto* next = curr.TryInstruction()) {
+		if (next->GetOpcode() != ValueOpcode::SelectU32 || next->Parent() != &block ||
+		    !HasOneUse(*next)) {
+			break;
+		}
+		Value    arm_x;
+		uint32_t arm_c = 0;
+		if (!MatchEqualityImmediate(Arg(*next, 0), arm_x, arm_c) || arm_x != x) {
+			break;
+		}
+		if (std::ranges::any_of(arms, [&](const MuxArm& a) { return a.c == arm_c; })) {
+			break;
+		}
+		arms.push_back({next, Arg(*next, 0), arm_c, Arg(*next, 1)});
+		curr = Arg(*next, 2);
+	}
+	if (arms.size() < 2u) {
+		return false;
+	}
+	Value base_default = curr;
+	const auto known_mask = KnownNonzeroBits(x);
+	const auto bit_count  = static_cast<uint32_t>(std::popcount(known_mask));
+	const bool has_zero_arm =
+	    std::ranges::any_of(arms, [](const MuxArm& a) { return a.c == 0u; });
+	const bool all_within_mask = std::ranges::all_of(
+	    arms, [&](const MuxArm& a) { return (a.c & ~known_mask) == 0u; });
+	const auto prepend_inst = [&](ValueOpcode op, std::initializer_list<Value> args) {
+		return worklist != nullptr ? worklist->Prepend(block, root_it, op, args)
+		                           : block.PrependNewInst(root_it, op, args);
+	};
+	bool rebased = false;
+	if (bit_count >= 1u && bit_count <= 5u && !has_zero_arm && all_within_mask &&
+	    arms.size() + 1u == (1u << bit_count)) {
+		// {c_0, ..., c_{n-1}} U {0} exhausts all possible values of x.
+		std::vector<Value> candidates;
+		candidates.reserve(arms.size() + 1u);
+		for (const auto& arm: arms) {
+			candidates.push_back(arm.v);
+		}
+		candidates.push_back(base_default);
+		Value    best_val   = base_default;
+		uint32_t best_count = 0;
+		for (const auto& cand: candidates) {
+			const auto cnt = static_cast<uint32_t>(std::ranges::count(candidates, cand));
+			if (cnt > best_count || (cnt == best_count && cand == base_default)) {
+				best_count = cnt;
+				best_val   = cand;
+			}
+		}
+		if (best_count >= 2u && best_val != base_default) {
+			const auto zero_cond =
+			    Value(&*prepend_inst(ValueOpcode::IEqual32, {x, Value(0u)}));
+			arms.push_back({nullptr, zero_cond, 0u, base_default});
+			base_default = best_val;
+			rebased      = true;
+		}
+	}
+	std::vector<MuxArm> kept;
+	kept.reserve(arms.size());
+	for (const auto& arm: arms) {
+		if (arm.v != base_default) {
+			kept.push_back(arm);
+		}
+	}
+	if (!rebased && kept.size() == arms.size()) {
+		return false;
+	}
+	if (kept.empty()) {
+		Replace(root, base_default);
+		return true;
+	}
+	Value built = base_default;
+	for (auto it = kept.rbegin(); it != kept.rend(); ++it) {
+		built = Value(&*prepend_inst(ValueOpcode::SelectU32, {it->cond, it->v, built}));
+	}
+	Replace(root, built);
+	return true;
+}
+
+} // namespace
+
+void SimplifyActiveLaneSelects(const BlockList& blocks) {
+	for (auto* block: blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			if (it->GetOpcode() == ValueOpcode::SelectU32) {
+				TrySimplifyEqualityMuxChain(*block, it);
+			}
+		}
+	}
+	ActiveLaneSimplifier simplifier;
+	uint32_t             total_insts = 0;
+	for (const auto* block: blocks) {
+		for (const auto& inst: *block) {
+			simplifier.order_map.emplace(&inst, total_insts++);
+		}
+	}
+	if (total_insts == 0) {
+		return;
+	}
+	for (uint32_t pass = 0; pass < 3u; ++pass) {
+		bool changed = false;
+		simplifier.false_imm_memo.clear();
+		for (auto* block: blocks) {
+			std::vector<Inst*> seen;
+			for (auto& inst: *block) {
+				const auto op = inst.GetOpcode();
+				if (op == ValueOpcode::Identity || op == ValueOpcode::Void) {
+					continue;
+				}
+				if (op == ValueOpcode::SelectU32) {
+					const auto self_ord = simplifier.OrderOf(&inst);
+					auto       c        = Arg(inst, 0);
+					auto       t        = Arg(inst, 1);
+					auto       f        = Arg(inst, 2);
+					if (t == f) {
+						Replace(inst, t);
+						changed = true;
+						continue;
+					}
+					while (const auto* f_inst = f.TryInstruction()) {
+						if (f_inst->GetOpcode() == ValueOpcode::SelectU32 &&
+						    simplifier.OrderOf(f_inst) < self_ord &&
+						    simplifier.PredicateImplies(Arg(*f_inst, 0), c)) {
+							f = Arg(*f_inst, 2);
+						} else if (f_inst->GetOpcode() == ValueOpcode::SelectU32 &&
+						           simplifier.OrderOf(f_inst) < self_ord &&
+						           simplifier.PredicateImplies(c, Arg(*f_inst, 0)) &&
+						           Arg(*f_inst, 1) == t) {
+							inst.SetArg(0, Arg(*f_inst, 0));
+							c       = Arg(*f_inst, 0);
+							f       = Arg(*f_inst, 2);
+							changed = true;
+						} else {
+							break;
+						}
+					}
+					if (const auto imm_f = simplifier.ResolveWhenFalseImmediate(f, c);
+					    !imm_f.IsEmpty()) {
+						f = imm_f;
+					}
+					if (f != Arg(inst, 2)) {
+						inst.SetArg(2, f);
+						changed = true;
+					}
+					while (const auto* t_inst = t.TryInstruction()) {
+						if (t_inst->GetOpcode() == ValueOpcode::SelectU32 &&
+						    simplifier.OrderOf(t_inst) < self_ord &&
+						    simplifier.PredicateImplies(c, Arg(*t_inst, 0))) {
+							t = Arg(*t_inst, 1);
+						} else {
+							break;
+						}
+					}
+					if (t != Arg(inst, 1)) {
+						inst.SetArg(1, t);
+						changed = true;
+					}
+					if (!t.IsImmediate()) {
+						if (const auto imm_t = simplifier.ResolveWhenFalseImmediate(t, c);
+						    !imm_t.IsEmpty() && imm_t == f) {
+							Replace(inst, t);
+							changed = true;
+							continue;
+						}
+					}
+					if (t == f) {
+						Replace(inst, t);
+						changed = true;
+						continue;
+					}
+				} else if (op == ValueOpcode::BitCastF32U32) {
+					if (FoldBitCast(inst, ValueOpcode::BitCastU32F32)) {
+						changed = true;
+						continue;
+					}
+				} else if (op == ValueOpcode::BitCastU32F32) {
+					if (FoldBitCast(inst, ValueOpcode::BitCastF32U32)) {
+						changed = true;
+						continue;
+					}
+				} else if (op == ValueOpcode::Phi) {
+					if (FoldPhi(inst)) {
+						changed = true;
+						continue;
+					}
+				}
+				if (inst.GetOpcode() == ValueOpcode::Phi ||
+				    inst.GetOpcode() == ValueOpcode::Identity ||
+				    inst.GetOpcode() == ValueOpcode::FPFract32 ||
+				    inst.GetOpcode() == ValueOpcode::FPSin ||
+				    inst.GetOpcode() == ValueOpcode::FPCos ||
+				    !IsPurePerLaneAlu(inst.GetOpcode())) {
+					continue;
+				}
+				Inst* match = nullptr;
+				for (auto* candidate: seen) {
+					if (candidate->GetOpcode() != inst.GetOpcode() ||
+					    candidate->Flags<uint64_t>() != inst.Flags<uint64_t>() ||
+					    candidate->NumArgs() != inst.NumArgs()) {
+						continue;
+					}
+					bool same_args = true;
+					for (size_t i = 0; i < inst.NumArgs(); ++i) {
+						if (Arg(*candidate, i) != Arg(inst, i)) {
+							same_args = false;
+							break;
+						}
+					}
+					if (same_args) {
+						match = candidate;
+						break;
+					}
+				}
+				if (match != nullptr) {
+					Replace(inst, Value(match));
+					changed = true;
+				} else {
+					seen.push_back(&inst);
+				}
+			}
+		}
+		simplifier.owt_memo.clear();
+		for (auto block_it = blocks.rbegin(); block_it != blocks.rend(); ++block_it) {
+			auto& instructions = (*block_it)->Instructions();
+			for (auto inst_it = instructions.rbegin(); inst_it != instructions.rend(); ++inst_it) {
+				auto& inst = *inst_it;
+				if (inst.GetOpcode() != ValueOpcode::SelectU32 || !inst.HasUses()) {
+					continue;
+				}
+				const auto c = Arg(inst, 0);
+				const auto t = Arg(inst, 1);
+				if (t.IsImmediate() || t.TryInstruction() == &inst) {
+					continue;
+				}
+				if (simplifier.OnlyObservedWhenTrue(inst, c)) {
+					Replace(inst, t);
+					changed = true;
+					continue;
+				}
+				if (const auto* and_inst = c.TryInstruction();
+				    and_inst != nullptr && and_inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+					const auto c0 = Arg(*and_inst, 0);
+					const auto c1 = Arg(*and_inst, 1);
+					if (simplifier.OnlyObservedWhenTrue(inst, c0)) {
+						inst.SetArg(0, c1);
+						changed = true;
+					} else if (simplifier.OnlyObservedWhenTrue(inst, c1)) {
+						inst.SetArg(0, c0);
+						changed = true;
+					}
+				}
+			}
+		}
+		for (auto* block: blocks) {
+			for (auto it = block->begin(); it != block->end(); ++it) {
+				if (it->GetOpcode() == ValueOpcode::SelectU32 &&
+				    TrySimplifyEqualityMuxChain(*block, it)) {
+					changed = true;
+				}
+			}
+		}
+		if (changed) {
+			simplifier.order_map.clear();
+			total_insts = 0;
+			for (const auto* block: blocks) {
+				for (const auto& inst: *block) {
+					simplifier.order_map.emplace(&inst, total_insts++);
+				}
+			}
+		} else {
+			break;
 		}
 	}
 }

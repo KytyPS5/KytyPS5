@@ -88,7 +88,7 @@ public:
 		const float* gains = nullptr;
 	};
 
-	Audio() = default;
+	Audio();
 	virtual ~Audio();
 
 	KYTY_CLASS_NO_COPY(Audio);
@@ -140,6 +140,7 @@ private:
 	PortIn* GetAudioInPort(Id handle); // Caller holds m_mutex.
 
 	Common::Mutex m_mutex;
+	bool          m_sdl_audio_initialized = false;
 	PortOut       m_out_ports[OUT_PORTS_MAX];
 	PortIn        m_in_ports[IN_PORTS_MAX];
 
@@ -218,12 +219,19 @@ void Shutdown() {
 	g_audio = nullptr;
 }
 
+Audio::Audio() {
+	m_sdl_audio_initialized = SDL_InitSubSystem(SDL_INIT_AUDIO);
+}
+
 Audio::~Audio() {
 	for (auto& port: m_out_ports) {
 		CloseSdlDevice(&port);
 	}
 	for (auto& port: m_in_ports) {
 		CloseSdlDevice(&port);
+	}
+	if (m_sdl_audio_initialized) {
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 	}
 }
 
@@ -618,8 +626,8 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 static bool RecordingDevicePresent(SDL_AudioDeviceID device) {
 	int                count   = 0;
 	SDL_AudioDeviceID* devices = SDL_GetAudioRecordingDevices(&count);
-	bool               present = false;
-	for (int i = 0; i < count; i++) {
+	bool               present = (device == SDL_AUDIO_DEVICE_DEFAULT_RECORDING && count > 0);
+	for (int i = 0; !present && i < count; i++) {
 		if (devices[i] == device) {
 			present = true;
 			break;
@@ -631,9 +639,6 @@ static bool RecordingDevicePresent(SDL_AudioDeviceID device) {
 
 void Audio::OpenSdlDevice(PortIn* port, Format format) {
 	const auto& name = Config::GetAudioInputDevice();
-	if (name.empty()) {
-		return;
-	}
 	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
 		LOGF("AudioIn: SDL init failed: %s\n", SDL_GetError());
 		return;
@@ -641,11 +646,43 @@ void Audio::OpenSdlDevice(PortIn* port, Format format) {
 	int                device_count = 0;
 	SDL_AudioDeviceID* devices      = SDL_GetAudioRecordingDevices(&device_count);
 	SDL_AudioDeviceID  device       = 0;
-	for (int i = 0; i < device_count; i++) {
-		const char* device_name = SDL_GetAudioDeviceName(devices[i]);
-		if (device_name != nullptr && name == device_name) {
-			device = devices[i];
-			break;
+	const char*        chosen_name  = name.c_str();
+	if (!name.empty()) {
+		for (int i = 0; i < device_count; i++) {
+			const char* device_name = SDL_GetAudioDeviceName(devices[i]);
+			if (device_name != nullptr && name == device_name) {
+				device      = devices[i];
+				chosen_name = device_name;
+				break;
+			}
+		}
+		for (int i = 0; device == 0 && i < device_count; i++) {
+			const char* device_name = SDL_GetAudioDeviceName(devices[i]);
+			if (device_name != nullptr &&
+			    std::string_view(device_name).find(name) != std::string_view::npos) {
+				device      = devices[i];
+				chosen_name = device_name;
+				break;
+			}
+		}
+	} else {
+		// Prefer the DualSense built-in microphone when connected so opening AudioIn does not
+		// force a Bluetooth A2DP headset into low-quality HFP capture mode.
+		for (int i = 0; i < device_count; i++) {
+			const char* device_name = SDL_GetAudioDeviceName(devices[i]);
+			if (device_name != nullptr &&
+			    (std::string_view(device_name).find("DualSense") != std::string_view::npos ||
+			     std::string_view(device_name).find("Wireless Controller") !=
+			         std::string_view::npos)) {
+				device      = devices[i];
+				chosen_name = device_name;
+				break;
+			}
+		}
+		if (device == 0 && device_count > 0) {
+			device      = devices[0];
+			const char* device_name = SDL_GetAudioDeviceName(device);
+			chosen_name = device_name != nullptr ? device_name : "default";
 		}
 	}
 	SDL_free(devices);
@@ -660,12 +697,13 @@ void Audio::OpenSdlDevice(PortIn* port, Format format) {
 	desired.channels = static_cast<int>(port->bytes_per_frame / BytesPerSample(format));
 	port->stream     = SDL_OpenAudioDeviceStream(device, &desired, nullptr, nullptr);
 	if (port->stream == nullptr) {
-		LOGF("AudioIn: cannot open '%s': %s; using silence\n", name.c_str(), SDL_GetError());
+		LOGF("AudioIn: cannot open '%s': %s; using silence\n", chosen_name, SDL_GetError());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return;
 	}
+	(void)SDL_ResumeAudioStreamDevice(port->stream);
 	port->device = device;
-	LOGF("AudioIn: opened '%s' (%u Hz, %d ch)\n", name.c_str(), port->freq, desired.channels);
+	LOGF("AudioIn: opened '%s' (%u Hz, %d ch)\n", chosen_name, port->freq, desired.channels);
 }
 
 void Audio::CloseSdlDevice(PortIn* port) {

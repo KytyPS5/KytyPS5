@@ -263,14 +263,16 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	});
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
-	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
-	            m_compiled[static_cast<size_t>(ShaderType::Vertex)],
-	            m_compiled[static_cast<size_t>(ShaderType::Pixel)],
-	            m_compiled[static_cast<size_t>(ShaderType::Compute)],
-	            m_compiled[static_cast<size_t>(ShaderType::Mesh)],
-	            m_compiled[static_cast<size_t>(ShaderType::Local)],
-	            m_compiled[static_cast<size_t>(ShaderType::TessellationControl)],
-	            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+	if (Config::GraphicsDebugDumpEnabled() && !Log::IsSilent()) {
+		std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
+		            m_compiled[static_cast<size_t>(ShaderType::Vertex)],
+		            m_compiled[static_cast<size_t>(ShaderType::Pixel)],
+		            m_compiled[static_cast<size_t>(ShaderType::Compute)],
+		            m_compiled[static_cast<size_t>(ShaderType::Mesh)],
+		            m_compiled[static_cast<size_t>(ShaderType::Local)],
+		            m_compiled[static_cast<size_t>(ShaderType::TessellationControl)],
+		            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+	}
 	// The inputs of these come from the stage's static key.
 	if (key.stage == ShaderType::Pixel &&
 	    options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {

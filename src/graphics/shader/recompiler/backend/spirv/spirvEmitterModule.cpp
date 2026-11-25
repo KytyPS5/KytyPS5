@@ -762,7 +762,9 @@ void DefineModule(EmitterState& state) {
 	state.entry_label = state.builder.AllocateId();
 
 	state.builder.RequireCapability(spv::CapabilityShader);
-	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	if (!state.profile.relaxed_float || state.program.info.float64) {
+		state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	}
 	if (state.program.info.buffer_u8) {
 		state.builder.RequireExtension("SPV_KHR_8bit_storage");
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer8BitAccess);
@@ -848,14 +850,18 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityFragmentBarycentricKHR);
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
-	state.builder.RequireExtension("SPV_KHR_float_controls");
+	if (!state.profile.relaxed_float || state.program.info.float64) {
+		state.builder.RequireExtension("SPV_KHR_float_controls");
+	}
 	state.builder.AddMemoryModel(physical_addresses ? spv::AddressingModelPhysicalStorageBuffer64
 	                                                : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
-	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
-	                               32u);
+	if (!state.profile.relaxed_float) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               32u);
+	}
 	if (state.program.info.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
 		                     state.input_info.compute->float_mode != 0xc0);

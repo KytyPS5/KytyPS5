@@ -66,6 +66,12 @@ struct BufferDefinition {
 	uint32_t element_type         = 0;
 	uint32_t pointer_type         = 0;
 	uint32_t element_pointer_type = 0;
+	struct CachedStaticAccess {
+		uint32_t label          = 0;
+		uint32_t object_pointer = 0;
+		uint32_t length         = 0;
+	};
+	std::vector<CachedStaticAccess> cached_static;
 };
 
 struct ImageDefinition {
@@ -115,6 +121,7 @@ struct EmitterState {
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
+	std::vector<uint32_t>                           memory_dword_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
@@ -155,6 +162,8 @@ struct EmitterState {
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	std::array<uint32_t, 2>    cached_subgroup_local_invocation_id {};
+	std::array<uint32_t, 2>    cached_local_invocation_index {};
 	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
@@ -417,6 +426,7 @@ struct MemoryResourceAccess {
 	uint32_t              descriptor_index = 0;
 	uint32_t              length           = 0;
 	uint32_t              byte_offset      = 0;
+	uint32_t              dword_offset     = 0;
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;

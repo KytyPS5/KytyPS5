@@ -906,7 +906,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(!m_context.GetCommandScheduler().Current().IsRendering());
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);

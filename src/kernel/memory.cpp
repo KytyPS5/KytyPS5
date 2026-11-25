@@ -805,11 +805,13 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-	return g_guest_address_space->TryReadBacking(vaddr, data, size);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -873,8 +875,10 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
-bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
+                    void* native_context) noexcept {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->HandleFault(access, fault_vaddr, native_context);
 }
 
 struct PrtAperture {

@@ -855,24 +855,24 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		if (!indexed) {
 			const auto& args = *reinterpret_cast<const vk::DrawIndirectCommand*>(addr);
 			PatchIndirectDrawOffsets(*this, registers, args.firstVertex, args.firstInstance, 0, i);
-			executor.DrawAuto(CurrentBuffer(), {.vertex_count   = args.vertexCount,
-			                                    .instance_count = args.instanceCount,
-			                                    .first_vertex   = args.firstVertex,
-			                                    .first_instance = args.firstInstance,
-			                                    .offset_source  = DrawOffsetSource::IndirectArgs});
+			DrawIndexAuto({.vertex_count   = args.vertexCount,
+			               .instance_count = args.instanceCount,
+			               .first_vertex   = args.firstVertex,
+			               .first_instance = args.firstInstance,
+			               .offset_source  = DrawOffsetSource::IndirectArgs});
 			continue;
 		}
 
 		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex, i);
-		executor.DrawIndex(CurrentBuffer(), {.index_count = std::min(args.indexCount, max_indices),
-		                                     .index_addr  = IndexAddress(args.firstIndex),
-		                                     .instance_count      = args.instanceCount,
-		                                     .index_type_and_size = m_index_type_and_size,
-		                                     .base_vertex         = args.vertexOffset,
-		                                     .first_instance      = args.firstInstance,
-		                                     .offset_source = DrawOffsetSource::IndirectArgs});
+		DrawIndex({.index_count         = std::min(args.indexCount, max_indices),
+		           .index_addr          = IndexAddress(args.firstIndex),
+		           .instance_count      = args.instanceCount,
+		           .index_type_and_size = m_index_type_and_size,
+		           .base_vertex         = args.vertexOffset,
+		           .first_instance      = args.firstInstance,
+		           .offset_source       = DrawOffsetSource::IndirectArgs});
 	}
 }
 

@@ -44,17 +44,30 @@ int32_t OcclusionQueries::BeginQuery(vk::CommandBuffer command) {
 
 void OcclusionQueries::Dump(uint64_t address) {
 	// Begins dump to the results, ends 8 bytes into them.
-	if ((address & 8u) == 0) {
+	const bool is_begin = (address & 8u) == 0;
+	if (is_begin) {
 		m_open++;
 	} else if (m_open != 0) {
 		m_open--;
 	}
-	m_dumps.push_back({address, m_scheduler.CurrentTick(), m_begun, m_uncounted});
+	// Publish a provisional ready counter immediately so end-of-pipe labels never stall on the
+	// host GPU; completed queries refine the counter asynchronously when their tick retires.
+	WriteZPassCounters(reinterpret_cast<volatile uint64_t*>(address),
+	                   m_samples + m_uncounted + (m_begun - m_read), is_begin);
+	if (m_begun != m_read) {
+		m_dumps.push_back({address, m_scheduler.CurrentTick(), m_begun, m_uncounted});
+	}
 }
 
 void OcclusionQueries::PublishDumps() {
-	if (const auto last = m_dumps.back().queries; last != m_read) {
-		m_scheduler.Wait(m_dumps.back().tick);
+	size_t completed = 0;
+	while (completed < m_dumps.size() && m_scheduler.IsFree(m_dumps[completed].tick)) {
+		completed++;
+	}
+	if (completed == 0) {
+		return;
+	}
+	if (const auto last = m_dumps[completed - 1].queries; last != m_read) {
 		// The unread queries wrap around the pool at most once.
 		for (uint64_t read = m_read; read < last;) {
 			const auto first = static_cast<uint32_t>(read % QUERY_COUNT);
@@ -69,14 +82,15 @@ void OcclusionQueries::PublishDumps() {
 			read += count;
 		}
 	}
-	for (const auto& dump: m_dumps) {
+	for (size_t i = 0; i < completed; i++) {
+		const auto& dump = m_dumps[i];
 		for (; m_read < dump.queries; m_read++) {
 			m_samples += m_results[m_read % QUERY_COUNT];
 		}
 		WriteZPassCounters(reinterpret_cast<volatile uint64_t*>(dump.address),
 		                   m_samples + dump.uncounted, (dump.address & 8u) == 0);
 	}
-	m_dumps.clear();
+	m_dumps.erase(m_dumps.begin(), m_dumps.begin() + static_cast<std::ptrdiff_t>(completed));
 }
 
 } // namespace Libs::Graphics

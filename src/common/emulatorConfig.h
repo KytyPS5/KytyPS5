@@ -85,7 +85,7 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
-	bool                   shader_cache_enabled        = false;
+	bool                   shader_cache_enabled        = true;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -104,7 +104,7 @@ struct ConfigOptions {
 	uint32_t               flush_draws                 = 0; // 0 is off
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
-	bool                   relaxed_shader_float        = false;
+	bool                   relaxed_shader_float        = true;
 	bool                   native_rt                   = false;
 	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;

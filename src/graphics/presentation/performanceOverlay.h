@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <chrono>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -10,7 +11,9 @@ namespace Libs::Graphics {
 struct GraphicContext;
 
 // Called for each main-bus guest flip, with the guest's video-out size.
-void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept;
+void PerformanceOverlayRecordFlip(
+    uint32_t guest_width, uint32_t guest_height,
+    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) noexcept;
 
 [[nodiscard]] bool PerformanceOverlayEnabled() noexcept;
 void               TogglePerformanceOverlay() noexcept;

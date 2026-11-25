@@ -66,15 +66,18 @@ FaultManager::~FaultManager() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
+	m_scheduler.PopPendingOperations();
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
-		m_scheduler.Wait(wait_tick);
+		if (!m_scheduler.IsFree(wait_tick)) {
+			m_scheduler.Wait(wait_tick);
+		}
 		m_scheduler.PopPendingOperations();
 	}
 
 	const auto offset = m_current_area * PageFaultAreaSize;
 	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, PageFaultAreaSize);
-	m_download_buffer.Flush(offset, PageFaultAreaSize);
+	std::memset(mapped, 0, sizeof(uint64_t));
+	m_download_buffer.Flush(offset, sizeof(uint64_t));
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;

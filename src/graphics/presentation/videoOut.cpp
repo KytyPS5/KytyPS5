@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/smallVector.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -216,7 +217,8 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
-	bool Flip();
+	bool Flip(std::chrono::steady_clock::time_point vblank_time =
+	              std::chrono::steady_clock::now());
 	void Wait(VideoOutConfig& cfg, int index);
 
 private:
@@ -372,14 +374,16 @@ static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
 
 static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind kind,
                                   void* trigger_data) {
-	VideoOutEventQueues queues;
+	Common::SmallVector<EventQueue::KernelEqueue, 8> handles;
 	{
 		Common::LockGuard lock(video_out.events->mutex);
-		queues = VideoOutEventQueuesFor(*video_out.events, kind);
+		for (const auto& registration: VideoOutEventQueuesFor(*video_out.events, kind)) {
+			handles.push_back(registration->handle);
+		}
 	}
-	for (const auto& registration: queues) {
+	for (const auto handle: handles) {
 		const auto result =
-		    EventQueue::KernelTriggerEvent(registration->handle, VideoOutEventId(kind),
+		    EventQueue::KernelTriggerEvent(handle, VideoOutEventId(kind),
 		                                   EventQueue::KERNEL_EVFILT_VIDEO_OUT, trigger_data);
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
@@ -806,11 +810,20 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	using Clock       = std::chrono::steady_clock;
 	const auto period = Clock::duration(std::chrono::seconds(1)) / Config::GetVblankFrequency();
 
+	auto vblank_time = Clock::now();
 	std::chrono::nanoseconds total_wait {};
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Clock::now();
 		if (total_wait.count() > 0) {
-			Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));
+			constexpr auto spin_margin = std::chrono::microseconds(250);
+			if (total_wait > spin_margin) {
+				Common::Thread::SleepNano(
+				    static_cast<uint64_t>((total_wait - spin_margin).count()));
+			}
+			const auto target = sleep_begin + total_wait;
+			while (Clock::now() < target && !token.stop_requested()) {
+				std::this_thread::yield();
+			}
 		}
 		if (token.stop_requested()) {
 			break;
@@ -819,7 +832,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		total_wait -= frame_begin - sleep_begin;
 
 		VblankBegin();
-		bool presented = m_flip_queue.Flip();
+		bool presented = m_flip_queue.Flip(vblank_time);
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (!m_presenter.PresentLastFrame()) {
 				m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
@@ -840,6 +853,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 		VblankEnd();
 
+		vblank_time += period;
 		total_wait += period - (Clock::now() - frame_begin);
 		if (total_wait.count() < 0) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
@@ -1083,7 +1097,7 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
-bool FlipQueue::Flip() {
+bool FlipQueue::Flip(std::chrono::steady_clock::time_point vblank_time) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
@@ -1139,14 +1153,14 @@ bool FlipQueue::Flip() {
 		}
 	}
 	if (due) {
+		if (requests[0].cfg->bus == 0) {
+			Graphics::PerformanceOverlayRecordFlip(m_width, m_height, vblank_time);
+		}
 		if (hidden != nullptr) {
 			m_presenter.Discard(*hidden);
 		}
 		if (layer_count != 0) {
 			m_presenter.Present(std::span(layers.data(), layer_count));
-		}
-		if (requests[0].cfg->bus == 0) {
-			Graphics::PerformanceOverlayRecordFlip(m_width, m_height);
 		}
 	}
 

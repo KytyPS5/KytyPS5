@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
@@ -82,6 +83,7 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasGpuDirtyBytesSafe(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -90,6 +92,9 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
+	[[nodiscard]] bool HasPendingBdaSync() const noexcept {
+		return m_has_bda_sync.load(std::memory_order_acquire);
+	}
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
@@ -135,10 +140,10 @@ private:
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
-	void Unregister(BufferId id);
+	void Unregister(BufferId id, bool clear_bda_table = true);
 	template <bool insert>
-	void ChangeRegister(BufferId id);
-	void DeleteBuffer(BufferId id);
+	void ChangeRegister(BufferId id, bool clear_bda_table = true);
+	void DeleteBuffer(BufferId id, bool clear_bda_table = true);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
@@ -158,11 +163,13 @@ private:
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
+	std::mutex                                        m_gpu_modified_mutex;
 	RangeSet                                          m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
+	std::atomic<bool>                                 m_has_bda_sync {false};
 	RangeSet                                          m_bda_sync;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

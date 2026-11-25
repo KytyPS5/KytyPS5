@@ -17,21 +17,69 @@ class SmallVector {
 
 public:
 	using size_type      = SizeType;
+	using iterator       = T*;
 	using const_iterator = const T*;
 
-	SmallVector() noexcept                     = default;
-	SmallVector(const SmallVector&)            = delete;
-	SmallVector& operator=(const SmallVector&) = delete;
+	SmallVector() noexcept = default;
+	SmallVector(const SmallVector& other) { *this = other; }
+	SmallVector(SmallVector&& other) noexcept { *this = std::move(other); }
+	SmallVector& operator=(const SmallVector& other) {
+		if (this == &other) {
+			return *this;
+		}
+		clear();
+		if (other.m_size > m_capacity) {
+			grow_to(other.m_size);
+		}
+		if (other.m_size != 0) {
+			std::memcpy(m_data, other.m_data, other.m_size * sizeof(T));
+		}
+		m_size = other.m_size;
+		return *this;
+	}
+	SmallVector& operator=(SmallVector&& other) noexcept {
+		if (this == &other) {
+			return *this;
+		}
+		if (!is_inline()) {
+			std::allocator<T> {}.deallocate(m_data, m_capacity);
+		}
+		if (other.is_inline()) {
+			m_data     = m_inline.buf;
+			m_capacity = N;
+			if (other.m_size != 0) {
+				std::memcpy(m_data, other.m_data, other.m_size * sizeof(T));
+			}
+		} else {
+			m_data           = other.m_data;
+			m_capacity       = other.m_capacity;
+			other.m_data     = other.m_inline.buf;
+			other.m_capacity = N;
+		}
+		m_size       = other.m_size;
+		other.m_size = 0;
+		return *this;
+	}
 	~SmallVector() {
 		if (!is_inline()) {
 			std::allocator<T> {}.deallocate(m_data, m_capacity);
 		}
 	}
 
+	[[nodiscard]] T&             operator[](size_type index) noexcept { return m_data[index]; }
+	[[nodiscard]] const T&       operator[](size_type index) const noexcept { return m_data[index]; }
+	[[nodiscard]] T&             front() noexcept { return m_data[0]; }
 	[[nodiscard]] const T&       front() const noexcept { return m_data[0]; }
+	[[nodiscard]] T*             data() noexcept { return m_data; }
+	[[nodiscard]] const T*       data() const noexcept { return m_data; }
+	[[nodiscard]] iterator       begin() noexcept { return m_data; }
 	[[nodiscard]] const_iterator begin() const noexcept { return m_data; }
+	[[nodiscard]] iterator       end() noexcept { return m_data + m_size; }
 	[[nodiscard]] const_iterator end() const noexcept { return m_data + m_size; }
 	[[nodiscard]] size_type      size() const noexcept { return m_size; }
+	[[nodiscard]] bool           empty() const noexcept { return m_size == 0; }
+
+	void clear() noexcept { m_size = 0; }
 
 	void push_back(const T& v) {
 		if (m_size == m_capacity) [[unlikely]] {
@@ -39,6 +87,16 @@ public:
 		}
 		std::construct_at(m_data + m_size, v);
 		++m_size;
+	}
+
+	template <typename... Args>
+	T& emplace_back(Args&&... args) {
+		if (m_size == m_capacity) [[unlikely]] {
+			grow_to(m_capacity + m_capacity / 2 + 1);
+		}
+		T* ptr = std::construct_at(m_data + m_size, std::forward<Args>(args)...);
+		++m_size;
+		return *ptr;
 	}
 
 	void erase(const_iterator pos) noexcept {

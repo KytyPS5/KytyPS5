@@ -1618,7 +1618,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	    (runtime.indirect_args_address != 0u &&
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
-	reads = program.source_reads;
+	if (program.source_reads.empty()) {
+		reads.clear();
+	} else {
+		reads = program.source_reads;
+	}
 	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));

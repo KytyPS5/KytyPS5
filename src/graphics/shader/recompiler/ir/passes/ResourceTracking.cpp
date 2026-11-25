@@ -1665,7 +1665,7 @@ private:
 			if (read->Arg(1).Resolve() == Value(0u)) value = read->Arg(0);
 			else if (read->Arg(0).Resolve() == Value(0u)) value = read->Arg(1);
 			else return nullptr;
-			selector.non_negative = true;
+			selector.zero_above = INT32_MAX;
 			read = ActiveValue(value, active).TryInstruction();
 		}
 		if (read != nullptr && read->GetOpcode() == ValueOpcode::BitFieldUExtract) {
@@ -1698,39 +1698,74 @@ private:
 		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
 		    !memory.idxen || memory.offen || memory.offset > UINT32_MAX - lane * 4u ||
 		    read->Arg(2).Resolve() != Value(0u) || read->Arg(3).Resolve() != Value(0u) ||
-		    !EquivalentValue(m_program, active, read->Arg(4))) return nullptr;
+		    !Implies(active, read->Arg(4))) return nullptr;
 		selector.offset = memory.offset + lane * 4u;
 		return read;
 	}
 
+	// Predicated writes and SSA joins may retain the original material field or zero.
+	// The outer unsigned check bounds every nonzero field used by this waterfall.
+	const Inst* GuardedMaterialField(const Inst* select, Value active,
+	                                DescriptorSource::IndirectDescriptor::SelectorRead& selector) const {
+		uint32_t limit;
+		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 ||
+		    select->Arg(2).Resolve() != Value(0u) ||
+		    !ImmediateU32(UnsignedBound(select->Arg(0), select->Arg(1)), limit) || limit == 0u) return nullptr;
+		const Inst* field = nullptr;
+		std::vector<Value> pending {select->Arg(1)};
+		for (size_t i = 0; i < pending.size(); ++i) {
+			auto value = pending[i].Resolve();
+			if (value == Value(0u)) continue;
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || inst->Parent() == nullptr || InCycle(inst->Parent())) return nullptr;
+			const bool phi = inst->GetOpcode() == ValueOpcode::Phi;
+			if (phi && inst->NumArgs() == 0u) return nullptr;
+			if (!phi && inst->GetOpcode() != ValueOpcode::SelectU32) {
+				if (field != nullptr && field != inst) return nullptr;
+				field = inst;
+				continue;
+			}
+			const auto end = !phi && Implies(active, inst->Arg(0)) ? 2u : inst->NumArgs();
+			for (size_t arm = phi ? 0u : 1u; arm < end; ++arm) {
+				value = inst->Arg(arm).Resolve();
+				if (std::ranges::find(pending, value) == pending.end()) pending.push_back(value);
+			}
+		}
+		selector.zero_above = limit - 1u;
+		return field;
+	}
+
+	enum class MaterialKey { Global, Indexed, Heap, Guarded };
+
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
-	                                DescriptorSource& material_source, bool indexed, bool heap = false) {
+	                                DescriptorSource& material_source, MaterialKey kind) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
 		const auto active = selected->Arg(0).Resolve();
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
-		const auto* read = SelectorReadValue(selected->Arg(1), active, selector);
-		if (indexed) {
+		const auto* read = kind == MaterialKey::Guarded
+		    ? GuardedMaterialField(selected->Arg(1).Resolve().TryInstruction(), active, selector)
+		    : SelectorReadValue(selected->Arg(1), active, selector);
+		if (kind != MaterialKey::Global) {
 			read = IndexedMaterialRead(read, active, selector);
 			// Bounded heaps keep their full domain when the material may alias a write: written
 			// buffers are checked at dispatch, storage images and address writes here. Pointer
 			// tables have no such domain, so a key that a same-dispatch write changes selects
-			// the root descriptor. Other stages keep the original domain.
-			if (read == nullptr || m_program.stage != ShaderType::Compute ||
-			    (heap && std::ranges::any_of(m_program.blocks, [](const Block* block) {
+			// the root descriptor. Graphics heaps retain their full domain.
+			if (read == nullptr || (kind != MaterialKey::Guarded && m_program.stage != ShaderType::Compute) ||
+			    (kind == MaterialKey::Heap && std::ranges::any_of(m_program.blocks, [](const Block* block) {
 				    return std::ranges::any_of(*block, [](const Inst& inst) {
 					    const auto op = inst.GetOpcode();
 					    return ImageOpcodeInfoOf(op).resource_class == ImageResourceClass::Storage ||
 					           AddressOpcodeInfoOf(op).access == AddressAccess::Write;
 				    });
 			    })) || !MakeRuntimeTableSource(*read, material_source)) return false;
-			// The record index is assumed not to wrap U32; an affine one then reaches only
-			// records offset + k * stride.
+			// Wrapped U32 indices preserve the stride's power-of-two congruence class.
 			AffineOffset row;
 			if (MatchAffineOffset(read->Arg(1), active, row) && row.stride != 0u) {
-				selector.first_record = static_cast<uint32_t>(row.offset);
-				selector.record_step = static_cast<uint32_t>(row.stride);
+				selector.record_step = 1u << std::countr_zero(static_cast<uint32_t>(row.stride));
+				selector.first_record = static_cast<uint32_t>(row.offset) % selector.record_step;
 			}
 			selector.source = InternSource(material_source);
 			indirect.selector = std::move(selector);
@@ -3296,7 +3331,7 @@ private:
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
 		} else if (!sampler && !plan.table_indexed && table_source.dword_count == 4u &&
-		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true, true)) {
+		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, MaterialKey::Heap)) {
 			// Preserve the heap's byte-offset key so runtime geometry can choose the
 			// tighter selector domain without changing the GPU's descriptor reads.
 			indirect.table_scalar = true;
@@ -3351,8 +3386,8 @@ private:
 				}
 			}
 			if (indirect.key_count.IsEmpty() &&
-			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, false) &&
-			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, true) &&
+			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, MaterialKey::Global) &&
+			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, MaterialKey::Indexed) &&
 			    !MatchReversedImageRange(key, indirect) && !MatchWorkgroupKey(key, indirect)) {
 				auto maximum = SelectorMaximum(key);
 				if (maximum >= MaxIndirectDescriptorProbes) {
@@ -3381,7 +3416,8 @@ private:
 					plan.retain_reads = true;
 				} else if (maximum < MaxIndirectDescriptorProbes)
 					indirect.key_count = Value(maximum + 1u);
-				else if (!ProgramLoopCount(key, indirect))
+				else if (!ProgramLoopCount(key, indirect) && (sampler ||
+				         !MatchUniformizedMaterialKey(key, handle, indirect, material_source, MaterialKey::Guarded)))
 					return false;
 			}
 			if ((table_offset & 3u) != 0u) return false;

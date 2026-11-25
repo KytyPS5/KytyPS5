@@ -545,7 +545,7 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 	if (selector->byte_ranges.empty()) {
 		for (auto& key: keys) {
 			auto field = (key >> selector->bit_offset) & selector->bit_mask;
-			if (selector->non_negative && static_cast<int32_t>(field) < 0) field = 0u;
+			if (field > selector->zero_above) field = 0u;
 			key = std::min(field, selector->maximum);
 		}
 		if (selector->excluded) std::erase(keys, *selector->excluded);

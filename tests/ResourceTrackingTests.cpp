@@ -3798,6 +3798,70 @@ void TestPointerTableIndexedMaterialKeys() {
         "pointer-table selector lost sorted raw keys or the OOB-zero root descriptor");
 }
 
+void TestGuardedMaterialImageKey() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto make = [](bool foreign_field) {
+    Fixture f(ShaderType::Pixel);
+    auto* entry = f.block;
+    auto* other = f.AddBlock();
+    auto* merge = f.AddBlock();
+    entry->AddBranch(other);
+    entry->AddBranch(merge);
+    other->AddBranch(merge);
+    const auto index = f.Emit(ValueOpcode::LaneId);
+    const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+    const auto mapped = f.Emit(ValueOpcode::BitwiseXor32, {index, Value(1u)});
+    const auto record = f.Emit(ValueOpcode::IAdd32, {mapped, Value(UINT32_MAX)});
+    const auto field = f.Emit(ValueOpcode::LoadBufferU32, {material, record, Value(0u), Value(0u), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Buffer, .offset = 4u, .idxen = true}, 0x10u));
+    const auto active = f.Emit(ValueOpcode::IEqual32, {index, Value(0u)});
+    const auto branch = f.Emit(ValueOpcode::IEqual32, {f.UserData(0), Value(0u)});
+    entry->condition = f.Emit(ValueOpcode::ConditionRef, {branch}, CFG::BranchCondition::SccNonZero);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = other, .false_block = merge};
+    other->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    merge->terminator.kind = CFG::TerminatorKind::Return;
+    const auto previous = f.Emit(ValueOpcode::SelectU32, {active, field, Value(0u)}, 0, other);
+    f.block = merge;
+    auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, foreign_field ? mapped : field);
+    phi.AddPhiOperand(other, previous);
+    const auto in_range = f.Emit(ValueOpcode::ULessThan32, {Value(&phi), Value(8u)});
+    const auto checked = f.Emit(ValueOpcode::SelectU32, {in_range, Value(&phi), Value(0u)});
+    const auto selected = f.Emit(ValueOpcode::SelectU32, {Value(true), checked, index});
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    const auto table = f.Address(f.UserData(4), f.UserData(5));
+    std::array<Value, 8> words;
+    for (uint32_t i = 0; i < words.size(); ++i)
+      words[i] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+          f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = i * 4u}, 0x20u));
+    const auto sampler = f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    f.Emit(ValueOpcode::ImageSampleRaw, {f.Image(words), sampler, f.ImageAddress(), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Image, .image_dimension = Decoder::ImageDimension::Dim2D}, 0x28u));
+    f.PlanAndTrack();
+    return ExtractResourcePlan(f.program);
+  };
+  CheckFatal([&] { make(true); }, "not a valid runtime value",
+             "raw pointer table borrowed another Phi arm's material field");
+  const auto plan = make(false);
+  LinearTestMemory memory;
+  const uint32_t table = uint32_t(memory.base) + 0x100u;
+  const std::array<uint32_t, 6> data{uint32_t(memory.base), 8u << 16u, 1u, 0x5204u, table, 0u};
+  const SrtRuntime runtime{.user_data = data, .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto field : {7u, 8u, UINT32_MAX}) {
+    memory.words[1] = field;
+    memory.descriptor_reads = 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.descriptor_reads == (field < 8u ? 2u : 1u) &&
+              std::ranges::find(snapshot.specialization_reads,
+                  std::pair<uint64_t, uint64_t>{table + (field < 8u ? field : 0u) * 32u, 32u}) !=
+                  snapshot.specialization_reads.end(),
+          "guarded material key read the wrong texture row at the cutoff");
+  }
+}
+
 void TestImageDescriptorFields() {
   constexpr std::array<std::pair<uint32_t, uint32_t>, 5> reserved{
       {{1u, 0x20000000u}, {2u, 0x70003000u}, {4u, 0xe000e000u},
@@ -9448,6 +9512,7 @@ int main() {
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("indexed material image keys", TestIndexedMaterialImageKeys);
     Run("pointer-table indexed material keys", TestPointerTableIndexedMaterialKeys);
+    Run("guarded material image key", TestGuardedMaterialImageKey);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("compact scalar image table", TestCompactScalarImageTable);

@@ -610,7 +610,7 @@ struct DescriptorSource {
 			uint32_t first_record = 0;
 			uint32_t record_step = 1;
 			uint32_t maximum = UINT32_MAX;
-			bool non_negative = false; // Signed-negative fields read as zero before the maximum.
+			uint32_t zero_above = UINT32_MAX; // Larger fields select row zero before the maximum.
 			uint32_t bit_offset = 0;
 			uint32_t bit_mask = UINT32_MAX;
 			bool global = false;

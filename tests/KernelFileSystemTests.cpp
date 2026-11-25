@@ -391,8 +391,7 @@ void TestThreadCreatedInHandlerTakesSignals() {
 
 void *KYTY_SYSV_ABI ReturnFromGuestThread(void *) { return nullptr; }
 
-// An exiting thread stops taking guest signals before it frees its TLS.
-void TestExitingThreadStopsTakingSignals() {
+void TestExitedThreadLifetime() {
   using namespace Libs::LibKernel;
   Pthread exiting = nullptr;
   Check(PthreadCreate(&exiting, nullptr, ReturnFromGuestThread, nullptr, "Exiting") == OK,
@@ -403,6 +402,15 @@ void TestExitingThreadStopsTakingSignals() {
   });
   Check(PthreadJoin(exiting, nullptr) == OK && !PthreadHasPendingSignal(exiting, 30),
         "joining clears signals the exiting thread did not take");
+
+  stop_sleepers = false;
+  auto *successor = StartSleeper();
+  const auto canceled = PthreadCancel(exiting);
+  stop_sleepers = true;
+  void *result = nullptr;
+  Check(PthreadJoin(successor, &result) == OK && result == nullptr &&
+            canceled == KERNEL_ERROR_ESRCH,
+        "canceling a joined thread leaves its successor running");
 }
 
 class TempDirectory {
@@ -3106,7 +3114,7 @@ int main(int argc, char** argv) {
   TestSignalWaitsForRunningHandler();
   TestSelfRaiseHoldsOtherRaises();
   TestThreadCreatedInHandlerTakesSignals();
-  TestExitingThreadStopsTakingSignals();
+  TestExitedThreadLifetime();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");

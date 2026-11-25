@@ -37618,37 +37618,44 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(1u);
 }
 
-TestCase BufferStoreDwordx2WorkgroupDescriptors() {
+TestCase BufferStoreWorkgroupDescriptors(u32 groups, bool guarded_pair = false) {
   TestCase test;
-  test.name = "BufferStoreDwordx2WorkgroupDescriptors";
+  test.name = guarded_pair ? "BufferStoreDwordx2WorkgroupDescriptors"
+                           : groups == 1u ? "BufferStoreOneWorkgroupDescriptor" : "BufferStoreTwoWorkgroupDescriptors";
   test.has_user_data = test.has_compute_info = true;
   test.user_data[0] = 128u;
   test.compute_info.workgroup_register = 10u;
-  test.compute_info.group_id[0] = true;
+  test.compute_info.group_id[2] = true;
   test.compute_info.wave_size = test.compute_info.threads_num[0] = 32u;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
   test.compute_info.thread_ids_num = 1u;
-  test.dispatch_x = 3u;
+  test.dispatch_z = groups;
   auto &code = test.code;
-  code = {EncodeSopc(0x0a, 10, InlineU32(2)), 0u, // Group 2 skips the table.
-          EncodeSop2(0x31, 4, 10, 255), 0x2a0u,
-          EncodeSmem0(0x02, 12), EncodeSmem1(0u, 4), EncodeSopp(0x0c, 0),
-          EncodeVop1(0x01, 2, 10), EncodeVop1(0x01, 3, InlineU32(7)),
-          EncodeMubuf0(0x1d, 0, true, false), EncodeMubuf1(2, 3, 0)};
-  code[1] = EncodeSopp(0x04, code.size() - 2u);
+  if (guarded_pair) code = {EncodeSopc(0x0a, 10, InlineU32(2)), 0u};
+  code.insert(code.end(), {EncodeSop2(0x31, 4, 10, 255), 0x2a0u,
+      EncodeSmem0(0x02, 12), EncodeSmem1(0u, 4), EncodeSopp(0x0c, 0),
+      EncodeVop1(0x01, 2, 10)});
+  if (guarded_pair) code.push_back(EncodeVop1(0x01, 3, InlineU32(7)));
+  code.insert(code.end(), {EncodeMubuf0(guarded_pair ? 0x1d : 0x1c, 0, true, false), EncodeMubuf1(2, 3, 0)});
+  if (guarded_pair) code[1] = EncodeSopp(0x04, code.size() - 2u);
   AppendEnd(&code);
   test.initial.assign(2064u, 0xdeadbeefu);
+  const u32 stride = guarded_pair ? 8u : 4u;
+  test.expected_buffer_resources.emplace();
   for (u32 row = 0; row < 2u; ++row) {
     const u32 output = 4096u * (row + 1u);
-    const std::array descriptor{output, 8u << 16u, 2u, 0x5204u};
+    const std::array descriptor{output, stride << 16u, 2u, 0x5204u};
     std::copy(descriptor.begin(), descriptor.end(),
               test.initial.begin() + (test.user_data[0] + 0x2a0u + row * 16u) / 4u);
-    test.storage_buffer_ranges.emplace_back(output, row == 0u ? 16u : 12u);
+    if (row < groups) {
+      test.expected_buffer_resources->push_back(row);
+      test.storage_buffer_ranges.emplace_back(output, guarded_pair && row == 1u ? 12u : 2u * stride);
+    }
   }
   test.expected = test.initial;
   for (const auto &[output, bytes] : test.storage_buffer_ranges)
     for (u32 word = 0; word < bytes / 4u; ++word)
-      test.expected[output / 4u + word] = word % 2u == 0u ? output / 4096u - 1u : 7u;
+      test.expected[output / 4u + word] = guarded_pair && word % 2u != 0u ? 7u : output / 4096u - 1u;
   return test;
 }
 
@@ -50459,7 +50466,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
-  AddCase(BufferStoreDwordx2WorkgroupDescriptors);
+  cases.push_back(BufferStoreWorkgroupDescriptors(3u, true));
+  for (u32 groups : {1u, 2u}) cases.push_back(BufferStoreWorkgroupDescriptors(groups));
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
@@ -58448,7 +58456,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckBoundedFormattedBufferCopy(vulkan);
-    RunCase(&vulkan, BufferStoreDwordx2WorkgroupDescriptors());
+    RunCase(&vulkan, BufferStoreWorkgroupDescriptors(3u, true));
+    for (u32 groups : {1u, 2u}) RunCase(&vulkan, BufferStoreWorkgroupDescriptors(groups));
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);

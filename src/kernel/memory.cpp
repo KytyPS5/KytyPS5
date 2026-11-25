@@ -23,7 +23,6 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
-#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -849,13 +848,6 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
 		     vaddr, size);
-	}
-	static thread_local std::array<uint64_t, 3> logged_clamp {};
-	const std::array<uint64_t, 3>               clamp {vaddr, size, clamped_size};
-	if (clamped_size != size && !Log::IsSilent() && std::exchange(logged_clamp, clamp) != clamp) {
-		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
 	}
 	return clamped_size;
 }

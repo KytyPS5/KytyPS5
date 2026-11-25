@@ -28,7 +28,6 @@
 #include <filesystem>
 #include <semaphore>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -1964,60 +1963,6 @@ void TestFlexibleRangeEditsCoalesce() {
 	        "KernelMunmap(right cleanup)");
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "range edit cleanup did not restore flexible capacity");
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-void TestClampedRangeIsLoggedWhenItChanges() {
-	using namespace Libs::LibKernel::Memory;
-	const char*        test     = "ClampedRangeIsLoggedWhenItChanges";
-	constexpr uint64_t page     = SceKernelPageSize;
-	constexpr auto     message  = std::string_view {"Memory: clamped buffer range"};
-	const auto         baseline = AvailableFlexibleMemory(test);
-	const auto         base     = MapNamedFlexible(test, 3 * page, SceKernelProtCpuRw, "clamp_log");
-	CheckOk(test, KernelMunmap(base + page, page), "KernelMunmap(create hole)");
-	const auto log_path = std::filesystem::temp_directory_path() / "kyty_clamp_log_test.txt";
-	Config::ConfigOptions options;
-	options.printf_direction   = Config::LogDirection::File;
-	options.printf_output_file = log_path;
-	const std::array<std::pair<uint64_t, uint64_t>, 5> calls {{{base + page / 2, page / 2},
-	                                                          {base + page / 2, page / 2},
-	                                                          {base + page / 2, page / 2},
-	                                                          {base + page / 4, 3 * page / 4},
-	                                                          {base + page / 2, page / 2}}};
-	std::array<uint64_t, calls.size()> results {};
-	uint64_t                           silent_result = 0;
-	std::thread([&] {
-		silent_result = ClampRangeSize(calls[0].first, page);
-		Config::Load(options);
-		Log::Initialize();
-		for (size_t i = 0; i < calls.size(); ++i) {
-			results[i] = ClampRangeSize(calls[i].first, page);
-		}
-	}).join();
-	Log::Flush();
-	Check(test, silent_result == calls[0].second, "range clamp did not stop at the hole while logging was silent");
-	for (size_t i = 0; i < calls.size(); ++i) {
-		Check(test, results[i] == calls[i].second, "range clamp did not stop at the hole");
-	}
-	size_t lines = 0;
-	{
-		Common::File log(log_path, Common::File::Mode::Read);
-		Check(test, !log.IsInvalid(), "open the clamp log");
-		const auto data = log.ReadWholeBuffer();
-		const std::string_view text(reinterpret_cast<const char*>(data.data()), data.size());
-		for (auto at = text.find(message); at != std::string_view::npos; at = text.find(message, at + 1)) {
-			++lines;
-		}
-	}
-	options.printf_direction = Config::LogDirection::Silent;
-	Config::Load(options);
-	Log::Initialize();
-	std::filesystem::remove(log_path);
-	Check(test, lines == 3, "a clamped range was not logged exactly when it changed");
-	CheckOk(test, KernelMunmap(base, page), "KernelMunmap(left cleanup)");
-	CheckOk(test, KernelMunmap(base + 2 * page, page), "KernelMunmap(right cleanup)");
-	Check(test, AvailableFlexibleMemory(test) == baseline,
-	      "clamp log cleanup did not restore flexible capacity");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -6267,7 +6212,6 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
 		RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 		RunTest(TestFlexibleRangeEditsCoalesce);
-		RunTest(TestClampedRangeIsLoggedWhenItChanges);
 		RunTest(TestPageTableStatsTrackRangeEdits);
 		RunTest(TestPartialFlexibleMunmapAndFindNext);
 		RunTest(TestReserveMapFixedAndNoOverwrite);
@@ -6376,7 +6320,6 @@ int main(int argc, char** argv) {
 	RunTest(TestAnonymousMmapUsesFlexibleMemory);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestFlexibleRangeEditsCoalesce);
-	RunTest(TestClampedRangeIsLoggedWhenItChanges);
 	RunTest(TestPageTableStatsTrackRangeEdits);
 	RunTest(TestReserveMapFixedAndNoOverwrite);
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);

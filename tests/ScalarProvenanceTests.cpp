@@ -581,14 +581,18 @@ void TestSharedIntegerRuntimeDependencies() {
   const auto lane = fixture.Emit(ValueOpcode::LaneId);
   const auto active =
       fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
-  auto inactive = lane;
-  for (uint32_t level = 0; level < 36; level++) {
-    const auto left =
-        fixture.Emit(ValueOpcode::IAdd32, {inactive, Value(1u)});
-    const auto right =
-        fixture.Emit(ValueOpcode::IMul32, {inactive, Value(3u)});
-    inactive = fixture.Emit(ValueOpcode::BitwiseXor32, {left, right});
-  }
+  const auto shared = [&](Value value) {
+    for (uint32_t level = 0; level < 36; level++) {
+      const auto left = fixture.Emit(ValueOpcode::IAdd32, {value, Value(1u)});
+      const auto right = fixture.Emit(ValueOpcode::IMul32, {value, Value(3u)});
+      value = fixture.Emit(ValueOpcode::BitwiseXor32, {left, right});
+    }
+    return value;
+  };
+  Check(ValidateRuntimeValue(fixture.program, shared(Value(42u)),
+                             RuntimeValueType::Integer),
+        "shared uniform integer dependencies were rejected");
+  const auto inactive = shared(lane);
   const auto selected = fixture.Emit(
       ValueOpcode::SelectU32, {active, Value(42u), inactive});
   const auto first =
@@ -616,6 +620,14 @@ void TestSharedIntegerRuntimeDependencies() {
   selected.ResolveInstruction()->SetArg(2, mixed);
   Check(!ValidateRuntimeValue(fixture.program, first, RuntimeValueType::Integer),
         "shared integer dependencies hid a floating-point sibling");
+
+  const auto condition = fixture.Emit(ValueOpcode::IEqual32, {Value(0u), Value(1u)});
+  const auto cyclic = fixture.Emit(ValueOpcode::SelectU32, {condition, Value(1u), Value(0u)});
+  const auto masked = fixture.Emit(ValueOpcode::ReadFirstLane, {cyclic, condition});
+  cyclic.Instruction()->SetArg(2, masked);
+  Check(ValidateRuntimeValue(fixture.program, masked) &&
+            !ValidateRuntimeValue(fixture.program, fixture.Emit(ValueOpcode::IAdd32, {masked, cyclic})),
+        "a completed masked lane read hid a cycle in an unmasked use");
 }
 
 void TestConstantBufferBounds() {

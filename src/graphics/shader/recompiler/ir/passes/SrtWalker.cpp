@@ -207,14 +207,19 @@ private:
 			}
 		}
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
-		// Integer-only dependency checks do not depend on the active EXEC mask.
-		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
+		auto& validated = require_uniform ? m_validated_uniform : m_validated_dependencies;
+		const bool cacheable = !require_uniform || m_active_mask.IsEmpty();
+		if (cacheable && validated.contains(inst)) return true;
 		if (!m_visiting.insert(inst).second) {
 			return !require_uniform;
 		}
+		const auto lane_reads = m_lane_reads;
 		const auto finish = [&](bool valid) {
 			m_visiting.erase(inst);
-			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			// A lane read can skip a cyclic operand under its own EXEC mask. Only
+			// reuse uniform proofs which traversed the whole unmasked expression.
+			if (valid && cacheable && (!require_uniform || lane_reads == m_lane_reads))
+				validated.insert(inst);
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -288,6 +293,7 @@ private:
 			return finish(Validate(invariant));
 		}
 		if (op == ValueOpcode::ReadFirstLane) {
+			++m_lane_reads;
 			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
 			    inst->Arg(1).GetType() != Type::U1) {
 				return finish(false);
@@ -358,6 +364,8 @@ private:
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
+	std::unordered_set<const Inst*> m_validated_uniform;
+	size_t                          m_lane_reads = 0;
 };
 
 // Emits one x86 function per plan. Each value, per EXEC-mask context, is a memoized thunk with a

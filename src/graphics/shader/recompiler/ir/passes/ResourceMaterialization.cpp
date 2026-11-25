@@ -15,6 +15,8 @@
 #include <functional>
 #include <numeric>
 #include <unordered_set>
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -227,6 +229,21 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 	    (!formatted_read && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u))) {
 		value.dwords.fill(0u);
 		return true;
+	}
+	if (!indexed && !resource.formatted && !descriptor.SwizzleEnabled() && !descriptor.AddTid() &&
+	    descriptor.OutOfBounds() == 0u) {
+		// A record array reached through byte offsets only: direct buffers treat it as the
+		// whole [base, base + stride * records) range, so express that as raw byte bounds.
+		const uint64_t bytes = descriptor.Stride() != 0u
+		                           ? uint64_t {descriptor.Stride()} * descriptor.NumRecords()
+		                           : uint64_t {descriptor.NumRecords()};
+		if (bytes > UINT32_MAX) {
+			return SpecializationFail("indirect buffer byte range exceeds 32 bits");
+		}
+		value.dwords[1] = (value.dwords[1] & ~(0x3fffu << 16u)) | (1u << 16u);
+		value.dwords[2] = static_cast<uint32_t>(bytes);
+		value.dwords[3] |= 3u << 28u;
+		if (!DecodeBufferDescriptor(value, descriptor)) return false;
 	}
 	if (descriptor.SwizzleEnabled() || descriptor.AddTid() ||
 	    descriptor.OutOfBounds() != (indexed ? 0u : 3u)) {
@@ -556,13 +573,13 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 }
 
 template <typename Specialization, typename Normalize>
-bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
-                                   uint32_t source_index,
-                                   uint32_t resource_index, uint32_t dword_count, uint32_t read_dwords,
-                                   const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+bool MaterializeIndirectDescriptor(const ResourcePlan& program, uint32_t source_index,
+                                   uint32_t resource_index, uint32_t dword_count,
+                                   uint32_t read_dwords, const SrtRuntime& runtime,
+                                   ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
-                                   Normalize&& normalize) {
+                                   Normalize&& normalize, bool allow_scan_cache = false) {
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
@@ -730,8 +747,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return true;
 				}
 			}
-			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
-				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
+			const uint64_t row_limit =
+			    indirect.table_scalar ? MaxIndirectScalarTableRows : MaxIndirectDescriptorProbes;
+			if (child_count == 0u || (!image_heap && count * child_count > row_limit))
+				return failed("candidate count", fmt::format("rows={} limit={}", count, row_limit));
 			// Affine SMEM offsets wrap in U32 before adding the aligned immediate.
 			// Image heaps retain one bulk snapshot and their absolute byte-offset mapping.
 			auto& heap_words = program.material_keys;
@@ -740,9 +759,64 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				if (!ReadScalarTable(table_base, table_size, 0u, runtime, heap_words))
 					return read_failed("image heap read", 0u, 0u, table_base, 0u, heap_words.size() * sizeof(uint32_t));
 			}
+			// Large flat tables are read once instead of one guest-memory call per row.
+			bool bulk_table = false;
+			if (!image_heap && pointer == nullptr && count > 16u && table_size >= 4u &&
+			    table_size <= (uint64_t {64} << 20u)) {
+				heap_words.resize(table_size / 4u);
+				bulk_table = ReadScalarTable(table_base, table_size, 0u, runtime, heap_words);
+			}
 			const auto mapping_offset = snapshot.flattened_srt.size();
-			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
-			for (uint32_t word = 0; word < count; ++word) {
+			// The scan of an unchanged table gives the same candidates and mapping again: every
+			// input (the table geometry, the root descriptor and the bytes) is part of the key.
+			ScanCacheEntry  cache_key;
+			ScanCacheEntry* cache_slot = nullptr;
+			const bool      cache_eligible =
+			    allow_scan_cache && bulk_table && descriptors.size() == children_begin;
+			bool cache_hit = false;
+			if (cache_eligible) {
+				cache_key.source_index     = source_index;
+				cache_key.resource_index   = resource_index;
+				cache_key.table_base       = table_base;
+				cache_key.table_size       = table_size;
+				cache_key.first            = first;
+				cache_key.step             = step;
+				cache_key.count            = count;
+				cache_key.dword_count      = dword_count;
+				cache_key.read_dwords      = read_dwords;
+				cache_key.root             = descriptors[resource_index].dwords;
+				cache_key.root_dword_count = descriptors[resource_index].dword_count;
+				cache_key.content_hash =
+				    XXH3_64bits(heap_words.data(), heap_words.size() * sizeof(uint32_t));
+				for (auto& entry: program.scan_cache) {
+					if (entry.SameInputs(cache_key)) {
+						cache_slot = &entry;
+						cache_hit  = entry.content_hash == cache_key.content_hash;
+						break;
+					}
+				}
+			}
+			if (cache_hit) {
+				const auto& children = cache_slot->children;
+				for (size_t at = 0; at + ScanCacheEntry::ChildWords <= children.size();
+				     at += ScanCacheEntry::ChildWords) {
+					DescriptorValue child_value;
+					std::copy_n(children.begin() + static_cast<std::ptrdiff_t>(at),
+					            child_value.dwords.size(), child_value.dwords.begin());
+					child_value.dword_count = children[at + child_value.dwords.size()];
+					descriptors.push_back(child_value);
+					auto child          = root_resource;
+					child.indirect_root = resource_index;
+					specializations.push_back(child);
+				}
+				snapshot.flattened_srt.insert(snapshot.flattened_srt.end(),
+				                              cache_slot->mapping.begin(),
+				                              cache_slot->mapping.end());
+			} else {
+				snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+			}
+			const uint32_t scan_rows = cache_hit ? 0u : static_cast<uint32_t>(count);
+			for (uint32_t word = 0; word < scan_rows; ++word) {
 				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
 				uint64_t pointer_base = 0u;
 				if (pointer != nullptr) {
@@ -759,6 +833,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 						        std::span(candidate.dwords).first(read_dwords)))
 							return read_failed("child descriptor read", word, child, pointer_base,
 							    uint64_t {child} * pointer->stride + pointer->offset, descriptor_bytes);
+					} else if (bulk_table) {
+						// Same result as ReadTable: dwords past the table end stay zero.
+						const auto   table_word = table_offset / 4u;
+						const size_t available =
+						    table_word < heap_words.size() ? heap_words.size() - table_word : 0u;
+						std::copy_n(heap_words.begin() + table_word,
+						            std::min<size_t>(read_dwords, available),
+						            candidate.dwords.begin());
 					} else if (!image_heap) {
 						if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 						                     std::span(candidate.dwords).first(read_dwords))) return false;
@@ -777,6 +859,24 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					snapshot.flattened_srt.resize(mapping_offset + 2u + mapping_word, 0u);
 					snapshot.flattened_srt[mapping_offset + 1u + mapping_word] = ordinal;
 				}
+			}
+			if (cache_eligible && !cache_hit) {
+				if (cache_slot == nullptr) {
+					if (program.scan_cache.size() >= ScanCacheEntry::MaxEntries)
+						program.scan_cache.clear();
+					cache_slot = &program.scan_cache.emplace_back();
+				}
+				cache_key.children.clear();
+				for (auto it = descriptors.begin() + static_cast<std::ptrdiff_t>(children_begin);
+				     it != descriptors.end(); ++it) {
+					cache_key.children.insert(cache_key.children.end(), it->dwords.begin(),
+					                          it->dwords.end());
+					cache_key.children.push_back(it->dword_count);
+				}
+				cache_key.mapping.assign(snapshot.flattened_srt.begin() +
+				                             static_cast<std::ptrdiff_t>(mapping_offset),
+				                         snapshot.flattened_srt.end());
+				*cache_slot = std::move(cache_key);
 			}
 
 			if (descriptors.size() == children_begin) {
@@ -1686,12 +1786,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (WalkedActive(program, base.source)) {
 					if (!MaterializeIndirectDescriptor(
-					        program, base.source, i, 4u, 4u, observed, snapshot,
-					        snapshot.buffers, specialization.buffers,
+					        program, base.source, i, 4u, 4u, observed, snapshot, snapshot.buffers,
+					        specialization.buffers,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
-					        }))
+					        },
+					        true))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i])) {
@@ -2154,11 +2255,13 @@ void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
 
 // Binds every plan field: one added later fails to compile here until it is stored or derived.
 template <class S, class P> void IoPlan(S& io, P& plan) {
-	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info, descriptor_sources,
-	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
-	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
+	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info,
+	       descriptor_sources, selector_groups, control_flow, control_phis, srt_reads, source_reads,
+	       capture_specialization_reads, srt_plan_complete, resource_tracking_complete, info,
+	       uniform_fill,
 	       // Derived on load.
-	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
+	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys,
+	       scan_cache] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,

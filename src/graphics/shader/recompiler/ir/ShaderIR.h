@@ -28,6 +28,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
+// A bounded table V# is scanned row by row on the host; only distinct descriptors become resources.
+constexpr uint32_t MaxIndirectScalarTableRows = 262144u;
 
 enum class ResourceKind {
 	None,
@@ -700,6 +702,36 @@ struct UniformFillPlan {
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
+// One scanned descriptor table: the inputs that determine the scan, and what it produced.
+struct ScanCacheEntry {
+	static constexpr size_t ChildWords = 9u; // Eight descriptor DWORDs and their count.
+	static constexpr size_t MaxEntries = 64u;
+
+	uint32_t                source_index     = 0;
+	uint32_t                resource_index   = 0;
+	uint64_t                table_base       = 0;
+	uint64_t                table_size       = 0;
+	uint64_t                first            = 0;
+	uint64_t                step             = 0;
+	uint64_t                count            = 0;
+	uint32_t                dword_count      = 0;
+	uint32_t                read_dwords      = 0;
+	std::array<uint32_t, 8> root             = {};
+	uint32_t                root_dword_count = 0;
+	uint64_t                content_hash     = 0;
+	std::vector<uint32_t>   children;
+	std::vector<uint32_t>   mapping;
+
+	// Everything except the table bytes; a match with other bytes is a stale entry to replace.
+	[[nodiscard]] bool SameInputs(const ScanCacheEntry& other) const {
+		return source_index == other.source_index && resource_index == other.resource_index &&
+		       table_base == other.table_base && table_size == other.table_size &&
+		       first == other.first && step == other.step && count == other.count &&
+		       dword_count == other.dword_count && read_dwords == other.read_dwords &&
+		       root == other.root && root_dword_count == other.root_dword_count;
+	}
+};
+
 struct ResourcePlan {
 	struct SelectorKeys {
 		std::vector<uint32_t> values;
@@ -739,6 +771,8 @@ struct ResourcePlan {
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	// Results of scanning large descriptor tables, reused while the table bytes are unchanged.
+	mutable std::vector<ScanCacheEntry> scan_cache;
 };
 
 struct Program: ResourcePlan {

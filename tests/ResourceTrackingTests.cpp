@@ -7727,9 +7727,9 @@ void TestPackedScalarBufferSelection() {
   memory.words[19] |= 3u << 28u;
   Check(!materialize(), "indexed DWORD write accepted raw byte bounds");
   for (auto bad : {0u, 1u, 2u}) {
-    auto invalid = make(bad == 0u ? 28u : 24u, bad == 1u, bad == 2u ? 4u : 0u);
+    auto invalid = make(bad == 0u ? 28u : 24u, bad == 1u, bad == 2u ? 2u : 0u);
     CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
-               "packed selector accepted a cross-byte shift, leafless cycle, or indexed byte offset");
+               "packed selector accepted a cross-byte shift, leafless cycle, or unaligned DWORD offset");
   }
   auto mixed = make(24u, false, 0u, true);
   mixed->PlanAndTrack();

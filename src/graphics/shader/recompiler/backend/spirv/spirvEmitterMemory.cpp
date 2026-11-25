@@ -368,15 +368,16 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	    !sources[buffer.source].indirect_descriptor->indexed) return payload_in_bounds;
 	const auto bytes = Binary(state, spv::OpIMul, TypeU32(state), resource.length,
 	                          ConstantU32(state, resource.element_bits / 8u));
-	const auto available = Binary(state, spv::OpISub, TypeU32(state), bytes, resource.byte_offset);
-	// Test the original index before multiplication can wrap. A truncated binding
-	// may omit final-record padding; the payload check below still checks every byte.
+	const auto first_byte = mem.offset == 0u ? resource.byte_offset
+	    : EmitAddU32(state, resource.byte_offset, ConstantU32(state, mem.offset));
+	const auto available = Binary(state, spv::OpISub, TypeU32(state), bytes, first_byte);
+	// Bound the original index before multiplying by the stride and adding the field offset.
 	const auto last_record = Binary(state, spv::OpUDiv, TypeU32(state),
 	    Binary(state, spv::OpISub, TypeU32(state), available, ConstantU32(state, 1u)),
 	    ConstantU32(state, buffer.packed_stride & 0x3fffu));
 	return AndCondition(state, payload_in_bounds,
 	    AndCondition(state,
-	        Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, resource.byte_offset),
+	        Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, first_byte),
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
 }
 

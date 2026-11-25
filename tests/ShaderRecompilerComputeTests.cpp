@@ -37648,7 +37648,8 @@ TestCase BufferStoreWorkgroupDescriptors(u32 groups, u32 components = 1u) {
   for (u32 word = 1u; word < components; ++word)
     code.push_back(EncodeVop1(0x01, 2u + word, InlineU32(6u + word)));
   const u32 opcode = components == 4u ? 0x1eu : components == 2u ? 0x1du : 0x1cu;
-  code.insert(code.end(), {EncodeMubuf0(opcode, 0, true, false), EncodeMubuf1(2, 3, 0)});
+  const u32 field_offset = components == 4u ? 8u : 0u;
+  code.insert(code.end(), {EncodeMubuf0(opcode, field_offset, true, false), EncodeMubuf1(2, 3, 0)});
   if (components == 2u) code[1] = EncodeSopp(0x04, code.size() - 2u);
   AppendEnd(&code);
   test.initial.assign(2064u, 0xdeadbeefu);
@@ -37660,16 +37661,17 @@ TestCase BufferStoreWorkgroupDescriptors(u32 groups, u32 components = 1u) {
     std::copy(descriptor.begin(), descriptor.end(),
               test.initial.begin() + (test.user_data[0] + 0x2a0u + row * 16u) / 4u);
     test.expected_buffer_resources->push_back(row);
-    const u32 bytes = components > 1u && row == 1u ? stride + (components - 1u) * 4u : 2u * stride;
+    const u32 bytes = components > 1u && row == 1u ? stride + field_offset + (components - 1u) * 4u : 2u * stride;
     test.storage_buffer_ranges.emplace_back(output, bytes);
   }
   test.expected = test.initial;
   for (const auto &[output, bytes] : test.storage_buffer_ranges)
-    for (u32 word = 0; word < bytes / 4u; ++word) {
-      const u32 component = word % (stride / 4u);
-      if (component < components)
-        test.expected[output / 4u + word] = component == 0u ? output / 4096u - 1u : 6u + component;
-    }
+    for (u32 record = 0; record < 2u; ++record)
+      for (u32 component = 0; component < components; ++component) {
+        const u32 offset = record * stride + field_offset + component * 4u;
+        if (offset < bytes)
+          test.expected[(output + offset) / 4u] = component == 0u ? output / 4096u - 1u : 6u + component;
+      }
   return test;
 }
 

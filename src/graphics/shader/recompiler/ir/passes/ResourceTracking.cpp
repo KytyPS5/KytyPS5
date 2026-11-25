@@ -3007,8 +3007,10 @@ private:
 		if (index >= m_program.memory_info.size()) return false;
 		const auto& memory = m_program.memory_info[index];
 		if (memory.kind != ResourceKind::Buffer || memory.typed || (memory.idxen && memory.offen) ||
-		    (memory.idxen && (memory.offset != 0u || inst.Arg(2).Resolve() != Value(0u))) ||
+		    (memory.idxen && inst.Arg(2).Resolve() != Value(0u)) ||
 		    inst.Arg(3).Resolve() != Value(0u)) return false;
+		if (memory.idxen && memory.offset != 0u &&
+		    (memory.formatted || memory.data_bits != 32u || (memory.offset & 3u) != 0u)) return false;
 		if (opcode == ValueOpcode::StoreBufferU32)
 			return !memory.formatted || (memory.idxen && memory.data_bits == 32u && memory.data_dwords == 1u);
 		if (!memory.idxen) return false;

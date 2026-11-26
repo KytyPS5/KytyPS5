@@ -449,6 +449,7 @@ public:
 		}
 		std::vector<std::pair<const IndirectDescriptorPlan*, Value>> buffer_selections;
 		for (const auto& plan: m_indirect_descriptors) {
+			const auto& indirect = *m_sources[plan.source].indirect_descriptor;
 			auto key = plan.key;
 			if (plan.table_read != nullptr) {
 				const auto* anchor = plan.table_indexed ? plan.handle : plan.table_read;
@@ -462,7 +463,10 @@ public:
 				const auto& memory = m_program.memory_info[read.Flags<MemoryFlags>().index];
 				Value offset;
 				Value valid(true);
-				if (plan.table_indexed) {
+				if (plan.handle->GetOpcode() == ValueOpcode::GetSamplerResource) {
+					// The sampler mapping stores one DWORD per packed descriptor.
+					offset = ScalarTableKey(*block, where, read, indirect.table_stride);
+				} else if (plan.table_indexed) {
 					const auto* table = read.Arg(0).ResolveInstruction();
 					const auto stride = emit(ValueOpcode::BitFieldUExtract,
 					    {table->Arg(1), Value(16u), Value(14u)});
@@ -474,7 +478,6 @@ public:
 					    {emit(ValueOpcode::ULessThan32, {read.Arg(1), table->Arg(2)}),
 					     emit(ValueOpcode::INotEqual32, {format, Value(0u)})});
 				} else {
-					const auto& indirect = *m_sources[plan.source].indirect_descriptor;
 					const auto dynamic = emit(ValueOpcode::BitwiseAnd32, {read.Arg(1), Value(~3u)});
 					if (m_sources[indirect.table_source].dword_count == 2u) {
 						// An address table's heap starts at key 0's slot.
@@ -485,9 +488,9 @@ public:
 						valid = emit(ValueOpcode::ULessThanEqual32, {dynamic, offset});
 					}
 				}
-				key = emit(ValueOpcode::SelectU32, {valid, offset, Value(UINT32_MAX)});
+				key = valid == Value(true) ? offset : emit(ValueOpcode::SelectU32, {valid, offset, Value(UINT32_MAX)});
 				if (!plan.table_indexed) {
-					// NativeDescriptorSource proved this read reaches the image. Preserve its
+					// NativeDescriptorSource proved this read reaches the handle. Preserve its
 					// SSA Phi edges while retaining descriptor DWORDs for other consumers.
 					std::map<const Inst*, Value> projected;
 					const auto project = [&](auto&& self, Value value) -> Value {
@@ -513,8 +516,7 @@ public:
 					plan.handle->SetArg(word, Value(0u));
 				continue;
 			}
-			if (m_sources[plan.source].indirect_descriptor->table_maximum &&
-			    plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
+			if (indirect.table_maximum && plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
 				auto* block = plan.handle->Parent();
 				const auto where = std::ranges::find_if(block->Instructions(),
 				    [&](const Inst& inst) { return &inst == plan.handle; });
@@ -538,17 +540,11 @@ public:
 					auto* block = anchor->Parent();
 					const auto where = std::ranges::find_if(block->Instructions(),
 					    [&](const Inst& inst) { return &inst == anchor; });
-					const auto& indirect = *m_sources[plan.source].indirect_descriptor;
 					if (indirect.table_maximum) {
 						key = Value(&*block->PrependNewInst(
 						    where, ValueOpcode::ShiftLeftLogical32, {key, Value(2u)}));
 					} else if (indirect.table_scalar) {
-						// Wrapped affine offsets span one power-of-two congruence class.
-						// Keep the existing mapping's byte key while compressing its empty gaps.
-						key = plan.reads[0]->Arg(1);
-						const auto shift = std::countr_zero(indirect.table_stride) - 2u;
-						if (shift != 0u) key = Value(&*block->PrependNewInst(
-						    where, ValueOpcode::ShiftRightLogical32, {key, Value(shift)}));
+						key = ScalarTableKey(*block, where, *plan.reads[0], indirect.table_stride);
 					}
 					auto& selection = *block->PrependNewInst(where, ValueOpcode::GetBufferResourceIndex, {key});
 					selection.SetFlags(plan.handle->Flags<uint32_t>());
@@ -3423,6 +3419,11 @@ private:
 					return false;
 			}
 			if ((table_offset & 3u) != 0u) return false;
+		} else if (sampler && table_stride == 4u * sizeof(uint32_t) &&
+		           table_offset == 0u && table_immediate == 0u && !plan.split_offsets) {
+			// A packed S# table has one lookup per 16-byte row of the bounded V#.
+			indirect.table_scalar = true;
+			plan.table_read = plan.reads[0];
 		} else {
 			// Keep the GPU selector and descriptor reads, and preserve the proven scalar
 			// offset domain within the bounded image table.
@@ -4091,6 +4092,14 @@ private:
 			    return plan.handle == &handle;
 		    });
 		return found == m_indirect_descriptors.end() ? nullptr : &*found;
+	}
+
+	// Index the dense DWORD mapping with the wrapped SMEM byte offset.
+	static Value ScalarTableKey(Block& block, Block::iterator where, const Inst& read, uint32_t stride) {
+		const auto offset = read.Arg(1);
+		const auto shift = std::countr_zero(stride) - 2u;
+		if (shift == 0u) return offset;
+		return Value(&*block.PrependNewInst(where, ValueOpcode::ShiftRightLogical32, {offset, Value(shift)}));
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {

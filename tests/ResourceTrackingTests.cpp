@@ -7970,27 +7970,30 @@ void TestFiniteImagePhiCycle() {
 }
 
 void TestPackedDescriptorWaterfall() {
-  for (const uint32_t variant : {0u, 1u, 2u}) {
+  for (const uint32_t variant : {0u, 1u, 2u, 3u}) {
     Fixture f(ShaderType::Pixel);
     const auto packed = f.Emit(ValueOpcode::GetInterpolationParameter,
                                {Value(1u), Value(1u), Value(2u)});
     const auto active = f.Emit(ValueOpcode::ULessThan32,
                                {f.Emit(ValueOpcode::LaneId), Value(16u)});
     const auto image_key = f.Emit(ValueOpcode::BitwiseAnd32, {packed, Value(65535u)});
-    const auto sampler_key = variant == 2u ? packed :
+    const auto sampler_key = variant >= 2u ? packed :
         f.Emit(ValueOpcode::ShiftRightLogical32, {packed, Value(16u)});
     auto selected_active = active;
+    Value selected_sampler;
     const auto descriptor = [&](Value key, uint32_t first, uint32_t count, uint32_t shift) {
       const auto selected = f.Emit(ValueOpcode::ReadFirstLane, {key, active});
+      if (count == 4u) selected_sampler = selected;
       selected_active = f.Emit(ValueOpcode::LogicalAnd, {selected_active,
           f.Emit(ValueOpcode::IEqual32, {selected, key})});
       const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {selected, Value(shift)});
       const auto table = f.Buffer({f.UserData(first), f.UserData(first + 1u),
                                    f.UserData(first + 2u), f.UserData(first + 3u)});
       std::array<Value, 8> words;
+      const auto member = count == 4u && variant == 3u ? 4u : 0u;
       for (uint32_t word = 0; word < count; ++word)
         words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
-            f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u}, 0x58u));
+            f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = member + word * 4u}, 0x58u));
       return words;
     };
     const auto image = f.Image(descriptor(image_key, 0u, 8u, 5u));
@@ -8001,9 +8004,9 @@ void TestPackedDescriptorWaterfall() {
         {image, sampler, f.ImageAddress(), variant == 1u ? Value(true) : selected_active},
         f.AddMemory({.kind = ResourceKind::Image,
                      .image_dimension = Decoder::ImageDimension::Dim2D}, 0x6cu));
-    if (variant != 0u) {
+    if (variant == 3u) {
       CheckFatal([&] { f.PlanAndTrack(); }, "not a valid runtime value",
-                 "packed waterfall accepted widened EXEC or an unbounded sampler key");
+                 "unbounded sampler table accepted a descriptor crossing packed row boundaries");
       continue;
     }
     f.PlanAndTrack();
@@ -8013,11 +8016,12 @@ void TestPackedDescriptorWaterfall() {
       const auto& table = value.indirect_descriptor;
       Check(table && !table->selector && table->table_scalar &&
                 table->table_stride == value.dword_count * 4u &&
-                (value.dword_count != 4u || table->table_maximum == 65535u),
-            "packed waterfall lost its static sampler bit bound or captured the varying key");
+                (value.dword_count != 4u || (variant == 0u ? table->table_maximum == 65535u
+                                                         : !table->table_maximum)),
+            "packed waterfall lost its sampler domain or captured the varying key");
     }
     LinearTestMemory memory;
-    const std::array<uint32_t, 8> user_data{
+    std::array<uint32_t, 8> user_data{
         uint32_t(memory.base) + 256u, 32u << 16u, 2u, 0x5204u,
         uint32_t(memory.base) + 512u, 16u << 16u, 59u, 0x5204u};
     for (uint32_t row = 0; row < 2u; ++row) {
@@ -8043,6 +8047,26 @@ void TestPackedDescriptorWaterfall() {
       return (span.first >= memory.base + 256u && span.first + span.second <= memory.base + 320u) ||
           (span.first >= memory.base + 512u && span.first + span.second <= memory.base + 512u + 59u * 16u);
     }), "packed waterfall materialization read outside the descriptor heaps");
+    if (variant == 2u) {
+      // The GPU byte offset wraps to 16; the dense sampler map stores one DWORD per row.
+      selected_sampler.Instruction()->ReplaceUsesWith(Value(0x10000001u));
+      uint32_t offset = 0;
+      const auto& root = specialization.samplers[0];
+      const auto mapping = root.indirect_mapping_offset;
+      Check(EvaluateSrtValue(f.program, runtime, sampler.Instruction()->Arg(0), offset) &&
+                offset == 4u && root.indirect_search_iterations == 0u &&
+                snapshot.flattened_srt[mapping] == 59u &&
+                snapshot.flattened_srt[mapping + 1u + offset / 4u] == 2u &&
+                snapshot.samplers[2].dwords[0] == 1u && snapshot.samplers[2].dwords[2] == 0x0a500000u,
+            "wrapped packed sampler index selected the wrong descriptor");
+      user_data[5] = 0u;
+      user_data[6] = 24u;
+      memory.fail_address = memory.base + 512u + 24u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.samplers.size() == 3u &&
+                std::ranges::equal(std::span(snapshot.samplers[2].dwords).first(4),
+                                   std::array{1u, 0x00fff000u, 0u, 0u}),
+            "partial packed sampler row did not zero its out-of-bounds DWORDs");
+    }
   }
 }
 

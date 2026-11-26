@@ -22,6 +22,62 @@ void Replace(Inst& inst, Value value) {
 	inst.ReplaceUsesWith(value.Resolve());
 }
 
+constexpr uint32_t AncillaryRetainDepth = 16;
+
+uint32_t FieldMask(uint32_t offset, uint32_t count) {
+	if (count == 0u) {
+		return 0u;
+	}
+	return count == 32u ? UINT32_MAX : ((uint32_t {1} << count) - 1u) << offset;
+}
+
+bool ReadImmediateField(const Inst& inst, size_t offset_arg, uint32_t& mask) {
+	const auto offset = Arg(inst, offset_arg);
+	const auto count  = Arg(inst, offset_arg + 1u);
+	if (!IsImmediate(offset, Type::U32) || !IsImmediate(count, Type::U32) || offset.U32() > 32u ||
+	    count.U32() > 32u - offset.U32()) {
+		return false;
+	}
+	mask = FieldMask(offset.U32(), count.U32());
+	return true;
+}
+
+bool AncillaryBitsUnread(const Inst& inst, uint32_t live_bits, const Inst* lanes, uint32_t depth) {
+	if (depth == 0u) {
+		return false;
+	}
+	return std::ranges::all_of(inst.Uses(), [&](const Use& use) {
+		const auto& user = *use.user;
+		if (!user.HasUses() && !user.MayHaveSideEffects()) {
+			return true;
+		}
+		uint32_t field = 0;
+		switch (user.GetOpcode()) {
+			case ValueOpcode::Identity:
+				return AncillaryBitsUnread(user, live_bits, lanes, depth - 1u);
+			case ValueOpcode::BitFieldUExtract:
+			case ValueOpcode::BitFieldSExtract:
+				return use.operand == 0u && ReadImmediateField(user, 1u, field) &&
+				       (field & live_bits) == 0u;
+			case ValueOpcode::BitFieldInsert:
+				return use.operand == 0u && ReadImmediateField(user, 2u, field) &&
+				       ((live_bits & ~field) == 0u ||
+				        AncillaryBitsUnread(user, live_bits & ~field, lanes, depth - 1u));
+			case ValueOpcode::SelectU32: {
+				const auto* condition = Arg(user, 0).TryInstruction();
+				if (use.operand == 2u && condition != nullptr && condition == lanes) {
+					return true;
+				}
+				return use.operand != 0u &&
+				       AncillaryBitsUnread(
+				           user, live_bits,
+				           use.operand == 1u && lanes == nullptr ? condition : lanes, depth - 1u);
+			}
+			default: return false;
+		}
+	});
+}
+
 bool HasOneUse(const Inst& inst) {
 	// Replacement aliases preserve external Values but emit no additional operation.
 	return std::ranges::count_if(inst.Uses(), [](const Use& use) {
@@ -1069,6 +1125,12 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 				const auto& user = *use.user;
 				if (!user.HasUses() && !user.MayHaveSideEffects()) {
 					return true;
+				}
+				uint32_t field = 0;
+				if (user.GetOpcode() == ValueOpcode::BitFieldInsert && use.operand == 0u &&
+				    ReadImmediateField(user, 2u, field)) {
+					return field == UINT32_MAX ||
+					       AncillaryBitsUnread(user, ~field, nullptr, AncillaryRetainDepth);
 				}
 				return user.GetOpcode() == ValueOpcode::Phi ||
 				       (user.GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2u);

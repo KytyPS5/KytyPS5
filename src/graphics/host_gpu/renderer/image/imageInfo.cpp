@@ -16,9 +16,8 @@ uint64_t Add(uint64_t left, uint64_t right) {
 }
 
 bool IsDepthPlane(const ImageInfo& info) {
-	return (info.IsDepth() || info.pixel_format == vk::Format::eS8Uint) &&
-	       (info.tile_mode == Prospero::TileMode::kDepth ||
-	        info.tile_mode == Prospero::TileMode::kLinear);
+	return info.IsDepth() && (info.tile_mode == Prospero::TileMode::kDepth ||
+	                          info.tile_mode == Prospero::TileMode::kLinear);
 }
 
 GuestRange TiledMipRange(const ImageInfo& info, uint32_t level) {
@@ -308,12 +307,7 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 	levels = levels == 0 ? resources.levels : levels;
 	EXIT_IF(levels > resources.levels || levels > mip_layout.size() || tiling.texel_width == 0 ||
 	        tiling.texel_height == 0);
-	auto aspect = vk::ImageAspectFlagBits::eColor;
-	if (IsDepth()) {
-		aspect = vk::ImageAspectFlagBits::eDepth;
-	} else if (pixel_format == vk::Format::eS8Uint) {
-		aspect = vk::ImageAspectFlagBits::eStencil;
-	}
+	const auto                       aspect = DataAspect(pixel_format);
 	const auto                       linear = LinearLayout();
 	std::vector<vk::BufferImageCopy> copies;
 	std::array<uint32_t, 16>         image_heights {};

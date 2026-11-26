@@ -3867,9 +3867,9 @@ struct AmmCommandBuffer {
 	}
 };
 
-void TestAmmMapAsPrt() {
+void TestAmmPrtBacking() {
 	using namespace Libs::LibKernel::Memory;
-	const char*        test     = "AmmMapAsPrt";
+	const char*        test     = "AmmPrtBacking";
 	constexpr uint64_t block    = 0x200000;
 	constexpr uint64_t base     = kExtendedMemoryBase + 0x24000000;
 	const auto         end      = static_cast<int64_t>(KernelGetDirectMemorySize());
@@ -3877,6 +3877,8 @@ void TestAmmMapAsPrt() {
 	AmmCommandBuffer   commands(test);
 	const auto         map_as_prt =
 	    commands.Find<int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t)>("ZJCgt+aPHAU");
+	const auto allocate = commands.Find<int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t, int, int)>(
+	    "d3lKWPM6odc");
 	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &physical, true),
 	        "allocate automatic backing");
 	CheckOk(test, MapAutomaticMemory(base + block, block, SceKernelMtypeC, SceKernelProtCpuRw),
@@ -3898,15 +3900,59 @@ void TestAmmMapAsPrt() {
 	Check(test, commands.Offset() == 12, "mapAsPrt record is not three dwords");
 	const auto result = commands.Submit();
 	Check(test, result.result == OK && result.error_offset == 0, "mapAsPrt execution failed");
-	ExpectRange(test, Query(test, base), base, base + block * 4, 0, 0, 0, 0, 0, "anon");
+	const auto prt = Query(test, base);
+	ExpectRange(test, prt, base, base + block * 4, 0, 0, 0, 0, 0, "anon");
+	Check(test, prt.is_gpu_prt && !prt.amm_usage, "unbacked PRT query flags");
 	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base + block, block}},
 	      "mapAsPrt did not unmap the replaced mapping from the GPU");
-	CheckOk(test, MapAutomaticMemory(base, block, SceKernelMtypeC, SceKernelProtCpuRw),
-	        "mapAsPrt did not return the replaced pages to the automatic allocator");
-	Check(test, Query(test, base).offset == static_cast<uint64_t>(physical),
-	      "automatic allocation did not reuse the replaced pages");
-	ExpectRange(test, Query(test, base + block), base + block, base + block * 4, 0, 0, 0, 0, 0,
-	            "anon");
+	constexpr auto size = block / 2;
+	constexpr auto type = SceKernelMtypeC;
+	constexpr int  prot = 0xf2;
+	auto*          header = commands.header.data();
+	commands.Find<void*(KYTY_SYSV_ABI*)(void*)>("ULvXMDz56po")(header);
+	Check(test, allocate(header, base, size, type, prot) == Libs::LibKernel::KERNEL_ERROR_EPERM,
+	      "allocatePaForPrt accepted an unset buffer");
+	CheckOk(test, commands.Find<int(KYTY_SYSV_ABI*)(void*, void*, uint32_t)>("N-FSPA4S3nI")(
+	                  header, commands.data.data(), 16), "set single-record buffer");
+	for (const auto [addr, len, mtype, flags] :
+	     {std::tuple<uint64_t, uint64_t, int, int> {base + 1, size, type, prot},
+	      {base, 0, type, prot}, {0, size, type, prot}, {base, size, 0, prot},
+	      {base, size, type, SceKernelProtCpuExec}})
+		Check(test, allocate(header, addr, len, mtype, flags) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+		      "allocatePaForPrt accepted invalid arguments");
+	CheckOk(test, allocate(header, base, size, type, prot), "append allocatePaForPrt");
+	const std::array<uint32_t, 4> record {0x580f3326u, static_cast<uint32_t>(base >> 14),
+	                                      0x40000000u | (size >> 12), 0x3fbu};
+	Check(test, commands.Offset() == sizeof(record) &&
+	              std::equal(record.begin(), record.end(), commands.data.begin()),
+	      "unexpected allocatePaForPrt record");
+	Check(test, allocate(header, base, size, type, prot) == Libs::LibKernel::KERNEL_ERROR_EBUSY,
+	      "allocatePaForPrt exceeded the buffer");
+	CheckOk(test, commands.Submit().result, "convert PRT pages to automatic backing");
+	auto* word = reinterpret_cast<uint64_t*>(base);
+	*word = 0xf00d;
+	const auto info = Query(test, base);
+	Check(test, !info.is_gpu_prt && info.amm_usage && info.is_direct && info.protection == 0xf3 &&
+	              info.memory_type == type &&
+	              info.offset == static_cast<uint64_t>(physical),
+	      "converted PRT range does not report its automatic backing");
+	const auto submit_allocate = [&](uint64_t address, uint64_t length) {
+		CheckOk(test, commands.Find<int(KYTY_SYSV_ABI*)(void*)>("baQO9ez2gL4")(header), "reset AMM buffer");
+		CheckOk(test, allocate(header, address, length, type, prot), "append allocatePaForPrt");
+		return commands.Submit().result;
+	};
+	Check(test, submit_allocate(base + size, block) == AMM_ERROR_OUT_OF_PA_PAGES,
+	      "insufficient automatic pages did not report MEMORYOUTOFPAPAGES");
+	const auto neighbor = Query(test, base + size);
+	ExpectRange(test, neighbor, base + size, base + block * 4, 0, 0, 0, 0, 0, "anon");
+	Check(test, neighbor.is_gpu_prt && *word == 0xf00d, "allocation failure changed adjacent mappings");
+	constexpr uint64_t outside_prt = base + block * 4;
+	CheckFailed(test, submit_allocate(outside_prt, size), "allocatePaForPrt on a hole");
+	void* reserved = reinterpret_cast<void*>(outside_prt);
+	CheckOk(test, KernelReserveVirtualRange(&reserved, size, SceKernelMapFixed, 0), "reserve ordinary VA");
+	Check(test, !Query(test, outside_prt).is_gpu_prt, "ordinary reservation reported as PRT");
+	CheckFailed(test, submit_allocate(outside_prt, size), "allocatePaForPrt on an ordinary reservation");
+	CheckOk(test, KernelMunmap(outside_prt, size), "release ordinary reservation");
 	CheckOk(test, UnmapAmmMemory(base, block * 4), "AMM unmap PRT range");
 	ExpectUnmapped(test, base);
 	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
@@ -5008,6 +5054,26 @@ void TestCpuExtensionContexts() {
 #else
 	flush({0x65, 0x66, 0x0f, 0xae, 0x37}, 7, address - reinterpret_cast<uintptr_t>(NtCurrentTeb()));
 #endif
+	const std::array<uint8_t, 4> zero {0x67, 0x0f, 0x01, 0xfc};
+	std::copy(zero.begin(), zero.end(), instruction);
+	context.Rip() = mapping;
+	context.Gpr(0) = (uint64_t {1} << 32) | (address + 63);
+	Check(test, EmulateInstructionContext(&context.native) && context.Rip() == mapping + zero.size(),
+	      "address-size CLZERO failed");
+	_mm_sfence();
+	Check(test, std::all_of(data, data + 64, [](uint8_t b) { return b == 0; }),
+	      "address-size CLZERO did not use EAX");
+	std::fill_n(data, 64, 0xa5);
+	for (const uint8_t prefix: {0x64, 0x65}) {
+		instruction[0] = prefix;
+		context.Gpr(0) = address;
+		context.Rip() = mapping;
+		Check(test, !EmulateInstructionContext(&context.native) && context.Rip() == mapping,
+		      "segment-relative CLZERO was accepted as a flat store");
+	}
+	_mm_sfence();
+	Check(test, std::all_of(data, data + 64, [](uint8_t b) { return b == 0xa5; }),
+	      "rejected segment-relative CLZERO changed guest memory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5840,6 +5906,21 @@ void TestCpuExtensionPatches() {
 	          std::all_of(data.begin(), data.end(),
 	                      [](uint64_t value) { return value == 0x123456789abcdef0ull; }),
 	      "CLWB direct fallback changed memory or used an unexpected trap path");
+
+	code.reset();
+	code.mov(code.rax, code.rdi);
+	code.stc();
+	code.clzero();
+	code.sfence();
+	code.cmovnc(code.rax, code.rsi);
+	code.ret();
+	alignas(64) std::array<uint64_t, 24> lines;
+	lines.fill(~uint64_t {0});
+	auto expected = lines;
+	std::fill_n(expected.begin() + 8, 8, 0);
+	const auto zero = reinterpret_cast<void*(KYTY_SYSV_ABI*)(void*, void*)>(mapping);
+	Check(test, zero(&lines[15], nullptr) == &lines[15] && lines == expected,
+	      "CLZERO failed to preserve RAX, carry or adjacent cache lines");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -6196,7 +6277,7 @@ int main(int argc, char** argv) {
 		RunTest(TestDirectTrimmedAliasRelease);
 		RunTest(TestDirectMappingNamesTypesAndValidation);
 		RunTest(TestAutomaticMemoryReuseAndAliases);
-		RunTest(TestAmmMapAsPrt);
+		RunTest(TestAmmPrtBacking);
 		RunTest(TestAmmRemapIntoPrt);
 		RunTest(TestAutomaticMemoryFragmentedMap);
 		RunTest(TestFragmentedMemoryPoolBacking);
@@ -6362,7 +6443,7 @@ int main(int argc, char** argv) {
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
-	RunTest(TestAmmMapAsPrt);
+	RunTest(TestAmmPrtBacking);
 	RunTest(TestAmmRemapIntoPrt);
 	RunTest(TestAmmSubmitReusedHeaderStorage);
 	RunTest(TestAutomaticMemoryFragmentedMap);

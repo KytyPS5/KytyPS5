@@ -190,6 +190,53 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+if(TARGET OpenAL AND CLANG)
+	function(kyty_patch_openal_source rel_path out_name search_str replace_str)
+		set(_orig "${KYTY_THIRD_PARTY_DIR}/openal-soft/${rel_path}")
+		set(_patched "${CMAKE_CURRENT_BINARY_DIR}/${out_name}")
+		file(READ "${_orig}" _src)
+		string(REPLACE "${search_str}" "${replace_str}" _src "${_src}")
+		file(WRITE "${_patched}.tmp" "${_src}")
+		execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+			"${_patched}.tmp" "${_patched}"
+		)
+		file(REMOVE "${_patched}.tmp")
+		set_source_files_properties("${_orig}"
+			DIRECTORY "${KYTY_THIRD_PARTY_DIR}/openal-soft"
+			PROPERTIES HEADER_FILE_ONLY TRUE
+		)
+		target_sources(OpenAL PRIVATE "${_patched}")
+	endfunction()
+
+	set(_kyty_openal_fix_header "${CMAKE_CURRENT_BINARY_DIR}/openal_nonblocking_fix.h")
+	file(GENERATE OUTPUT "${_kyty_openal_fix_header}" CONTENT
+		"#pragma once\n#include \"opthelpers.h\"\n#undef NONBLOCKING\n#define NONBLOCKING\n"
+	)
+	if(KYTY_CLANG_CL)
+		target_compile_options(OpenAL PRIVATE
+			$<$<COMPILE_LANGUAGE:CXX>:/FI${_kyty_openal_fix_header}>
+		)
+		# MSVC STL 14.52+ breaks template argument deduction for &std::unique_ptr::operator* in views::transform.
+		target_include_directories(OpenAL PRIVATE "${KYTY_THIRD_PARTY_DIR}/openal-soft/alc")
+		kyty_patch_openal_source("alc/alc.cpp" "openal_alc_patched.cpp"
+			"std::views::transform(&ContextBase::EffectSlotCluster::operator*)"
+			"std::views::transform([](auto &c) -> auto& { return *c; })"
+		)
+	else()
+		target_compile_options(OpenAL PRIVATE
+			"$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${_kyty_openal_fix_header}>"
+		)
+		if(LINUX)
+			# Clang <= 19 with libstdc++ 14 rejects is_constructible_v on std::array of a nested struct with NSDMIs.
+			foreach(_effect_name IN ITEMS chorus distortion pshifter fshifter)
+				kyty_patch_openal_source("alc/effects/${_effect_name}.cpp" "openal_${_effect_name}_patched.cpp"
+					"mUpsampler.emplace()"
+					"mUpsampler.emplace(decltype(mUpsampler)::value_type{})"
+				)
+			endforeach()
+		endif()
+	endif()
+endif()
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
@@ -335,7 +382,17 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers SPIRV-Tools-static SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
+# Keep the renderer's OpenAL headers and compile definitions private.
+set(spatial_renderer_src
+	"${KYTY_SOURCE_DIR}/libs/spatialRenderer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/audio3d.cpp"
+	"${KYTY_SOURCE_DIR}/libs/audioSpeakerArray.cpp"
+)
+list(REMOVE_ITEM kyty_emulator_src ${spatial_renderer_src})
+add_library(kyty_spatial_audio STATIC ${spatial_renderer_src})
+target_link_libraries(kyty_spatial_audio PRIVATE common OpenAL::OpenAL)
+
+set(kyty_emulator_link_libraries common Vulkan::Headers SPIRV-Tools-static SDL3::SDL3-static kyty_spatial_audio imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
 
 # Linux system libraries.
 if(LINUX)
@@ -505,11 +562,11 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
-target_link_libraries(audio_out2_port_tests common fmt::fmt)
+target_link_libraries(audio_out2_port_tests common fmt::fmt kyty_spatial_audio)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")
-target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
+target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static kyty_spatial_audio)
 target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
 
 add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
@@ -529,7 +586,7 @@ target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
-target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
+target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus kyty_spatial_audio)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
 
 add_executable(controller_settings_tests EXCLUDE_FROM_ALL

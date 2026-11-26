@@ -2860,6 +2860,14 @@ uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type) {
 	return (event_type & 0xfeu) == 0x38u ? 16u : 8u;
 }
 
+uint64_t KYTY_SYSV_ABI AgcDcbAtomicMemGetSize() {
+	return 9 * sizeof(uint32_t);
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbAtomicMemGetSize() {
+	return AgcDcbAtomicMemGetSize();
+}
+
 uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* /*address*/) {
 	if (buf == nullptr) {
@@ -2876,6 +2884,10 @@ uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	cmd[1] = (static_cast<uint32_t>(event_type) & 0x3fu) | (event_type == 7u ? 0x400u : 0u);
 
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbEventWriteGetSize() {
+	return 2 * sizeof(uint32_t);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
@@ -3011,6 +3023,10 @@ uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, 
 		cmd[1] |= (static_cast<uint32_t>(offload & 0x1u) << 24u);
 	}
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbRewindGetSize() {
+	return AgcDcbRewindGetSize();
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
@@ -3203,6 +3219,10 @@ uint32_t* KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf) {
 	return cmd;
 }
 
+uint64_t KYTY_SYSV_ABI AgcDcbStallCommandBufferParserGetSize() {
+	return 2 * sizeof(uint32_t);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
                                        uint64_t src_address_or_immediate, uint8_t item_size,
@@ -3334,7 +3354,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbJumpGetSize() {
 	return 16;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbRewindGetSize() {
+uint64_t KYTY_SYSV_ABI AgcDcbRewindGetSize() {
 	PRINT_NAME();
 
 	return 8;
@@ -3516,13 +3536,21 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
-	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_REWIND) {
+static int patch_packet_control_bit31(uint32_t* cmd, uint32_t opcode, uint8_t value) {
+	if (((cmd[0] >> 8u) & 0xffu) != opcode) {
 		return AGC_ERROR_INVALID_PACKET;
 	}
 
-	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(state) << 31u);
+	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(value) << 31u);
 	return OK;
+}
+
+int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
+	return patch_packet_control_bit31(cmd, Pm4::IT_REWIND, state);
+}
+
+int KYTY_SYSV_ABI AgcAcquireMemSetEngine(uint32_t* cmd, uint8_t engine) {
+	return patch_packet_control_bit31(cmd, Pm4::IT_ACQUIRE_MEM, engine);
 }
 
 int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {

@@ -532,8 +532,12 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto data = ctx.Arg(inst, 0);
 		if (exp.kind == IR::ExportTargetKind::Primitive) {
 			if (state.program.stage == ShaderType::Mesh) {
-				state.builder.AddFunction(spv::OpStore, MeshPrimitivePointer(state),
-				                          ExportRawComponent(ctx, data, 0));
+				for (uint32_t component = 0; component < state.mesh_primitive_data.size(); ++component) {
+					if (state.mesh_primitive_data[component] && (exp.en & (1u << component))) {
+						state.builder.AddFunction(spv::OpStore, MeshPrimitivePointer(state, component),
+						                          ExportRawComponent(ctx, data, component));
+					}
+				}
 			}
 			return;
 		}

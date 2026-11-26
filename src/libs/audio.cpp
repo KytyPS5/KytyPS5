@@ -1,3 +1,4 @@
+#include "libs/audio3d.h"
 #include "libs/audio.h"
 
 #include "common/assert.h"
@@ -212,6 +213,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	Audio3d::Shutdown();
 	delete g_audio;
 	g_audio = nullptr;
 }
@@ -229,6 +231,7 @@ bool Audio::FormatIsFloat(Format format) {
 	switch (format) {
 		case Format::FloatMono:
 		case Format::FloatStereo:
+		case Format::Float6Ch:
 		case Format::Float8Ch:
 		case Format::Float8ChStd:
 		case Format::Float12Ch: return true;
@@ -446,6 +449,7 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				case Format::Float8Ch:
 				case Format::Signed16bit8ChStd:
 				case Format::Float8ChStd: port.channels_num = 8; break;
+				case Format::Float6Ch: port.channels_num = 6; break;
 				case Format::Float12Ch: port.channels_num = 12; break;
 				default: EXIT("unknown format");
 			}

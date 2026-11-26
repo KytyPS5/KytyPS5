@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -379,17 +380,20 @@ struct PthreadGuestData {
 
 static_assert(sizeof(PthreadGuestData) == 4096);
 
+enum class PthreadState : uint8_t { Retired, Running, Exiting };
+
 struct PthreadPrivate {
 	PthreadGuestData      guest;
 	std::string           name;
 	pthread_t             p;
+	std::mutex            native_mutex;
+	std::mutex            join_mutex;
 	PthreadAttr           attr;
 	pthread_entry_func_t  entry;
 	void*                 arg;
 	int                   unique_id;
 	std::atomic_bool      detached;
-	std::atomic_bool      almost_done;
-	std::atomic_bool      free;
+	std::atomic<PthreadState> state {PthreadState::Retired};
 	uint64_t              host_thread_id;
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
@@ -560,11 +564,14 @@ public:
 	KYTY_CLASS_NO_COPY(PthreadPool);
 
 	Pthread Create();
+	void    Retire(Pthread thread);
 
 	void FreeDetachedThreads();
 
 private:
 	std::vector<Pthread> m_threads;
+	std::deque<Pthread>  m_retired;
+	size_t               m_reusable = 0;
 	Common::Mutex        m_mutex;
 };
 
@@ -984,9 +991,8 @@ void PthreadInitSelfForMainThread() {
 	g_pthread_self->name            = "MainThread";
 	g_pthread_self->guest.thread_id = ++g_pthread_thread_id;
 	g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
-	g_pthread_self->free            = false;
+	g_pthread_self->state           = PthreadState::Running;
 	g_pthread_self->detached        = false;
-	g_pthread_self->almost_done     = false;
 	g_pthread_self->entry           = nullptr;
 	g_pthread_self->arg             = nullptr;
 
@@ -1484,30 +1490,33 @@ void PthreadStaticObjects::DeleteObjects(Loader::Program* program) {
 Pthread PthreadPool::Create() {
 	Common::LockGuard lock(m_mutex);
 
-	for (auto* p: m_threads) {
-		if (p->free) {
-			p->free = false;
-			return p;
-		}
+	// Collect retired pthread descriptors in batches, as in shadPS4.
+	constexpr size_t gc_threshold = 5;
+	if (m_reusable == 0 && m_retired.size() >= gc_threshold) {
+		m_reusable = m_retired.size();
+	}
+	if (m_reusable != 0) {
+		auto* thread = m_retired.front();
+		m_retired.pop_front();
+		--m_reusable;
+		return thread;
 	}
 
-	auto* ret = new PthreadPrivate {};
+	auto* thread = new PthreadPrivate {};
+	m_threads.push_back(thread);
+	return thread;
+}
 
-	ret->free        = false;
-	ret->detached    = false;
-	ret->almost_done = false;
-	ret->attr        = nullptr;
-
-	m_threads.push_back(ret);
-
-	return ret;
+void PthreadPool::Retire(Pthread thread) {
+	Common::LockGuard lock(m_mutex);
+	m_retired.push_back(thread);
 }
 
 void PthreadPool::FreeDetachedThreads() {
 	Common::LockGuard lock(m_mutex);
 
 	for (auto* p: m_threads) {
-		if (p->detached && p->almost_done && !p->free) {
+		if (p->state == PthreadState::Exiting && p->detached) {
 			PthreadJoin(p, nullptr);
 		}
 	}
@@ -3039,7 +3048,11 @@ uint64_t PthreadGetHostThreadId(Pthread thread) {
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Raise a host signal on another guest thread.
 bool PthreadKillHost(Pthread thread, int host_signal) {
-	if (thread == nullptr || thread->free) {
+	if (thread == nullptr) {
+		return false;
+	}
+	std::lock_guard lock(thread->native_mutex);
+	if (thread->state != PthreadState::Running) {
 		return false;
 	}
 
@@ -3066,7 +3079,7 @@ bool PthreadHasPendingSignal(Pthread thread, int signum) {
 }
 
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
-	if (thread == nullptr || thread->almost_done || signum < 0 || signum >= 64) {
+	if (thread == nullptr || thread->state != PthreadState::Running || signum < 0 || signum >= 64) {
 		return false;
 	}
 
@@ -3130,7 +3143,10 @@ static void CleanupThread(void* arg) {
 	DestructPthreadSpecific();
 
 	// Guest signal handlers stop here: they would run on freed TLS.
-	thread->almost_done = true;
+	{
+		std::lock_guard lock(thread->native_mutex);
+		thread->state = PthreadState::Exiting;
+	}
 	Loader::RuntimeLinker::DeleteThreadTls();
 }
 
@@ -3211,7 +3227,8 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 	PRINT_NAME_ENABLE(false);
 
 	auto* created_thread = pthread_pool->Create();
-	*thread              = created_thread;
+	std::unique_lock native_lock(created_thread->native_mutex);
+	*thread = created_thread;
 
 	if (created_thread->attr != nullptr) {
 		PthreadAttrDestroy(&created_thread->attr);
@@ -3222,8 +3239,6 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 	int result = PthreadAttrCopy(&created_thread->attr, attr);
 
 	if (result == 0) {
-		EXIT_IF(created_thread->free);
-
 		// A thread created without a CPU set runs on its creator's CPUs.
 		if ((*attr)->affinity == 0) {
 			created_thread->attr->affinity = PthreadSelf()->attr->affinity;
@@ -3241,9 +3256,10 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->entry           = entry;
 		created_thread->arg             = arg;
 		created_thread->guest.thread_id = ++g_pthread_thread_id;
-		created_thread->almost_done     = false;
+		created_thread->pending_signal_mask.store(0, std::memory_order_relaxed);
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
+		created_thread->state           = PthreadState::Running;
 
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);
@@ -3253,14 +3269,15 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		}
 	}
 
-	if (result != 0) {
-		created_thread->free = true;
-	}
-
 	LOGF("\tthread create: %s, id = %d, %d\n", created_thread->name.c_str(),
 	     created_thread->unique_id, result);
 
 	PthreadAttrDbgPrint(&created_thread->attr);
+	if (result != 0) {
+		created_thread->state = PthreadState::Retired;
+		native_lock.unlock();
+		pthread_pool->Retire(created_thread);
+	}
 
 	PRINT_NAME_ENABLE(true);
 
@@ -3299,7 +3316,18 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = pthread_join(thread->p, value);
+	std::unique_lock joining(thread->join_mutex, std::try_to_lock);
+	if (!joining.owns_lock()) {
+		return KERNEL_ERROR_EOPNOTSUPP;
+	}
+	std::unique_lock native_lock(thread->native_mutex);
+	if (thread->state == PthreadState::Retired) {
+		return KERNEL_ERROR_ESRCH;
+	}
+	const auto native_thread = thread->p;
+	native_lock.unlock();
+
+	int result = pthread_join(native_thread, value);
 
 	if (PRINT_NAME_ENABLED) {
 		LOGF("\tthread join: %s, %d\n", thread->name.c_str(), result);
@@ -3307,10 +3335,10 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 
 	if (result == 0) {
 		FreeGuestStack(thread->attr);
-
 		thread->pending_signal_mask.store(0, std::memory_order_relaxed);
-		thread->almost_done = false;
-		thread->free        = true;
+		thread->state = PthreadState::Retired;
+		joining.unlock();
+		g_pthread_context->GetPthreadPool()->Retire(thread);
 	}
 
 	switch (result) {
@@ -3329,8 +3357,8 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	// A joined thread's native handle is gone; the guest may still hold its handle.
-	if (thread->free) {
+	std::lock_guard lock(thread->native_mutex);
+	if (thread->state != PthreadState::Running) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
@@ -3437,7 +3465,7 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 
 	EXIT_NOT_IMPLEMENTED(prio == nullptr);
 
-	if (thread->free) {
+	if (thread->state == PthreadState::Retired) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
@@ -3453,8 +3481,8 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	// A joined thread's native handle is gone; the guest may still hold its handle.
-	if (thread->free) {
+	std::lock_guard lock(thread->native_mutex);
+	if (thread->state != PthreadState::Running) {
 		return KERNEL_ERROR_ESRCH;
 	}
 

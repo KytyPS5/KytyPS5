@@ -1791,7 +1791,6 @@ static constexpr auto MakeContextIndirectTable() {
 	                             Pm4::VGT_HOS_MAX_TESS_LEVEL,
 	                             Pm4::VGT_HOS_MIN_TESS_LEVEL,
 	                             Pm4::VGT_ESGS_RING_ITEMSIZE,
-	                             Pm4::VGT_PRIMITIVEID_EN,
 	                             Pm4::VGT_REUSE_OFF,
 	                             Pm4::VGT_TESS_DISTRIBUTION,
 	                             Pm4::VGT_PRIMITIVEID_RESET,
@@ -1828,6 +1827,7 @@ static constexpr auto MakeContextIndirectTable() {
 		cp.GetCtx().SetGsOutPrimType(value);
 	};
 	table[Pm4::VGT_TF_PARAM]          = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetTfParam(value); };
+	table[Pm4::VGT_PRIMITIVEID_EN] = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetPrimitiveIdEnable(value & 1u); };
 	table[Pm4::VGT_DRAW_PAYLOAD_CNTL] = [](KYTY_HW_REG_ARGS) {
 		cp.GetCtx().SetDrawPayloadControl(value);
 	};
@@ -1868,6 +1868,8 @@ static constexpr auto MakeContextIndirectTable() {
 		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, EXEC_ON_NOOP) != 0;
 		db_shader_control.alpha_to_mask_disable =
 		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, ALPHA_TO_MASK_DISABLE) != 0;
+		db_shader_control.depth_before_shader =
+		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, DEPTH_BEFORE_SHADER) != 0;
 		cp.GetCtx().SetDepthShaderControl(db_shader_control);
 	};
 

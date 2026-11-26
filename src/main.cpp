@@ -36,6 +36,7 @@ static void PrintUsage() {
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf("  --audio-3d                          Enable 3D audio support for games.\n");
 	::printf("  --audio-output <value>              Report TV, AVReceiver (7.1), SoundBar (5.1),\n"
 	         "                                      or Headphones to games. Default: TV.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
@@ -64,7 +65,8 @@ static void PrintUsage() {
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
-	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
+	::printf("  --console-language <0-%u>            Console language. Default: 1 (English US).\n",
+	         Config::MAX_CONSOLE_LANGUAGE);
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
 	::printf("  --emulate-psn                        Simulate PSN sign-in for compatibility.\n");
@@ -194,6 +196,7 @@ struct Flag {
 static constexpr Flag FLAGS[] = {
     {"--rd", &ConfigOptions::renderdoc_enabled},
     {"--fullscreen", &ConfigOptions::fullscreen_enabled},
+    {"--audio-3d", &ConfigOptions::audio_3d_enabled},
     {"--hdr", &ConfigOptions::hdr_enabled},
     {"--hide-cursor", &ConfigOptions::hide_cursor_enabled},
     {"--stretch", &ConfigOptions::stretch_enabled},

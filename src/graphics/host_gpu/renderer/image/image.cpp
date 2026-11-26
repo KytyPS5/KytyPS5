@@ -32,7 +32,7 @@ namespace {
 [[nodiscard]] vk::ImageCreateFlags
 ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::ImageUsageFlags usage) {
 	vk::ImageCreateFlags flags {};
-	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
+	if (!info.IsDepth()) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
 		if (info.IsBlock() && graphics.supports_block_texel_view) {
 			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
@@ -79,7 +79,7 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
 	}
-	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
+	if (info.IsDepth()) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
 		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
 			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
@@ -105,20 +105,6 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 }
 
 } // namespace
-
-vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
-	switch (format) {
-		case vk::Format::eD16Unorm:
-		case vk::Format::eX8D24UnormPack32:
-		case vk::Format::eD32Sfloat: return vk::ImageAspectFlagBits::eDepth;
-		case vk::Format::eS8Uint: return vk::ImageAspectFlagBits::eStencil;
-		case vk::Format::eD16UnormS8Uint:
-		case vk::Format::eD24UnormS8Uint:
-		case vk::Format::eD32SfloatS8Uint:
-			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
-		default: return vk::ImageAspectFlagBits::eColor;
-	}
-}
 
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
@@ -169,7 +155,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 					barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 					barrier.image                           = backing.image;
-					barrier.subresourceRange.aspectMask     = FullAspectMask(backing.format);
+					barrier.subresourceRange.aspectMask     = ImageAspectMask(backing.format);
 					barrier.subresourceRange.baseMipLevel   = level;
 					barrier.subresourceRange.levelCount     = 1;
 					barrier.subresourceRange.baseArrayLayer = layer;
@@ -203,7 +189,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 		barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 		barrier.image                           = backing.image;
-		barrier.subresourceRange.aspectMask     = FullAspectMask(backing.format);
+		barrier.subresourceRange.aspectMask     = ImageAspectMask(backing.format);
 		barrier.subresourceRange.baseMipLevel   = 0;
 		barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
 		barrier.subresourceRange.baseArrayLayer = 0;
@@ -354,10 +340,8 @@ void Image::CopyImage(Image& source) {
 	} else if (backing.image_type == vk::ImageType::e3D) {
 		base_depth = backing.extent.depth;
 	}
-	const auto source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	const auto source_aspect      = DataAspect(source.backing.format);
+	const auto destination_aspect = DataAspect(backing.format);
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
@@ -466,16 +450,14 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
-	const auto     source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto     source_bytes      = DepthAspectTransferBytes(source.backing.format) != 0
-	                                       ? DepthAspectTransferBytes(source.backing.format)
-	                                       : source.info.bytes_per_block;
-	const auto     destination_bytes = DepthAspectTransferBytes(backing.format) != 0
-	                                       ? DepthAspectTransferBytes(backing.format)
-	                                       : info.bytes_per_block;
+	const auto     source_aspect      = DataAspect(source.backing.format);
+	const auto     destination_aspect = DataAspect(backing.format);
+	const auto     source_bytes       = DepthStencilTransferBytes(source.backing.format) != 0
+	                                        ? DepthStencilTransferBytes(source.backing.format)
+	                                        : source.info.bytes_per_block;
+	const auto     destination_bytes  = DepthStencilTransferBytes(backing.format) != 0
+	                                        ? DepthStencilTransferBytes(backing.format)
+	                                        : info.bytes_per_block;
 	const uint32_t source_block      = source.info.IsBlock() ? 4u : 1u;
 	const uint32_t destination_block = info.IsBlock() ? 4u : 1u;
 	EXIT_IF(levels == 0 || source_bytes == 0 || source_bytes != destination_bytes ||
@@ -570,8 +552,8 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
 	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
 	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
-	const auto aspects                             = FullAspectMask(source.backing.format);
-	EXIT_IF(aspects != FullAspectMask(backing.format));
+	const auto aspects                             = ImageAspectMask(source.backing.format);
+	EXIT_IF(aspects != ImageAspectMask(backing.format));
 	std::array<vk::ImageCopy, 2> copies {};
 	uint32_t                     copy_count = 0;
 	for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,

@@ -88,7 +88,7 @@ void EmitReturn(ValueEmitContext& ctx) {
 		auto& state = ctx.state;
 		const auto primitive = EmitGetBuiltin(
 		    ctx, IR::Value {static_cast<uint32_t>(IR::StageInputKind::PrimitiveId)}, IR::Value {0u});
-		const auto object = EmitPushDataLoad(state, ConstantU32(state, 0));
+		const auto object = EmitPushDataLoad(state, ConstantU32(state, IR::PushData::ObjectIdDword));
 		state.builder.AddFunction(spv::OpStore, state.object_primitive_id_variable,
 		                          EmitAddU32(state, object, primitive));
 	}

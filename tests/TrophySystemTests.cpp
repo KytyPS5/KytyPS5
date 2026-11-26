@@ -83,6 +83,7 @@ void TestLocalization() {
       {"th-TH", "ได้รับถ้วยรางวัลแล้ว!"},
       {"vi-VN", "Đã nhận cúp!"},
       {"id-ID", "Trofi diperoleh!"},
+      {"uk-UA", "Trophy earned!"},
   };
   constexpr std::string_view key = "trophy.toast.earned";
   const auto japanese = Common::Localization::Get(0, key);
@@ -96,7 +97,7 @@ void TestLocalization() {
   }
   Check(japanese == translations[0].earned,
         "translation view survives other locale lookups");
-  for (const int invalid : {-1, 30, 1000}) {
+  for (const int invalid : {-1, 31, 1000}) {
     Check(Common::Localization::LocaleName(invalid) == "en-US" &&
               Common::Localization::Get(invalid, key) == "Trophy earned!",
           "invalid console language falls back to English");

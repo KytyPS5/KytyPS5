@@ -413,6 +413,7 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	for (uint32_t span = 1u; level.size() > 1u; span <<= 1u) {
 		for (uint32_t i = 1u; i < level.size(); i += 2u) {
 			const auto upper = ir.ULessThan(IR::U32(IR::Value(i * span - 1u)), m0);
+			upper.Instruction()->SetFlags(IR::IntegerCompareFlags {.register_index = true});
 			level[i / 2]     = ir.Select(upper, level[i], level[i - 1]);
 		}
 		if (level.size() % 2u != 0u) {
@@ -444,6 +445,7 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 		}
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
+		match.Instruction()->SetFlags(IR::IntegerCompareFlags {.register_index = true});
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);
 		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg)));
 	}

@@ -479,11 +479,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	if (depth.image_id) {
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
+		const auto  aspects    = depth.desc.view_info.aspect;
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.load_clear_aspects = {};
-		if (depth.depth_clear_enable || meta_clear)
+		if (depth.depth_clear_enable || (meta_clear && (aspects & vk::ImageAspectFlagBits::eDepth)))
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
 		// Apply pending clears to compressed stencil as well as depth.
 		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
@@ -533,7 +534,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
-		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
 		attachment.image_layout   = layout;
@@ -1158,24 +1158,25 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 	using ShaderRecompiler::IR::PushData;
-	const auto draw_dwords =
-	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
-	if (draw_dwords != 0) {
+	if (mesh_active) {
 		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
 		if (mesh_task) {
 			draw_data[0] = static_cast<uint32_t>(task_params);
 			draw_data[1] = static_cast<uint32_t>(task_params >> 32u);
-		} else if (mesh_active) {
+		} else {
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
 			             index_source.guest_element_size,
 			             static_cast<uint32_t>(mesh_indices),
 			             static_cast<uint32_t>(mesh_indices >> 32u)};
-		} else {
-			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
-		                        draw_dwords * sizeof(uint32_t), draw_data.data());
+		                        sizeof(draw_data), draw_data.data());
+	}
+	if (state.ps_input_info.object_primitive_id) {
+		const auto object_id = buffer.GetUserConfig().GetObjectId();
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+		                        PushData::ObjectIdDword * sizeof(uint32_t), sizeof(object_id), &object_id);
 	}
 	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,

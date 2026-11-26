@@ -77,8 +77,6 @@ public:
 	void OpenChunkManifest(const std::filesystem::path& file_name);
 	void Close();
 
-	bool IsValid();
-
 	bool GetChunksNum(uint32_t* num);
 
 	void DbgPrint();
@@ -94,7 +92,6 @@ struct SystemContent {
 	bool                  trinity_mode = false;
 	std::filesystem::path psf_path;
 	Psf                   psf;
-	std::filesystem::path playgo_path;
 	PlayGo                playgo;
 	std::filesystem::path icon_path;
 };
@@ -455,6 +452,20 @@ void PlayGo::OpenChunkDefs(const std::filesystem::path& file_name) {
 
 	const std::string_view xml(reinterpret_cast<const char*>(buf.data()), buf.size());
 
+	if (const auto info = xml.find("<chunk_info"); info != std::string_view::npos) {
+		const auto end = xml.find('>', info);
+		if (end == std::string_view::npos) {
+			return;
+		}
+		const auto tag = xml.substr(info, end - info);
+		uint32_t count = 0;
+		if (ParseXmlUintAttr(tag, "chunk_count", count) && count > 0 && count <= 1000) {
+			m_chunks_num = static_cast<uint16_t>(count);
+			m_opened     = true;
+			return;
+		}
+	}
+
 	uint32_t max_chunk_id = 0;
 	bool     found        = false;
 
@@ -565,12 +576,6 @@ void PlayGo::Close() {
 	m_chunks_num = 0;
 }
 
-bool PlayGo::IsValid() {
-	Common::LockGuard lock(m_mutex);
-
-	return m_opened;
-}
-
 bool PlayGo::GetChunksNum(uint32_t* num) {
 	Common::LockGuard lock(m_mutex);
 
@@ -620,20 +625,12 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 		sc->icon_path.clear();
 	}
 
-	sc->playgo_path = file_name.parent_path() / "playgo-chunk.dat";
-	sc->playgo.Open(sc->playgo_path);
-	if (!sc->playgo.IsValid()) {
-		sc->playgo_path = file_name.parent_path().parent_path() / "playgo-chunkdefs.xml";
-		sc->playgo.OpenChunkDefs(sc->playgo_path);
-	}
-	if (!sc->playgo.IsValid()) {
-		sc->playgo_path = file_name.parent_path().parent_path() / "Data" / "chunkmanifest";
-		sc->playgo.OpenChunkManifest(sc->playgo_path);
-	}
-
-	if (sc->playgo.IsValid()) {
-		sc->playgo.DbgPrint();
-	}
+	const auto app_root = file_name.parent_path().parent_path();
+	sc->playgo.Open(file_name.parent_path() / "playgo-chunk.dat");
+	sc->playgo.OpenChunkDefs(app_root / "playgo-chunks.xml");
+	sc->playgo.OpenChunkDefs(app_root / "playgo-chunkdefs.xml");
+	sc->playgo.OpenChunkManifest(app_root / "Data" / "chunkmanifest");
+	sc->playgo.DbgPrint();
 }
 
 bool SystemContentIsTrinityMode() {

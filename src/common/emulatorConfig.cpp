@@ -56,6 +56,10 @@ AudioOutput GetAudioOutput() {
 	return g_config->audio_output;
 }
 
+bool Audio3dEnabled() {
+	return g_config->audio_3d_enabled;
+}
+
 const std::optional<ControllerColor>& GetControllerColor() {
 	return g_config->controller_color;
 }

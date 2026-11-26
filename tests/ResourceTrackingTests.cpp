@@ -3801,6 +3801,70 @@ void TestPointerTableIndexedMaterialKeys() {
         "pointer-table selector lost sorted raw keys or the OOB-zero root descriptor");
 }
 
+void TestGuardedMaterialImageKey() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto make = [](bool foreign_field) {
+    Fixture f(ShaderType::Pixel);
+    auto* entry = f.block;
+    auto* other = f.AddBlock();
+    auto* merge = f.AddBlock();
+    entry->AddBranch(other);
+    entry->AddBranch(merge);
+    other->AddBranch(merge);
+    const auto index = f.Emit(ValueOpcode::LaneId);
+    const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+    const auto mapped = f.Emit(ValueOpcode::BitwiseXor32, {index, Value(1u)});
+    const auto record = f.Emit(ValueOpcode::IAdd32, {mapped, Value(UINT32_MAX)});
+    const auto field = f.Emit(ValueOpcode::LoadBufferU32, {material, record, Value(0u), Value(0u), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Buffer, .offset = 4u, .idxen = true}, 0x10u));
+    const auto active = f.Emit(ValueOpcode::IEqual32, {index, Value(0u)});
+    const auto branch = f.Emit(ValueOpcode::IEqual32, {f.UserData(0), Value(0u)});
+    entry->condition = f.Emit(ValueOpcode::ConditionRef, {branch}, CFG::BranchCondition::SccNonZero);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = other, .false_block = merge};
+    other->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    merge->terminator.kind = CFG::TerminatorKind::Return;
+    const auto previous = f.Emit(ValueOpcode::SelectU32, {active, field, Value(0u)}, 0, other);
+    f.block = merge;
+    auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, foreign_field ? mapped : field);
+    phi.AddPhiOperand(other, previous);
+    const auto in_range = f.Emit(ValueOpcode::ULessThan32, {Value(&phi), Value(8u)});
+    const auto checked = f.Emit(ValueOpcode::SelectU32, {in_range, Value(&phi), Value(0u)});
+    const auto selected = f.Emit(ValueOpcode::SelectU32, {Value(true), checked, index});
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    const auto table = f.Address(f.UserData(4), f.UserData(5));
+    std::array<Value, 8> words;
+    for (uint32_t i = 0; i < words.size(); ++i)
+      words[i] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+          f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = i * 4u}, 0x20u));
+    const auto sampler = f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    f.Emit(ValueOpcode::ImageSampleRaw, {f.Image(words), sampler, f.ImageAddress(), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Image, .image_dimension = Decoder::ImageDimension::Dim2D}, 0x28u));
+    f.PlanAndTrack();
+    return ExtractResourcePlan(f.program);
+  };
+  CheckFatal([&] { make(true); }, "not a valid runtime value",
+             "raw pointer table borrowed another Phi arm's material field");
+  const auto plan = make(false);
+  LinearTestMemory memory;
+  const uint32_t table = uint32_t(memory.base) + 0x100u;
+  const std::array<uint32_t, 6> data{uint32_t(memory.base), 8u << 16u, 1u, 0x5204u, table, 0u};
+  const SrtRuntime runtime{.user_data = data, .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto field : {7u, 8u, UINT32_MAX}) {
+    memory.words[1] = field;
+    memory.descriptor_reads = 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.descriptor_reads == (field < 8u ? 2u : 1u) &&
+              std::ranges::find(snapshot.specialization_reads,
+                  std::pair<uint64_t, uint64_t>{table + (field < 8u ? field : 0u) * 32u, 32u}) !=
+                  snapshot.specialization_reads.end(),
+          "guarded material key read the wrong texture row at the cutoff");
+  }
+}
+
 void TestImageDescriptorFields() {
   constexpr std::array<std::pair<uint32_t, uint32_t>, 5> reserved{
       {{1u, 0x20000000u}, {2u, 0x70003000u}, {4u, 0xe000e000u},
@@ -4000,7 +4064,8 @@ void TestCompactScalarImageTable() {
   enum class Sharing { None, SameBlock, Dominating, Sibling, Later, WrongMask, MixedMask };
   const auto make_plan = [&](bool compact, uint32_t invalid = 0u,
                              Domain domain = Domain::Unbounded, Pairing pairing = Pairing::SameKey,
-                             uint32_t member = 0x98u, Sharing sharing = Sharing::None) {
+                             uint32_t member = 0x98u, Sharing sharing = Sharing::None,
+                             uint32_t sample_flags = 0u) {
     Fixture fixture;
     const auto list = invalid == 1u
         ? fixture.Address(fixture.UserData(0), fixture.UserData(1))
@@ -4055,10 +4120,16 @@ void TestCompactScalarImageTable() {
       sampler_words[word] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, record},
                                           fixture.AddMemory(scalar, 0x590u));
     }
+    if (invalid == 5u) {
+      const auto bit = fixture.Emit(ValueOpcode::BitwiseAnd32, {fixture.Emit(ValueOpcode::LaneId), Value(1u)});
+      const auto scratch = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {bit, Value(12u)});
+      sampler_words[3] = fixture.Emit(ValueOpcode::BitwiseOr32, {sampler_words[3], scratch});
+    }
     MemoryInfo sample;
     sample.kind = ResourceKind::Image;
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
     sample.image_r128 = compact;
+    sample.image_sample_flags = sample_flags;
     const auto sampler = fixture.Sampler(sampler_words, 0x59cu);
     const auto read_unpaired = [&] {
       fixture.Emit(ValueOpcode::ImageRead, {unpaired, fixture.ImageAddress(), Value(true)},
@@ -4123,8 +4194,9 @@ void TestCompactScalarImageTable() {
           {make_image(second_key, 0x16cu), sampler, fixture.ImageAddress(), Value(true)},
           fixture.AddMemory(sample, 0x79cu));
     }
-    if (invalid == 4u) {
+    if (invalid == 4u || invalid == 5u) {
       sample.image_r128 = false;
+      sample.image_sample_flags = 0u;
       fixture.Emit(ValueOpcode::ImageSampleRaw,
           {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x5a0u));
     }
@@ -4160,9 +4232,13 @@ void TestCompactScalarImageTable() {
     }
     return ExtractResourcePlan(fixture.program);
   };
-  struct Case { bool compact; uint32_t member; Pairing pairing; Sharing sharing = Sharing::None; };
-  for (const auto [compact, member, pairing, sharing] : {
+  struct Case {
+    bool compact; uint32_t member; Pairing pairing; Sharing sharing = Sharing::None;
+    uint32_t sample_flags = 0u;
+  };
+  for (const auto [compact, member, pairing, sharing, sample_flags] : {
            Case{false, image_offset, Pairing::SameKey}, Case{true, image_offset, Pairing::SameKey},
+           Case{false, image_offset, Pairing::SameKey, Sharing::None, Decoder::ImageSampleFlagAdjust},
            Case{true, 0x16cu, Pairing::SameKey}, Case{true, 0x16cu, Pairing::DifferentKey},
            Case{true, 0x16cu, Pairing::PairedFirst}, Case{true, 0x16cu, Pairing::UnpairedFirst},
            Case{true, 0x16cu, Pairing::MixedUses},
@@ -4172,7 +4248,7 @@ void TestCompactScalarImageTable() {
            Case{true, 0x16cu, Pairing::SameKey, Sharing::Later},
            Case{true, 0x16cu, Pairing::SameKey, Sharing::WrongMask},
            Case{true, 0x16cu, Pairing::SameKey, Sharing::MixedMask}}) {
-    auto plan = make_plan(compact, 0u, Domain::Unbounded, pairing, member, sharing);
+    auto plan = make_plan(compact, 0u, Domain::Unbounded, pairing, member, sharing, sample_flags);
     const uint32_t width = compact ? 4u : 8u;
     const auto bytes = 2u * stride + member + width * 4u;
     std::array<uint32_t, 9> data{0x1000u, 0u, 8u, 0u, 0x2000u, 0u, bytes, 0u, 0u};
@@ -4339,6 +4415,11 @@ void TestCompactScalarImageTable() {
     memory.fail_address = UINT64_MAX;
     materialize({0x100u, 0x101u, 0x200u, 0x201u}, {0u, 1u});
   }
+  CheckFatal([&] {
+    make_plan(false, 5u, Domain::Unbounded, Pairing::SameKey, image_offset, Sharing::None,
+              Decoder::ImageSampleFlagAdjust);
+  }, "GetSamplerResource dword 0 is not a valid runtime value",
+     "ordinary sample accepted a shared sampler table with per-instruction scratch bits");
   for (uint32_t invalid : {1u, 2u, 3u, 4u})
     CheckFatal([&] { make_plan(true, invalid); }, "not a valid runtime value",
                "compact table accepted an unproved selector or inconsistent descriptor width");
@@ -6748,18 +6829,24 @@ void TestGuardedWaterfallBufferRecords() {
     const auto root = std::ranges::find_if(plan.info.buffers, [&](const auto& buffer) {
       return plan.descriptor_sources[buffer.source].indirect_descriptor.has_value();
     });
-    Check(root != plan.info.buffers.end(), "waterfall buffer lost its indirect resource");
     const bool proven = guard == Guard::Exact || guard == Guard::Reversed || guard == Guard::Greater ||
         guard == Guard::Loop || guard == Guard::LoopReversed || guard == Guard::LoopEntries;
-    const auto& domain = *plan.descriptor_sources[root->source].indirect_descriptor;
-    Check(domain.key_count.IsEmpty() != proven && !domain.selector &&
-              domain.table_stride == 488u && domain.table_immediate == 216u,
-          "waterfall bound mixed different lanes, values or resource uses");
     const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
     if (!proven) {
-      Check(!materialize(), "unproved waterfall bypassed conservative descriptor rejection");
+      const auto& memory_info = fixture->program.memory_info;
+      Check(root == plan.info.buffers.end() &&
+                std::ranges::count(memory_info, ResourceKind::IndirectBuffer, &MemoryInfo::kind) == 2 &&
+                std::ranges::none_of(memory_info, &MemoryInfo::planning_only),
+            "unproved waterfall lost GPU-selected loads or their descriptor words");
+      memory.reads = 0;
+      Check(materialize() && memory.reads == 0u, "unproved waterfall probed unrelated record fields");
       continue;
     }
+    Check(root != plan.info.buffers.end(), "bounded waterfall buffer lost its indirect resource");
+    const auto& domain = *plan.descriptor_sources[root->source].indirect_descriptor;
+    Check(!domain.key_count.IsEmpty() && !domain.selector &&
+              domain.table_stride == 488u && domain.table_immediate == 216u,
+          "waterfall bound mixed different lanes, values or resource uses");
     for (const uint32_t count : {2u, 0u, 1u, 2u}) {
       user_data[2] = count;
       memory.reads = 0;
@@ -7044,6 +7131,84 @@ void TestWorkgroupSelectedBufferRecords() {
   user_data[2] = 0u;
   Check(MaterializeResources(ordinary_plan, runtime, snapshot, specialization),
         "a plan without workgroup counts read the indirect argument pointer");
+}
+
+void TestPackedMaterialBufferStore() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture f;
+  const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+  const auto heap = f.Buffer({f.UserData(4), f.UserData(5), f.UserData(6), f.UserData(7)});
+  const auto lane = f.Emit(ValueOpcode::LaneId);
+  const auto active = f.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+  const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x2,
+      {material, lane, Value(0u), Value(0u), active},
+      f.AddMemory({.kind = ResourceKind::Buffer, .offset = 56u, .data_dwords = 2u, .idxen = true}, 0x260u));
+  const auto word = f.Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(1u)});
+  const auto field = f.Emit(ValueOpcode::BitwiseAnd32, {Value(0xffffffu), word});
+  const auto selected = f.Emit(ValueOpcode::SelectU32, {active, field, word});
+  auto* body = f.AddBlock();
+  auto* exit = f.AddBlock();
+  f.block->AddBranch(body);
+  f.block->AddBranch(exit);
+  f.block->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = body, .false_block = exit};
+  f.block->condition = f.Emit(ValueOpcode::ConditionRef, {active}, CFG::BranchCondition::ExecNonZero);
+  f.block = body;
+  const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, active});
+  const auto equal = f.Emit(ValueOpcode::IEqual32, {key, selected});
+  const auto writing = f.Emit(ValueOpcode::LogicalAnd, {active, equal});
+  const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+  std::array<Value, 4> descriptor;
+  for (uint32_t i = 0; i < descriptor.size(); ++i)
+    descriptor[i] = f.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
+        f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = i * 4u,
+                     .component_index = i, .component_count = 4u}, 0x14f0u));
+  f.Emit(ValueOpcode::StoreBufferU32, {f.Buffer(descriptor), lane, Value(0u), Value(0u), word, writing},
+         f.AddMemory({.kind = ResourceKind::Buffer, .formatted = true, .idxen = true}, 0x6acu));
+  const auto output = f.Buffer({f.UserData(8), f.UserData(9), f.UserData(10), f.UserData(11)});
+  f.Emit(ValueOpcode::StoreBufferU32, {output, Value(0u), Value(0u), Value(0u), word, Value(true)},
+         f.AddMemory({.kind = ResourceKind::Buffer, .offset = 4u}, 0x1504u));
+  f.PlanAndTrack();
+  auto plan = ExtractResourcePlan(f.program);
+  LinearTestMemory memory;
+  const auto material_base = static_cast<uint32_t>(memory.base);
+  const auto heap_base = material_base + 512u;
+  std::array<uint32_t, 12> data{material_base, 176u << 16u, 2u, 0x5204u,
+                               heap_base, 16u << 16u, 196608u, 0x5204u};
+  SrtRuntime runtime{.user_data = data, .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+  memory.words[15] = 0xab000002u;
+  memory.words[44u + 15u] = 0xcd000002u;
+  const uint32_t row = (heap_base - material_base) / 4u + 2u * 4u;
+  const std::array<uint32_t, 4> target{0x100000u, 4u << 16u, 32u, 0x14204u};
+  std::copy(target.begin(), target.end(), memory.words.begin() + row);
+  Check(materialize() && memory.reads == 3u, "packed material keys did not bound the large V# table");
+  const auto root = std::ranges::find_if(specialization.buffers, [](const auto& buffer) {
+    return buffer.indirect_search_iterations != 0u;
+  });
+  Check(root != specialization.buffers.end() &&
+            snapshot.flattened_srt[root->indirect_mapping_offset + 3u] == 2u * 4u,
+        "sparse buffer map lost the GPU selection's DWORD offset");
+  const auto source = plan.info.buffers[root - specialization.buffers.begin()].source;
+  auto& indirect = *plan.descriptor_sources[source].indirect_descriptor;
+  memory.words[row] = material_base + 60u;
+  Check(!materialize(), "overlapping indirect write specialized mutable material keys");
+  indirect.key_count = Value(3u);
+  Check(materialize(), "a bounded key count in a large heap unnecessarily read mutable material keys");
+  indirect.key_count = {};
+  data[6] = 3u;
+  Check(materialize(), "a small overlapping table lost its complete GPU-selectable domain");
+  data[6] = 196608u;
+  memory.words[row] = target[0];
+  data[8] = material_base + 56u;
+  data[10] = 1u;
+  data[11] = 0x20005204u;
+  Check(!materialize(), "a zero-stride vector store overlapped a key past NumRecords bytes");
+  memory.words[row] = 0u;
+  Check(!materialize(), "an all-null sparse lookup lost its overlapping selector write");
+  data[8] -= 4u;
+  Check(materialize(), "a zero-stride store ending before the key was considered overlapping");
 }
 
 void TestGpuSelectedFormattedRecordStore() {
@@ -7509,6 +7674,65 @@ void TestFiniteBufferSelection() {
   }
 }
 
+void TestGuardedCarriedBufferKey() {
+  enum class Key { Carried, Bypass, Masked };
+  const auto make = [](Key kind) {
+    Fixture f;
+    const auto table = f.Address(f.UserData(0u), f.UserData(1u));
+    const auto count = f.UserData(2u);
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    Value selected;
+    if (kind == Key::Masked) {
+      const auto row = f.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(1u)});
+      const auto below = f.Emit(ValueOpcode::ULessThan32, {row, count});
+      selected = f.Emit(ValueOpcode::SelectU32, {below, row, Value(0u)});
+    } else {
+      auto* entry = f.block;
+      f.block = f.AddBlock();
+      entry->AddBranch(f.block);
+      f.block->AddBranch(f.block);
+      auto& carried = f.block->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      carried.AddPhiOperand(entry, kind == Key::Bypass ? lane : Value(0u));
+      const auto below = f.Emit(ValueOpcode::ULessThan32, {lane, count});
+      carried.AddPhiOperand(f.block, f.Emit(ValueOpcode::SelectU32, {below, lane, Value(&carried)}));
+      selected = Value(&carried);
+      if (kind == Key::Carried) {
+        const auto in_table = f.Emit(ValueOpcode::ULessThan32, {selected, Value(2u)});
+        selected = f.Emit(ValueOpcode::SelectU32, {in_table, selected, Value(0u)});
+      }
+    }
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+    std::array<Value, 4> words;
+    for (uint32_t i = 0; i < words.size(); ++i)
+      words[i] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+          f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = i * 4u,
+                       .component_index = i, .component_count = 4u}, 0x10u));
+    const auto pair = f.Emit(ValueOpcode::CompositeConstructU32x2, {lane, lane});
+    f.Emit(ValueOpcode::StoreBufferU32x2, {f.Buffer(words), lane, Value(0u), Value(0u), pair, Value(true)},
+           f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .idxen = true}, 0x18u));
+    f.PlanAndTrack();
+    return ExtractResourcePlan(f.program);
+  };
+  CheckFatal([&] { make(Key::Bypass); }, "not a valid runtime value",
+             "unchecked incoming lane borrowed the bound of another Phi arm");
+  TestMemory memory;
+  std::array<uint32_t, 3> data{uint32_t(memory.base), 0u, 0u};
+  SrtRuntime runtime{.user_data = data, .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto kind : {Key::Carried, Key::Masked}) {
+    auto plan = make(kind);
+    for (auto count : {0u, 1u, UINT32_MAX}) {
+      data[2] = count;
+      memory.reads = 0u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                memory.reads == std::clamp(count, 1u, 2u),
+            "guarded lane key lost its zero row or read beyond its static range");
+    }
+  }
+}
+
 void TestPackedScalarBufferSelection() {
   const auto make = [](uint32_t shift_mask = 24u, bool cycle = false, uint32_t store_offset = 0u,
                        bool byte_store = false) {
@@ -7600,14 +7824,16 @@ void TestPackedScalarBufferSelection() {
   Check(materialize() && specialization == initial && memory.reads == 20u,
         "packed table refresh changed shader specialization or repeated scalar reads");
   memory.words[17] = 8u << 16u;
-  Check(!materialize(), "indexed DWORD write accepted an incompatible descriptor stride");
+  Check(materialize() && specialization != initial, "padded record stride was not specialized");
+  memory.words[17] = 6u << 16u;
+  Check(!materialize(), "indexed DWORD write accepted an unaligned record stride");
   memory.words[17] = 4u << 16u;
   memory.words[19] |= 3u << 28u;
   Check(!materialize(), "indexed DWORD write accepted raw byte bounds");
   for (auto bad : {0u, 1u, 2u}) {
-    auto invalid = make(bad == 0u ? 28u : 24u, bad == 1u, bad == 2u ? 4u : 0u);
+    auto invalid = make(bad == 0u ? 28u : 24u, bad == 1u, bad == 2u ? 2u : 0u);
     CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
-               "packed selector accepted a cross-byte shift, leafless cycle, or indexed byte offset");
+               "packed selector accepted a cross-byte shift, leafless cycle, or unaligned DWORD offset");
   }
   auto mixed = make(24u, false, 0u, true);
   mixed->PlanAndTrack();
@@ -7831,40 +8057,49 @@ void TestFiniteImagePhiCycle() {
 }
 
 void TestPackedDescriptorWaterfall() {
-  for (const uint32_t variant : {0u, 1u, 2u}) {
+  for (const uint32_t variant : {0u, 1u, 2u, 3u}) {
     Fixture f(ShaderType::Pixel);
     const auto packed = f.Emit(ValueOpcode::GetInterpolationParameter,
                                {Value(1u), Value(1u), Value(2u)});
     const auto active = f.Emit(ValueOpcode::ULessThan32,
                                {f.Emit(ValueOpcode::LaneId), Value(16u)});
     const auto image_key = f.Emit(ValueOpcode::BitwiseAnd32, {packed, Value(65535u)});
-    const auto sampler_key = variant == 2u ? packed :
+    const auto sampler_key = variant >= 2u ? packed :
         f.Emit(ValueOpcode::ShiftRightLogical32, {packed, Value(16u)});
     auto selected_active = active;
+    Value selected_sampler;
     const auto descriptor = [&](Value key, uint32_t first, uint32_t count, uint32_t shift) {
       const auto selected = f.Emit(ValueOpcode::ReadFirstLane, {key, active});
+      if (count == 4u) selected_sampler = selected;
       selected_active = f.Emit(ValueOpcode::LogicalAnd, {selected_active,
           f.Emit(ValueOpcode::IEqual32, {selected, key})});
       const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {selected, Value(shift)});
       const auto table = f.Buffer({f.UserData(first), f.UserData(first + 1u),
                                    f.UserData(first + 2u), f.UserData(first + 3u)});
       std::array<Value, 8> words;
+      const auto member = count == 4u && variant == 3u ? 4u : 0u;
       for (uint32_t word = 0; word < count; ++word)
         words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
-            f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u}, 0x58u));
+            f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = member + word * 4u}, 0x58u));
       return words;
     };
     const auto image = f.Image(descriptor(image_key, 0u, 8u, 5u));
-    const auto sampler_words = descriptor(sampler_key, 4u, 4u, 4u);
+    auto sampler_words = descriptor(sampler_key, 4u, 4u, 4u);
+    if (variant == 2u) {
+      const auto scratch = f.Emit(ValueOpcode::ShiftLeftLogical32, {image_key, Value(12u)});
+      sampler_words[3] = f.Emit(ValueOpcode::BitwiseOr32, {sampler_words[3], scratch});
+    }
     const auto sampler = f.Sampler({sampler_words[0], sampler_words[1],
                                    sampler_words[2], sampler_words[3]});
     f.Emit(ValueOpcode::ImageSampleRaw,
         {image, sampler, f.ImageAddress(), variant == 1u ? Value(true) : selected_active},
         f.AddMemory({.kind = ResourceKind::Image,
-                     .image_dimension = Decoder::ImageDimension::Dim2D}, 0x6cu));
-    if (variant != 0u) {
+                     .image_sample_flags = variant == 2u ? uint32_t(Decoder::ImageSampleFlagAdjust) : 0u,
+                     .image_dimension = Decoder::ImageDimension::Dim2D},
+                    0x6cu));
+    if (variant == 3u) {
       CheckFatal([&] { f.PlanAndTrack(); }, "not a valid runtime value",
-                 "packed waterfall accepted widened EXEC or an unbounded sampler key");
+                 "unbounded sampler table accepted a descriptor crossing packed row boundaries");
       continue;
     }
     f.PlanAndTrack();
@@ -7874,11 +8109,12 @@ void TestPackedDescriptorWaterfall() {
       const auto& table = value.indirect_descriptor;
       Check(table && !table->selector && table->table_scalar &&
                 table->table_stride == value.dword_count * 4u &&
-                (value.dword_count != 4u || table->table_maximum == 65535u),
-            "packed waterfall lost its static sampler bit bound or captured the varying key");
+                (value.dword_count != 4u || (variant == 0u ? table->table_maximum == 65535u
+                                                         : !table->table_maximum)),
+            "packed waterfall lost its sampler domain or captured the varying key");
     }
     LinearTestMemory memory;
-    const std::array<uint32_t, 8> user_data{
+    std::array<uint32_t, 8> user_data{
         uint32_t(memory.base) + 256u, 32u << 16u, 2u, 0x5204u,
         uint32_t(memory.base) + 512u, 16u << 16u, 59u, 0x5204u};
     for (uint32_t row = 0; row < 2u; ++row) {
@@ -7892,6 +8128,7 @@ void TestPackedDescriptorWaterfall() {
       memory.words[word] = row;
       memory.words[word + 1u] = 0x00fff000u;
       memory.words[word + 2u] = (row & 1u) ? 0x0a500000u : 0u;
+      memory.words[word + 3u] = 0x80000abcu;
     }
     const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
         .read_specialization_memory = ReadLinearTestMemory};
@@ -7904,6 +8141,27 @@ void TestPackedDescriptorWaterfall() {
       return (span.first >= memory.base + 256u && span.first + span.second <= memory.base + 320u) ||
           (span.first >= memory.base + 512u && span.first + span.second <= memory.base + 512u + 59u * 16u);
     }), "packed waterfall materialization read outside the descriptor heaps");
+    if (variant == 2u) {
+      // The GPU byte offset wraps to 16; the dense sampler map stores one DWORD per row.
+      selected_sampler.Instruction()->ReplaceUsesWith(Value(0x10000001u));
+      uint32_t offset = 0;
+      const auto& root = specialization.samplers[0];
+      const auto mapping = root.indirect_mapping_offset;
+      Check(EvaluateSrtValue(f.program, runtime, sampler.Instruction()->Arg(0), offset) &&
+                offset == 4u && root.indirect_search_iterations == 0u &&
+                snapshot.flattened_srt[mapping] == 59u &&
+                snapshot.flattened_srt[mapping + 1u + offset / 4u] == 2u &&
+                snapshot.samplers[2].dwords[0] == 1u && snapshot.samplers[2].dwords[2] == 0x0a500000u &&
+                snapshot.samplers[2].dwords[3] == 0x80000abcu,
+            "wrapped packed sampler index selected the wrong descriptor");
+      user_data[5] = 0u;
+      user_data[6] = 24u;
+      memory.fail_address = memory.base + 512u + 24u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.samplers.size() == 3u &&
+                std::ranges::equal(std::span(snapshot.samplers[2].dwords).first(4),
+                                   std::array{1u, 0x00fff000u, 0u, 0u}),
+            "partial packed sampler row did not zero its out-of-bounds DWORDs");
+    }
   }
 }
 
@@ -9474,6 +9732,7 @@ int main() {
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("indexed material image keys", TestIndexedMaterialImageKeys);
     Run("pointer-table indexed material keys", TestPointerTableIndexedMaterialKeys);
+    Run("guarded material image key", TestGuardedMaterialImageKey);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("compact scalar image table", TestCompactScalarImageTable);
@@ -9493,8 +9752,10 @@ int main() {
     });
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
+    Run("packed material buffer store", TestPackedMaterialBufferStore);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
+    Run("guarded carried buffer key", TestGuardedCarriedBufferKey);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);

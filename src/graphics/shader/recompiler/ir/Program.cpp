@@ -227,22 +227,6 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 	           ? 32u : info.component_bits[0];
 }
 
-bool HasShaderMemoryWrites(const Program& program) {
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			const auto op     = inst.GetOpcode();
-			const auto buffer = BufferAccessOf(op);
-			const auto image  = ImageOpcodeInfoOf(op).access;
-			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
-			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
-			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
 void ValidateProgram(const Program& program) {
 	if (program.blocks.size() != program.block_storage.size()) {
 		return Fail("value IR block storage is inconsistent");
@@ -482,7 +466,7 @@ void ValidateProgram(const Program& program) {
 				if (memory.kind == ResourceKind::IndirectBuffer &&
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
 					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
-					            "or formatted X load");
+					            "or formatted DWORD load");
 				}
 				const auto access = BufferAccessOf(inst.GetOpcode());
 				const bool packed_formatted =

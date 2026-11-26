@@ -80,15 +80,13 @@ void FaultManager::ProcessFaultBuffer() {
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
 	pre_barrier.buffer        = m_fault_buffer.Handle();
 	pre_barrier.offset        = 0;
 	pre_barrier.size           = m_fault_buffer.Size();
 	auto post_barrier         = pre_barrier;
 	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
 	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},

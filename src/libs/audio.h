@@ -39,7 +39,29 @@ struct AudioOut2PortParam;
 struct AudioOut2Attribute;
 struct AudioOut2PortState;
 struct AudioOut2SystemState;
-struct AudioOut2Position;
+struct AudioOut2Position {
+	float             x, y, z;
+	bool              IsFinite() const;
+	double            Length() const;
+	AudioOut2Position operator/(double divisor) const;
+};
+
+struct AudioOut2SpeakerArrayParam {
+	const AudioOut2Position* positions;
+	uint32_t                 count;
+	uint8_t                  is_3d;
+	void*                    buffer;
+	size_t                   size;
+	uint32_t                 correction_type;
+	float                    correction_gain;
+	uint32_t                 reserved[6];
+};
+
+struct AudioOut2AmbisonicsDecodeParam {
+	uint32_t ordering;
+	uint8_t  height_aware;
+	uint32_t reserved[6];
+};
 struct AudioOut2SpeakerInfo;
 struct AudioOut2SystemDebugStateParam;
 struct AudioOut2MasteringParamsHeader;
@@ -77,8 +99,9 @@ int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle
                                                        uint32_t* port_attributes);
 size_t KYTY_SYSV_ABI AudioOut2GetSpeakerArrayMemorySize(uint32_t num_speakers, uint8_t is_3d,
                                                         uint8_t is_ambisonics);
-int KYTY_SYSV_ABI    AudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle* handle,
-                                                 const void* vbap_params, const void* ambi_params);
+int KYTY_SYSV_ABI    AudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle*          handle,
+                                                 const AudioOut2SpeakerArrayParam*     vbap_params,
+                                                 const AudioOut2AmbisonicsDecodeParam* ambi_params);
 int KYTY_SYSV_ABI    AudioOut2SpeakerArrayDestroy(AudioOut2SpeakerArrayHandle handle);
 int KYTY_SYSV_ABI    AudioOut2GetSpeakerArrayCoefficients(
     AudioOut2SpeakerArrayHandle handle, AudioOut2Position pos, float spread, float* coefficients,

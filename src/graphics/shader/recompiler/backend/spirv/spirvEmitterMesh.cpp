@@ -84,22 +84,29 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 		              shared ? mesh.max_vertices : state.lane_count);
 	}
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
-	state.mesh_primitive_data =
+	state.mesh_primitive_data[0] =
 	    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
 	state.mesh_primitives = MeshArray(state, spv::StorageClassOutput, MeshPrimitiveType(state),
 	                                  mesh.max_primitives);
-	state.mesh_cull =
-	    MeshArray(state, spv::StorageClassOutput, TypeBool(state), mesh.max_primitives);
+	const auto per_primitive = [&](uint32_t type, spv::BuiltIn builtin) {
+		const auto variable = MeshArray(state, spv::StorageClassOutput, type, mesh.max_primitives);
+		state.interface_variables.push_back(variable);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPerPrimitiveEXT);
+		return variable;
+	};
+	state.mesh_cull = per_primitive(TypeBool(state), spv::BuiltInCullPrimitiveEXT);
+	if (mesh.output_primitive_id) {
+		state.mesh_primitive_data[1] =
+		    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
+		state.mesh_primitive_id = per_primitive(TypeI32(state), spv::BuiltInPrimitiveId);
+	}
 	state.interface_variables.push_back(state.mesh_primitives);
-	state.interface_variables.push_back(state.mesh_cull);
 	constexpr spv::BuiltIn indices[] = {spv::BuiltInPrimitivePointIndicesEXT,
 	                                    spv::BuiltInPrimitiveLineIndicesEXT,
 	                                    spv::BuiltInPrimitiveTriangleIndicesEXT};
 	state.builder.AddAnnotation(spv::OpDecorate, state.mesh_primitives, spv::DecorationBuiltIn,
 	                            indices[mesh.output_primitive_size - 1u]);
-	state.builder.AddAnnotation(spv::OpDecorate, state.mesh_cull, spv::DecorationBuiltIn,
-	                            spv::BuiltInCullPrimitiveEXT); // CullPrimitiveEXT
-	state.builder.AddAnnotation(spv::OpDecorate, state.mesh_cull, spv::DecorationPerPrimitiveEXT);
 }
 
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index) {
@@ -117,8 +124,8 @@ uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32
 	    shared ? EmitLocalInvocationIndex(state) : ConstantU32(state, state.lane_half));
 }
 
-uint32_t MeshPrimitivePointer(EmitterState& state) {
-	return MeshElement(state, state.mesh_primitive_data, spv::StorageClassPrivate, TypeU32(state),
+uint32_t MeshPrimitivePointer(EmitterState& state, uint32_t component) {
+	return MeshElement(state, state.mesh_primitive_data[component], spv::StorageClassPrivate, TypeU32(state),
 	                   ConstantU32(state, state.lane_half));
 }
 
@@ -187,7 +194,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_primitive, index,
 		                          primitives);
 		EmitIfCondition(state, is_primitive, [&] {
-			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
+			const auto packed = MeshLoad(state, state.mesh_primitive_data[0], spv::StorageClassPrivate,
 			                             TypeU32(state), ConstantU32(state, half));
 			const auto size = state.input_info.vertex->mesh.output_primitive_size;
 			const auto type = MeshPrimitiveType(state);
@@ -208,6 +215,15 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			    spv::OpStore,
 			    MeshElement(state, state.mesh_primitives, spv::StorageClassOutput, type, index),
 			    primitive);
+			if (state.mesh_primitive_id) {
+				const auto payload = MeshLoad(state, state.mesh_primitive_data[1], spv::StorageClassPrivate,
+				                              TypeU32(state), ConstantU32(state, half));
+				const auto id = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitcast, TypeI32(state), id, payload);
+				state.builder.AddFunction(spv::OpStore,
+				                          MeshElement(state, state.mesh_primitive_id, spv::StorageClassOutput,
+				                                      TypeI32(state), index), id);
+			}
 			const auto null_bit =
 			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
 			const auto culled = state.builder.AllocateId();

@@ -62,7 +62,7 @@ inline vk::ImageAspectFlags DepthReadableAspects(vk::ImageLayout layout) {
 }
 
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
-	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+	const auto available     = ImageAspectMask(depth.desc.view_info.format);
 	const auto writes        = depth.AttachmentWriteAspects();
 	const bool has_depth     = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
 	const bool has_stencil   = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);

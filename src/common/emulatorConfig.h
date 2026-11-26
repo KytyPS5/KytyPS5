@@ -35,7 +35,7 @@ using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
-constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
+constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 30;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
 constexpr int32_t DEFAULT_USER_ID           = 1000;
 
@@ -58,6 +58,7 @@ struct ConfigOptions {
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
 	AudioOutput            audio_output                = AudioOutput::TV;
+	bool                   audio_3d_enabled            = false;
 	std::optional<ControllerColor> controller_color;
 	uint32_t               controller_speaker_volume      = 50;
 	uint32_t               controller_vibration_intensity = 100;
@@ -128,6 +129,7 @@ const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
 AudioOutput GetAudioOutput();
+bool Audio3dEnabled();
 const std::optional<ControllerColor>& GetControllerColor();
 uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();

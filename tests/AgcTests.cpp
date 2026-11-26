@@ -40,6 +40,40 @@ TEST(Agc, AcquireMemWritesBackInvalidatedGl2) {
 	}
 }
 
+TEST(Agc, AcquireMemSetEnginePatchesOnlyEngineBit) {
+	Loader::SymbolDatabase symbols;
+	Libs::InitAgcDriver_1(&symbols);
+	const auto* symbol = symbols.Find({"W0WEyog0f74", "Agc", "Agc", Loader::SymbolType::Func});
+	ASSERT_NE(symbol, nullptr);
+	using SetEngine = int(KYTY_SYSV_ABI*)(uint32_t*, uint8_t);
+	const auto set_engine = reinterpret_cast<SetEngine>(symbol->vaddr);
+
+	Packet<8> dcb;
+	auto* cmd = Agc::AgcDcbAcquireMem(dcb.Buf(), 1, 0x40u, 0x100u, nullptr, 0, 400);
+	auto expected = dcb.dw;
+	for (uint8_t engine: {0, 1}) {
+		expected[1] = 0x40u | (uint32_t{engine} << 31u);
+		EXPECT_EQ(set_engine(cmd, engine), 0);
+		EXPECT_EQ(dcb.dw, expected);
+	}
+	expected[0] = cmd[0] = 0xc0005900u; // REWIND
+	EXPECT_EQ(set_engine(cmd, 0), static_cast<int>(0x8a6c000cu));
+	EXPECT_EQ(dcb.dw, expected);
+}
+
+TEST(Agc, FixedPacketSizeExportsReturnBytes) {
+	Loader::SymbolDatabase symbols;
+	Libs::InitAgcDriver_1(&symbols);
+	using GetSize = uint64_t(KYTY_SYSV_ABI*)();
+	for (const auto [nid, bytes]: {std::pair {"da1Sm8-QDoU", 36u}, std::pair {"oz6zQq1JwCE", 36u},
+	                               std::pair {"Y-5vneiBtzk", 8u}, std::pair {"0ZOG0jc9nRg", 8u},
+	                               std::pair {"QIXCsbipds0", 8u}, std::pair {"+u6dKSLWM2o", 8u}}) {
+		const auto* symbol = symbols.Find({nid, "Agc", "Agc", Loader::SymbolType::Func});
+		ASSERT_NE(symbol, nullptr) << nid;
+		EXPECT_EQ(reinterpret_cast<GetSize>(symbol->vaddr)(), bytes) << nid;
+	}
+}
+
 TEST(Agc, AcquireMemDbFlushIsGlobal) {
 	const auto* base = reinterpret_cast<const volatile void*>(0x12345600);
 	for (const auto [gcr, expected]: {std::pair {0x910au, 0x8101u}, std::pair {0x500bu, 0xc001u},

@@ -329,6 +329,7 @@ static void ShaderGetStaticInputInfoPS(
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
+	ps_info.float_mode          = regs.ps_regs.rsrc1.float_mode;
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 	ps_info.lds_size_dwords     = static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u;
 
@@ -365,14 +366,14 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_ancillary                 = (active_inputs & 0x00002000u) != 0;
 	ps_info.ps_sample_shading            = (active_inputs & 0x00000011u) != 0;
 	ps_info.ps_no_perspective            = (sh.ps_input_ena & sh.ps_input_addr & 0x00000020u) != 0;
-	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
-	ps_info.ps_depth_export_enable       = sh.db_shader_control.shader_z_export_enable;
-	ps_info.ps_sample_mask_export_enable = sh.db_shader_control.shader_mask_export_enable;
-	// Alpha-to-mask coverage must gate depth writes, so it rules out early fragment tests.
-	ps_info.ps_early_z =
-	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
-	     !sh.db_shader_control.shader_z_export_enable &&
-	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
+	const auto& db = sh.db_shader_control;
+	ps_info.ps_pixel_kill_enable         = db.shader_kill_enable;
+	ps_info.ps_depth_export_enable       = db.shader_z_export_enable;
+	ps_info.ps_sample_mask_export_enable = db.shader_mask_export_enable;
+	ps_info.ps_early_z = db.depth_before_shader ||
+	                     (db.shader_z_behavior == 1 && !db.shader_kill_enable &&
+	                      !db.shader_z_export_enable && !db.shader_mask_export_enable &&
+	                      !sh.AlphaToMask());
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
@@ -431,7 +432,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
 	key.push_back(info.resources_num);
-	key.push_back(info.wave_size);
+	key.push_back(info.wave_size | (uint32_t {ShaderFlushF16Inputs(info.float_mode)} << 8u));
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
@@ -458,7 +459,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.output_primitive_size, mesh.primitives_per_group,
 		                       mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
-		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch)});
+		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch),
+		                       static_cast<uint32_t>(mesh.input_primitive_id),
+		                       static_cast<uint32_t>(mesh.output_primitive_id)});
 	}
 	// Each tessellation stage keys only the layout fields its module depends on.
 	const auto& tess = info.tess;
@@ -494,7 +497,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.input_num);
-	key.push_back(info.wave_size);
+	key.push_back(info.wave_size | (uint32_t {ShaderFlushF16Inputs(info.float_mode)} << 8u));
 	key.push_back(info.ps_system_input_base);
 	key.push_back(info.custom_interpolation_mask);
 	key.push_back(info.ps_perspective_center_vgpr);
@@ -509,7 +512,6 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
 	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
 	key.push_back(static_cast<uint32_t>(info.parameter_mode));
-	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
@@ -562,6 +564,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    regs.es_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	    merged || native_ngg ? 8u : 0u);
+	info.float_mode = regs.gs_regs.rsrc1.float_mode;
 	if (!merged && !native_ngg) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
@@ -577,6 +580,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());
+	mesh.input_primitive_id  = sh.primitive_id_enable && regs.gs_regs.rsrc1.gs_vgpr_component_count >= 2;
 	mesh.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 	mesh.max_vertices        = sh.m_geMaxOutputPerSubgroup;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
@@ -674,13 +678,16 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 		EXIT("failed to prepare local shader program\n");
 	}
 	// LS and HS share the HS wave; the TES runs in the GS wave.
+	input_info[0].float_mode          = regs.hs_regs.rsrc1.float_mode;
 	input_info[0].logical_stage       = ShaderType::Local;
 	input_info[0].wave_size           = (stages & 0x00200000u) != 0 ? 32u : 64u;
 	input_info[1].logical_stage       = ShaderType::TessellationControl;
 	input_info[1].wave_size           = input_info[0].wave_size;
+	input_info[1].float_mode          = input_info[0].float_mode;
 	input_info[1].scratch_size_dwords = control.scratch_size_dwords;
 	input_info[2].logical_stage       = ShaderType::TessellationEvaluation;
 	input_info[2].wave_size           = (stages & 0x00400000u) != 0 ? 32u : 64u;
+	input_info[2].float_mode          = regs.gs_regs.rsrc1.float_mode;
 	input_info[2].scratch_size_dwords = evaluation.scratch_size_dwords;
 	input_info[2].pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 

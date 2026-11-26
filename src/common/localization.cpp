@@ -10,11 +10,11 @@
 namespace Common::Localization {
 namespace {
 
-constexpr std::array<std::string_view, 30> Locales = {
+constexpr std::array<std::string_view, 31> Locales = {
     "ja-JP", "en-US", "fr-FR",   "es-ES",   "de-DE", "it-IT", "nl-NL", "pt-PT",
     "ru-RU", "ko-KR", "zh-Hant", "zh-Hans", "fi-FI", "sv-SE", "da-DK", "no-NO",
     "pl-PL", "pt-BR", "en-GB",   "tr-TR",   "es-419", "ar-AE", "fr-CA", "cs-CZ",
-    "hu-HU", "el-GR", "ro-RO",   "th-TH",   "vi-VN", "id-ID"};
+    "hu-HU", "el-GR", "ro-RO",   "th-TH",   "vi-VN", "id-ID", "uk-UA"};
 
 size_t LanguageIndex(int console_language) {
 	return console_language >= 0 && console_language < static_cast<int>(Locales.size())

@@ -85,16 +85,11 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
-		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		return data_bits == 32u && ((!formatted && opcode == ValueOpcode::ReadConstBuffer) ||
+		       opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		       opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -173,13 +168,20 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
+[[nodiscard]] constexpr bool IsSupportedAtomicImageFormat(Prospero::BufferFormat format, bool wide) {
+	using F = Prospero::BufferFormat;
+	// An atomic treats one or two 32-bit channels as a single word regardless of their numeric type.
+	return wide ? format >= F::k32_32UInt && format <= F::k32_32Float
+	            : format >= F::k32UInt && format <= F::k32Float;
+}
+
 [[nodiscard]] constexpr Prospero::BufferFormat
 RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
-	if (image.resource_class != ImageResourceClass::Storage || !image.written)
+	if (image.resource_class != ImageResourceClass::Storage || !image.written || image.read || image.atomic)
 		return Prospero::BufferFormat::kInvalid;
-	if (format == Prospero::BufferFormat::k32SInt && (image.atomic ? !image.atomic64 : !image.read))
+	if (format == Prospero::BufferFormat::k32SInt)
 		return Prospero::BufferFormat::k32UInt;
-	if (format == Prospero::BufferFormat::k16SInt && !image.read && !image.atomic)
+	if (format == Prospero::BufferFormat::k16SInt)
 		return Prospero::BufferFormat::k16UInt;
 	return Prospero::BufferFormat::kInvalid;
 }
@@ -372,16 +374,10 @@ struct PushData {
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
-	// User clip planes 0..N follow the mesh draw parameters or object ID, four dwords each.
+	// User clip planes follow the mesh parameters. The object's register value occupies the
+	// opposite end so both stages can use their draw data in the same pipeline.
 	static constexpr uint32_t UserClipPlaneDword = MeshDrawDwordCount;
-
-	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
-	                                                           uint32_t user_clip_planes = 0) {
-		if (user_clip_planes != 0) {
-			return UserClipPlaneDword + 4u * std::bit_width(user_clip_planes);
-		}
-		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
-	}
+	static constexpr uint32_t ObjectIdDword      = DwordCount - 1;
 
 	// The dwords [begin, end) no stage has taken. The pixel stage takes the end, so where the
 	// other stages start does not depend on its size.
@@ -394,6 +390,16 @@ struct PushData {
 			return stage == ShaderType::Pixel ? end - size : begin;
 		}
 	};
+
+	[[nodiscard]] static constexpr Window GraphicsWindow(bool mesh, bool object_id,
+	                                                     uint32_t user_clip_planes = 0) {
+		Window window {.begin = mesh ? MeshDrawDwordCount : 0u,
+		               .end = object_id ? ObjectIdDword : DwordCount};
+		if (user_clip_planes != 0) {
+			window.begin = UserClipPlaneDword + 4u * std::bit_width(user_clip_planes);
+		}
+		return window;
+	}
 };
 
 static_assert(sizeof(PushData) == 128);
@@ -606,7 +612,7 @@ struct DescriptorSource {
 			uint32_t first_record = 0;
 			uint32_t record_step = 1;
 			uint32_t maximum = UINT32_MAX;
-			bool non_negative = false; // Signed-negative fields read as zero before the maximum.
+			uint32_t zero_above = UINT32_MAX; // Larger fields select row zero before the maximum.
 			uint32_t bit_offset = 0;
 			uint32_t bit_mask = UINT32_MAX;
 			bool global = false;
@@ -766,7 +772,6 @@ struct Program: ResourcePlan {
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory);
 
 std::string ProgramToString(const Program& program);
-bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);

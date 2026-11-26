@@ -199,8 +199,11 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
                                          uint32_t gcr_cntl, const volatile void* base,
                                          uint64_t size_bytes, uint32_t poll_cycles);
 uint32_t KYTY_SYSV_ABI  AgcDcbAcquireMemGetSize();
+uint64_t KYTY_SYSV_ABI  AgcDcbAtomicMemGetSize();
+uint64_t KYTY_SYSV_ABI  AgcAcbAtomicMemGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* address);
+uint64_t KYTY_SYSV_ABI  AgcAcbEventWriteGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbAcquireMem(CommandBuffer* buf, uint32_t gcr_cntl,
                                          const volatile void* base, uint64_t size_bytes,
                                          uint32_t poll_cycles);
@@ -212,6 +215,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
                                    const uint32_t* target, uint32_t size_in_dwords);
 uint32_t KYTY_SYSV_ABI  AgcAcbJumpGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload);
+uint64_t KYTY_SYSV_ABI  AgcAcbRewindGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles);
@@ -240,6 +244,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbSetMarker(CommandBuffer* buf, const char* str, uin
 uint32_t* KYTY_SYSV_ABI AgcAcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf);
 uint32_t* KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf);
+uint64_t KYTY_SYSV_ABI  AgcDcbStallCommandBufferParserGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
                                        uint64_t src_address_or_immediate, uint8_t item_size,
@@ -254,7 +259,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_
 uint32_t* KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cache_policy,
                                    const uint32_t* target, uint32_t size_in_dwords);
 uint32_t KYTY_SYSV_ABI  AgcDcbJumpGetSize();
-uint32_t KYTY_SYSV_ABI  AgcDcbRewindGetSize();
+uint64_t KYTY_SYSV_ABI  AgcDcbRewindGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbRewind(CommandBuffer* buf, uint32_t initial_state);
 uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                        uint32_t num_dwords);
@@ -274,6 +279,7 @@ int KYTY_SYSV_ABI       AgcSetRangePredication(uint32_t* start, const volatile u
                                                uint32_t predication);
 int KYTY_SYSV_ABI       AgcSetNop(uint32_t* packet);
 int KYTY_SYSV_ABI       AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state);
+int KYTY_SYSV_ABI       AgcAcquireMemSetEngine(uint32_t* cmd, uint8_t engine);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetCommandAddress(uint32_t*                cmd,
                                                           const volatile uint32_t* command);

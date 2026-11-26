@@ -375,6 +375,7 @@ enum class Opcode {
 	V_MAX_U32,
 	V_MAX_F16,
 	V_MIN_F16,
+	// Keep the floating-point compares (F32 and F64) contiguous for IsVopcFloatCompareOpcode.
 	V_CMP_F_F32,
 	V_CMP_LT_F32,
 	V_CMP_EQ_F32,
@@ -445,6 +446,7 @@ enum class Opcode {
 	V_CMP_NE_I32,
 	V_CMP_GE_I32,
 	V_CMP_T_I32,
+	// Keep the floating-point class compares contiguous for IsVopcFloatCompareOpcode.
 	V_CMP_CLASS_F32,
 	V_CMPX_CLASS_F32,
 	V_CMP_CLASS_F16,
@@ -461,6 +463,7 @@ enum class Opcode {
 	V_CMPX_GT_I16,
 	V_CMPX_NE_I16,
 	V_CMPX_GE_I16,
+	// Keep the F16 compares contiguous for IsVopcFloatCompareOpcode.
 	V_CMP_LT_F16,
 	V_CMP_EQ_F16,
 	V_CMP_LE_F16,
@@ -470,6 +473,7 @@ enum class Opcode {
 	V_CMP_U_F16,
 	V_CMP_NGE_F16,
 	V_CMP_NGT_F16,
+	V_CMP_NLE_F16,
 	V_CMP_NEQ_F16,
 	V_CMP_NLT_F16,
 	V_CMPX_LT_F16,
@@ -477,6 +481,7 @@ enum class Opcode {
 	V_CMPX_LE_F16,
 	V_CMPX_GT_F16,
 	V_CMPX_GE_F16,
+	V_CMPX_NGE_F16,
 	V_CMPX_NGT_F16,
 	V_CMPX_NLE_F16,
 	V_CMPX_NEQ_F16,

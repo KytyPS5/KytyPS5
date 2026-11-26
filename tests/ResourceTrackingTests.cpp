@@ -4061,7 +4061,8 @@ void TestCompactScalarImageTable() {
   enum class Sharing { None, SameBlock, Dominating, Sibling, Later, WrongMask, MixedMask };
   const auto make_plan = [&](bool compact, uint32_t invalid = 0u,
                              Domain domain = Domain::Unbounded, Pairing pairing = Pairing::SameKey,
-                             uint32_t member = 0x98u, Sharing sharing = Sharing::None) {
+                             uint32_t member = 0x98u, Sharing sharing = Sharing::None,
+                             uint32_t sample_flags = 0u) {
     Fixture fixture;
     const auto list = invalid == 1u
         ? fixture.Address(fixture.UserData(0), fixture.UserData(1))
@@ -4116,10 +4117,16 @@ void TestCompactScalarImageTable() {
       sampler_words[word] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, record},
                                           fixture.AddMemory(scalar, 0x590u));
     }
+    if (invalid == 5u) {
+      const auto bit = fixture.Emit(ValueOpcode::BitwiseAnd32, {fixture.Emit(ValueOpcode::LaneId), Value(1u)});
+      const auto scratch = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {bit, Value(12u)});
+      sampler_words[3] = fixture.Emit(ValueOpcode::BitwiseOr32, {sampler_words[3], scratch});
+    }
     MemoryInfo sample;
     sample.kind = ResourceKind::Image;
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
     sample.image_r128 = compact;
+    sample.image_sample_flags = sample_flags;
     const auto sampler = fixture.Sampler(sampler_words, 0x59cu);
     const auto read_unpaired = [&] {
       fixture.Emit(ValueOpcode::ImageRead, {unpaired, fixture.ImageAddress(), Value(true)},
@@ -4184,8 +4191,9 @@ void TestCompactScalarImageTable() {
           {make_image(second_key, 0x16cu), sampler, fixture.ImageAddress(), Value(true)},
           fixture.AddMemory(sample, 0x79cu));
     }
-    if (invalid == 4u) {
+    if (invalid == 4u || invalid == 5u) {
       sample.image_r128 = false;
+      sample.image_sample_flags = 0u;
       fixture.Emit(ValueOpcode::ImageSampleRaw,
           {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x5a0u));
     }
@@ -4221,9 +4229,13 @@ void TestCompactScalarImageTable() {
     }
     return ExtractResourcePlan(fixture.program);
   };
-  struct Case { bool compact; uint32_t member; Pairing pairing; Sharing sharing = Sharing::None; };
-  for (const auto [compact, member, pairing, sharing] : {
+  struct Case {
+    bool compact; uint32_t member; Pairing pairing; Sharing sharing = Sharing::None;
+    uint32_t sample_flags = 0u;
+  };
+  for (const auto [compact, member, pairing, sharing, sample_flags] : {
            Case{false, image_offset, Pairing::SameKey}, Case{true, image_offset, Pairing::SameKey},
+           Case{false, image_offset, Pairing::SameKey, Sharing::None, Decoder::ImageSampleFlagAdjust},
            Case{true, 0x16cu, Pairing::SameKey}, Case{true, 0x16cu, Pairing::DifferentKey},
            Case{true, 0x16cu, Pairing::PairedFirst}, Case{true, 0x16cu, Pairing::UnpairedFirst},
            Case{true, 0x16cu, Pairing::MixedUses},
@@ -4233,7 +4245,7 @@ void TestCompactScalarImageTable() {
            Case{true, 0x16cu, Pairing::SameKey, Sharing::Later},
            Case{true, 0x16cu, Pairing::SameKey, Sharing::WrongMask},
            Case{true, 0x16cu, Pairing::SameKey, Sharing::MixedMask}}) {
-    auto plan = make_plan(compact, 0u, Domain::Unbounded, pairing, member, sharing);
+    auto plan = make_plan(compact, 0u, Domain::Unbounded, pairing, member, sharing, sample_flags);
     const uint32_t width = compact ? 4u : 8u;
     const auto bytes = 2u * stride + member + width * 4u;
     std::array<uint32_t, 9> data{0x1000u, 0u, 8u, 0u, 0x2000u, 0u, bytes, 0u, 0u};
@@ -4400,6 +4412,11 @@ void TestCompactScalarImageTable() {
     memory.fail_address = UINT64_MAX;
     materialize({0x100u, 0x101u, 0x200u, 0x201u}, {0u, 1u});
   }
+  CheckFatal([&] {
+    make_plan(false, 5u, Domain::Unbounded, Pairing::SameKey, image_offset, Sharing::None,
+              Decoder::ImageSampleFlagAdjust);
+  }, "GetSamplerResource dword 0 is not a valid runtime value",
+     "ordinary sample accepted a shared sampler table with per-instruction scratch bits");
   for (uint32_t invalid : {1u, 2u, 3u, 4u})
     CheckFatal([&] { make_plan(true, invalid); }, "not a valid runtime value",
                "compact table accepted an unproved selector or inconsistent descriptor width");

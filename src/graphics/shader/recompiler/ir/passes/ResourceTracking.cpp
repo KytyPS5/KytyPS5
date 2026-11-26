@@ -830,30 +830,30 @@ private:
 		const auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
 			return entry.handle == &handle && entry.pc == pc;
 		});
-		if (resolved != m_resolved_handles.end()) {
+		if (resolved == m_resolved_handles.end()) {
+			if (handle.NumArgs() != width) {
+				Fail(pc, fmt::format("{} has {} descriptor dwords, expected {}",
+				                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
+			}
+			descriptor.dword_count = width;
+			for (uint32_t i = 0; i < width; i++) {
+				const auto value = base_reg != UINT32_MAX
+				    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
+				descriptor.dwords[i] = LowerDescriptorValue(value);
+			}
+			const auto dword0 = descriptor.dwords[0].Resolve();
+			if (sampler && dword0.IsImmediate() && dword0.GetType() == Type::U32 &&
+			    (dword0.U32() & SamplerBorderClampMask) == 0) {
+				// Border color and its table index are unused unless a clamp axis selects border mode.
+				descriptor.dwords[3] = Value(0u);
+			}
+			m_resolved_handles.push_back({&handle, pc, descriptor, {}});
+		} else {
 			descriptor = resolved->source;
-			return;
-		}
-		if (handle.NumArgs() != width) {
-			Fail(pc, fmt::format("{} has {} descriptor dwords, expected {}",
-			                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
-		}
-		descriptor.dword_count = width;
-		for (uint32_t i = 0; i < width; i++) {
-			const auto value = base_reg != UINT32_MAX
-			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
-			descriptor.dwords[i] = LowerDescriptorValue(value);
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
 		}
-		const auto dword0 = descriptor.dwords[0].Resolve();
-		if (sampler && dword0.IsImmediate() && dword0.GetType() == Type::U32 &&
-		    (dword0.U32() & SamplerBorderClampMask) == 0) {
-			// Border color and its table index are unused unless a clamp axis selects border mode.
-			descriptor.dwords[3] = Value(0u);
-		}
-		m_resolved_handles.push_back({&handle, pc, descriptor, {}});
 	}
 
 	uint32_t ScalarReadBase(const Inst& read) const {
@@ -3268,9 +3268,7 @@ private:
 		const auto& access = *use.user;
 		if (use.operand != (sampler ? 1u : 0u) ||
 		    ImageOpcodeInfoOf(access.GetOpcode()).access == ImageAccess::None) return {};
-		if (sampler && (access.GetOpcode() != ValueOpcode::ImageSampleRaw ||
-		    (m_program.memory_info[access.Flags<MemoryFlags>().index].image_sample_flags &
-		     Decoder::ImageSampleFlagAdjust) != 0u)) return {};
+		if (sampler && access.GetOpcode() != ValueOpcode::ImageSampleRaw) return {};
 		const auto mask = access.Arg(access.NumArgs() - 1u);
 		return mask.GetType() == Type::U1 ? mask : Value {};
 	}
@@ -4149,8 +4147,7 @@ private:
 						m_indirect_descriptors.push_back(std::move(plan));
 					}
 				};
-				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
-				    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) == 0u) {
+				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
 					plan_handle(inst.Arg(1), 4u, memory.sampler * 4u, true);
 				}
 				plan_handle(inst.Arg(0), IndirectBufferAccess(inst) ? 4u : 8u,

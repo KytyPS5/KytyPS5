@@ -63,6 +63,12 @@ public:
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// Hosts without attachment feedback loops cannot sample a depth/stencil target that the draw
+	// writes. Copies `range` (the `aspects` given) of depth image `depth_id` into an image of its
+	// own, outside any render pass, for the draw to sample instead: the draw reads the values from
+	// before it ran. The copy lives until the depth image is deleted.
+	[[nodiscard]] ImageId CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
+	                                           vk::ImageAspectFlags aspects);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
@@ -214,6 +220,8 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
+	// Releases the depth feedback copy of a depth image, if it has one. Caller holds m_lock.
+	void                      ReleaseDepthFeedbackCopy(ImageId depth_id);
 	void                      FreeImage(ImageId id);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
@@ -278,6 +286,8 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
+	// Depth image -> its depth feedback copy (see CopyDepthForFeedback).
+	std::unordered_map<ImageId, ImageId>              m_depth_feedback_copies;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

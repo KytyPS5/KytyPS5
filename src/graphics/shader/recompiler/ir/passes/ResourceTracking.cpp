@@ -407,6 +407,23 @@ private:
 	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
 };
 
+enum class ShaderWrites { None, Resource, Address };
+
+static ShaderWrites ClassifyWrites(const Program& program) {
+	auto writes = ShaderWrites::None;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (AddressOpcodeInfoOf(op).access == AddressAccess::Write) return ShaderWrites::Address;
+			const auto buffer = BufferAccessOf(op);
+			const auto image = ImageOpcodeInfoOf(op).access;
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+			    image == ImageAccess::Write || image == ImageAccess::Atomic) writes = ShaderWrites::Resource;
+		}
+	}
+	return writes;
+}
+
 class Tracker {
 public:
 	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
@@ -420,7 +437,7 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.address_bases.clear();
 		m_info.user_address_bases.clear();
-		m_shader_writes = HasShaderMemoryWrites(program);
+		m_shader_writes = ClassifyWrites(program);
 	}
 
 	void Run() {
@@ -746,19 +763,35 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
-	Value LowerDescriptorValue(Value value) {
+	using DescriptorValues = std::map<const Inst*, Value>;
+	using ZeroTest = std::pair<Value, bool>; // SSA operand and whether the edge requires nonzero.
+
+	ZeroTest EdgeZeroTest(const Block* from, const Block* to) const {
+		const auto edge = ConditionalEdge(from, to);
+		if (!edge || edge->lanes != LaneQuantifier::All) return {};
+		const auto* test = edge->condition.TryInstruction();
+		if (test == nullptr || (test->GetOpcode() != ValueOpcode::IEqual32 &&
+		                        test->GetOpcode() != ValueOpcode::INotEqual32)) return {};
+		for (uint32_t i = 0; i < 2u; ++i) {
+			if (test->Arg(i).Resolve() == Value(0u))
+				return {test->Arg(i ^ 1u).Resolve(), edge->positive == (test->GetOpcode() == ValueOpcode::INotEqual32)};
+		}
+		return {};
+	}
+
+	Value LowerDescriptorValue(Value value, ZeroTest use, DescriptorValues& values) {
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return value;
 		// The scalar planner owns reads and lowers their address handles separately.
 		uint32_t memory_index = 0;
 		if (ScalarReadMemory(*inst, memory_index) != nullptr) return value;
-		const auto [cached, inserted] = m_descriptor_values.emplace(inst, value);
+		const auto [cached, inserted] = values.emplace(inst, value);
 		if (!inserted) return cached->second;
 		if (inst->GetOpcode() != ValueOpcode::Phi) {
 			Inst* projected = nullptr;
 			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-				const auto lowered = LowerDescriptorValue(inst->Arg(arg));
+				const auto lowered = LowerDescriptorValue(inst->Arg(arg), use, values);
 				if (lowered == inst->Arg(arg).Resolve()) continue;
 				if (projected == nullptr) {
 					projected = &m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
@@ -805,11 +838,19 @@ private:
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
 		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer) ||
 		    !ValidateRuntimeValue(m_program, inst->Arg(0)) ||
 		    !ValidateRuntimeValue(m_program, inst->Arg(1))) {
 			return value;
+		}
+		if (!ValidateRuntimeValue(m_program, info.condition, m_shader_writes != ShaderWrites::None
+		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
+			// A repeated test of the very same SSA value guarantees which arm reaches this use.
+			// Comparing addresses of separate loads would be unsound for a writable shader.
+			if (use.first.IsEmpty() || !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Integer)) return value;
+			const auto first = EdgeZeroTest(branch, targets[0]);
+			if (first.first != use.first) return value;
+			cached->second = inst->Arg(first.second == use.second ? 0u : 1u);
+			return cached->second;
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
 		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
@@ -832,10 +873,15 @@ private:
 				                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
 			}
 			descriptor.dword_count = width;
+			const auto* block = handle.Parent();
+			const auto use = m_shader_writes == ShaderWrites::Resource && !m_program.srt_plan_complete && block != nullptr &&
+			                 block->ImmPredecessors().size() == 1u
+			    ? EdgeZeroTest(block->ImmPredecessors()[0], block) : ZeroTest {};
+			auto& values = m_descriptor_values[use.first.IsEmpty() ? nullptr : block];
 			for (uint32_t i = 0; i < width; i++) {
 				const auto value = base_reg != UINT32_MAX
 				    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
-				descriptor.dwords[i] = LowerDescriptorValue(value);
+				descriptor.dwords[i] = LowerDescriptorValue(value, use, values);
 			}
 			const auto dword0 = descriptor.dwords[0].Resolve();
 			if (sampler && dword0.IsImmediate() && dword0.GetType() == Type::U32 &&
@@ -4545,9 +4591,9 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
-	std::map<const Inst*, Value>              m_descriptor_values;
+	std::map<const Block*, DescriptorValues>   m_descriptor_values;
 	mutable std::unordered_map<const Inst*, bool>   m_loop_proofs; // By loop-bound comparison.
-	bool                                       m_shader_writes = false;
+	ShaderWrites                               m_shader_writes = ShaderWrites::None;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,

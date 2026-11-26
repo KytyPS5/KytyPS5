@@ -227,22 +227,6 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 	           ? 32u : info.component_bits[0];
 }
 
-bool HasShaderMemoryWrites(const Program& program) {
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			const auto op     = inst.GetOpcode();
-			const auto buffer = BufferAccessOf(op);
-			const auto image  = ImageOpcodeInfoOf(op).access;
-			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
-			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
-			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
 void ValidateProgram(const Program& program) {
 	if (program.blocks.size() != program.block_storage.size()) {
 		return Fail("value IR block storage is inconsistent");

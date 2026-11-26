@@ -333,7 +333,9 @@ void ConfigurationListWidget::WriteSettings() {
 	if (file.exists()) {
 		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
 	} else {
-#ifdef __linux__
+		// The system scope resolves to root-owned paths on macOS, which silently drops
+		// every save (#2489); the user scope keeps settings per account there too.
+#if defined(__linux__) || defined(__APPLE__)
 		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
 		                                CONF_APP_NAME);
 #else
@@ -383,7 +385,9 @@ void ConfigurationListWidget::ReadSettings() {
 	if (file.exists()) {
 		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
 	} else {
-#ifdef __linux__
+		// The system scope resolves to root-owned paths on macOS, which silently drops
+		// every save (#2489); the user scope keeps settings per account there too.
+#if defined(__linux__) || defined(__APPLE__)
 		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
 		                                CONF_APP_NAME);
 #else

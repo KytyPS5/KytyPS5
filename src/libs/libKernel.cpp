@@ -1275,6 +1275,10 @@ int KYTY_SYSV_ABI KernelGetProsperoCompiledSdkVersion(uint32_t* version) {
 	return OK;
 }
 
+static int KYTY_SYSV_ABI KernelIsTrinityHardware() {
+	return Config::Ps5ProEnabled();
+}
+
 static int KYTY_SYSV_ABI KernelIsTrinityMode() {
 	return Loader::SystemContentIsTrinityMode() ? 1 : 0;
 }
@@ -3429,6 +3433,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("GGeRJk1XdWc", LibKernel::KernelGetProsperoCompiledSdkVersion);
+	LIB_FUNC("yu17wG8L5FI", LibKernel::KernelIsTrinityHardware);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
 	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
 	LIB_FUNC("fTx66l5iWIA", FileSystem::KernelFsync);

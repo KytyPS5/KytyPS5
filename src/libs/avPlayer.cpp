@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
+#include "libs/agc.h"
 #include "libs/audio.h"
 #include "libs/libs.h"
 
@@ -485,6 +486,9 @@ public:
 	uint8_t* Get() const { return m_data; }
 	bool     Valid() const { return m_data != nullptr; }
 	uint32_t Size() const { return m_size; }
+	// A video output the guest gave back: the guest GPU work submitted until then (0: none), which
+	// may still read it (Source::Video, ReceiveFrames).
+	uint64_t gpu_work = 0;
 
 private:
 	void Move(GuestBuffer& r) {
@@ -492,6 +496,7 @@ private:
 		m_data    = r.m_data;
 		m_size    = r.m_size;
 		m_texture = r.m_texture;
+		gpu_work  = r.gpu_work;
 		r.m_data  = nullptr;
 		r.m_size  = 0;
 	}
@@ -978,6 +983,10 @@ public:
 			return false;
 		}
 		if (current_video) {
+			// The guest's GPU work may still read the frame it gives back (Astro Bot copies each one
+			// with a DMA the command processor runs up to two frames later): the decoder writes the
+			// buffer again only once all work submitted until now has completed.
+			current_video->buffer->gpu_work = Graphics::SubmittedGpuWork();
 			video_buffers.Push(std::move(current_video->buffer));
 		}
 		current_video = std::move(*frame);
@@ -1129,8 +1138,19 @@ private:
 		if (c == nullptr) {
 			return false;
 		}
-		if (avcodec_parameters_to_context(c, s->codecpar) < 0 ||
-		    avcodec_open2(c, dec, nullptr) < 0) {
+		if (avcodec_parameters_to_context(c, s->codecpar) < 0) {
+			avcodec_free_context(&c);
+			return false;
+		}
+		if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			// Decode video on one thread per CPU. One emulated core decodes a 3840x2160 60 Hz H.264
+			// stream (Astro Bot's PlayStation Studios intro) at about 40 frames per second, so the
+			// video plays late and stutters. FFmpeg's decoded frames do not depend on the thread
+			// count; frame threading only delays the first output by a few frames.
+			c->thread_count = 0;
+			c->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+		}
+		if (avcodec_open2(c, dec, nullptr) < 0) {
 			avcodec_free_context(&c);
 			return false;
 		}
@@ -1404,6 +1424,14 @@ private:
 			if (!buffer) {
 				av_frame_free(&frame);
 				return false;
+			}
+			if ((*buffer)->gpu_work != 0) {
+				if (!Graphics::WaitForGpuWork((*buffer)->gpu_work, worker_stop)) {
+					buffers.Push(std::move(*buffer));
+					av_frame_free(&frame);
+					return false;
+				}
+				(*buffer)->gpu_work = 0;
 			}
 			ReadyFrame ready {.buffer = std::move(*buffer)};
 			if (!(this->*prepare)(frame, ready.buffer, &ready.info)) {

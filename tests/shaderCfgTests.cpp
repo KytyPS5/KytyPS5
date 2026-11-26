@@ -11610,7 +11610,12 @@ void TestGuardedScalarDescriptor() {
       EncodeSmem0(1, 4, 0), (125u << 25u) | 0x50u,
       EncodeSop1(0x1d, 5, 146),                // s_bitset1_b32 s5, 18
       EncodeSMovB32(6, 144), EncodeSMovB32(7, 255), 0x16204u,
-      EncodeSopc(0x07, 128, 10), EncodeSopp(0x04, 2),
+      EncodeSopc(0x07, 128, 10), EncodeSopp(0x04, 8),
+      EncodeVopc(0xc2, 128, 0),                // v_cmp_eq_u32 vcc, 0, v0
+      EncodeSop1(0x24, 12, 106),               // s_and_saveexec_b64 s[12:13], vcc
+      EncodeSopp(0x08, 2),                     // s_cbranch_execz restore
+      EncodeMubuf0(0x32), EncodeMubuf1(0, 1, 0),
+      EncodeSop1(0x04, 126, 12),               // s_mov_b64 exec, s[12:13]
       EncodeMubuf0(0x32), EncodeMubuf1(0, 1, 0), EncodeSopp(0x01)};
   std::array<uint32_t, 2> user_data{0x1000u, 0u};
   auto options = MakeCompileOptions(ShaderType::Compute);

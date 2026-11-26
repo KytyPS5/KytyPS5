@@ -50,6 +50,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("n2fD4A+pb+g", AgcCbSetShRegisterRangeDirect);
 	LIB_FUNC("bxGoVxpdSPQ", AgcCbSetShRegisterRangeDirectGetSize);
 	LIB_FUNC("UZbQjYAwwXM", AgcCbSetShRegistersDirect);
+	LIB_FUNC("yUBESvCCJ4I", AgcCbSetShRegistersDirectGetSize);
 	LIB_FUNC("03RZmELWWzw", AgcCbSetUcRegistersDirect);
 	LIB_FUNC("wr23dPKyWc0", AgcCbReleaseMem);
 	LIB_FUNC("hL7C0IRpWZI", AgcCbQueueEndOfPipeActionGetSize);

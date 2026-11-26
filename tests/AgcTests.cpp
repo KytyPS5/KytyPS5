@@ -1,3 +1,4 @@
+#include "graphics/shader/shader.h"
 #include "libs/agc.h"
 #include "loader/symbolDatabase.h"
 
@@ -137,6 +138,46 @@ TEST(Agc, BranchLeavesNullTargetSlotsZero) {
 	Agc::AgcCbBranch(dcb.Buf(), 1, 3, nullptr, 0, 0, 1, then_target, 0x10u, 2, nullptr, 0x20u);
 	EXPECT_EQ(dcb.dw, (std::array<uint32_t, 14> {0xc00c3f00u, 0x301u, 0u, 0u, 0u, 0u, 0u, 0u,
 	                                             0x34567898u, 0x12u, 0x10000010u, 0u, 0u, 0u}));
+}
+
+TEST(Agc, SetShRegistersDirectSizeCoversOnePacketPerRegister) {
+	EXPECT_EQ(Agc::AgcCbSetShRegistersDirectGetSize(0), 0u);
+	EXPECT_EQ(Agc::AgcCbSetShRegistersDirectGetSize(1), 12u);
+	EXPECT_EQ(Agc::AgcCbSetShRegistersDirectGetSize(4), 48u);
+	EXPECT_EQ(Agc::AgcCbSetShRegistersDirectGetSize(0x15555555u), 0xfffffffcu);
+
+	// No two offsets are adjacent, so every register needs its own three-dword packet.
+	const std::array<ShaderRegister, 4> scattered {
+	    {{0x12u, 1u}, {0x11u, 2u}, {0x20u, 3u}, {0xffffu, 4u}}};
+	Packet<12> packet;
+	ASSERT_EQ(Agc::AgcCbSetShRegistersDirect(packet.Buf(), scattered.data(), scattered.size()),
+	          packet.dw.data());
+	EXPECT_EQ(packet.layout.cursor_up - packet.dw.data(), 12);
+}
+
+TEST(Agc, SetShRegistersDirectSizeCoversMergedRanges) {
+	// Adjacent offsets share one packet and use less than the queried upper bound.
+	const std::array<ShaderRegister, 4> adjacent {
+	    {{0x10u, 5u}, {0x11u, 6u}, {0x12u, 7u}, {0x13u, 8u}}};
+	Packet<12> packet;
+	ASSERT_EQ(Agc::AgcCbSetShRegistersDirect(packet.Buf(), adjacent.data(), adjacent.size()),
+	          packet.dw.data());
+	EXPECT_EQ(packet.layout.cursor_up - packet.dw.data(), 6);
+	EXPECT_EQ((std::array {packet.dw[0], packet.dw[1]}),
+	          (std::array<uint32_t, 2> {0xc0047600u, 0x10u}));
+}
+
+TEST(Agc, SetShRegistersDirectSizeResolvesItsNid) {
+	Loader::SymbolDatabase symbols;
+	Libs::InitAgcDriver_1(&symbols);
+	const auto* func = symbols.FindByNid("yUBESvCCJ4I", Loader::SymbolType::Func);
+	ASSERT_NE(func, nullptr);
+	EXPECT_EQ(func->vaddr,
+	          reinterpret_cast<uint64_t>(&Agc::AgcCbSetShRegistersDirectGetSize));
+}
+
+TEST(AgcDeathTest, SetShRegistersDirectSizeRejectsOverflow) {
+	EXPECT_DEATH(Agc::AgcCbSetShRegistersDirectGetSize(0x15555556u), "");
 }
 
 TEST(Agc, DebugRaiseExceptionFails) {

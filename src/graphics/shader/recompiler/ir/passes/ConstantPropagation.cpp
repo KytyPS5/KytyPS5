@@ -22,6 +22,18 @@ void Replace(Inst& inst, Value value) {
 	inst.ReplaceUsesWith(value.Resolve());
 }
 
+bool AncillaryRetainedOnly(const Inst& inst) {
+	return std::ranges::all_of(inst.Uses(), [](const Use& use) {
+		const auto& user = *use.user;
+		if (!user.HasUses() && !user.MayHaveSideEffects()) {
+			return true;
+		}
+		return user.GetOpcode() == ValueOpcode::Phi ||
+		       (user.GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2u) ||
+		       (user.GetOpcode() == ValueOpcode::Identity && AncillaryRetainedOnly(user));
+	});
+}
+
 bool HasOneUse(const Inst& inst) {
 	// Replacement aliases preserve external Values but emit no additional operation.
 	return std::ranges::count_if(inst.Uses(), [](const Use& use) {
@@ -1065,15 +1077,7 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		normalized = false;
 		for (auto* source: worklist.lowered_ancillary) {
 			if (source->GetOpcode() == ValueOpcode::Identity) continue;
-			const bool retained_only = std::ranges::all_of(source->Uses(), [](const Use& use) {
-				const auto& user = *use.user;
-				if (!user.HasUses() && !user.MayHaveSideEffects()) {
-					return true;
-				}
-				return user.GetOpcode() == ValueOpcode::Phi ||
-				       (user.GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2u);
-			});
-			if (retained_only) {
+			if (AncillaryRetainedOnly(*source)) {
 				worklist.QueueUsers(source->Uses());
 				Replace(*source, Value(0u));
 				normalized = true;

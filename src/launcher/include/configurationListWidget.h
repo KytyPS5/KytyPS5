@@ -51,6 +51,7 @@ signals:
 	void Run(const QString& activity = {});
 	void Select();
 	void PreviewControllerColor(const QString& color);
+	void CopyLaunchCommand();
 
 protected:
 	void changeEvent(QEvent* event) override;

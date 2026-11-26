@@ -1003,6 +1003,15 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	    hw.GetBlendControl(0).enable || state.ps_input_info.ps_pixel_kill_enable ||
 	    state.ps_input_info.ps_depth_export_enable ||
 	    state.ps_input_info.ps_sample_mask_export_enable);
+	// In place: the guest converts its depth buffer into a color view of the same memory. Finding
+	// the color image replaces the depth image with a copy of its data, which is the whole copy.
+	if (color.desc.info.data.address == depth.desc.info.data.address) {
+		auto& cache                     = m_context.GetTextureCache();
+		color.desc.view_info.base_level = color.guest_mip_level;
+		color.desc.view_info.base_layer = color.guest_array_layer;
+		color.image_id                  = cache.FindImage(color.desc);
+		return true;
+	}
 	vk::ImageAspectFlags feedback;
 	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
 	if (depth.load_clear_aspects) {

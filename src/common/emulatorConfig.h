@@ -35,7 +35,7 @@ using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
-constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
+constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 30;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
 constexpr int32_t DEFAULT_USER_ID           = 1000;
 

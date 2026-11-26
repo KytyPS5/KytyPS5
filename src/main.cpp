@@ -65,7 +65,8 @@ static void PrintUsage() {
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
-	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
+	::printf("  --console-language <0-%u>            Console language. Default: 1 (English US).\n",
+	         Config::MAX_CONSOLE_LANGUAGE);
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
 	::printf("  --emulate-psn                        Simulate PSN sign-in for compatibility.\n");

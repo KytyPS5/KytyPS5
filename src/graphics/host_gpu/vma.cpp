@@ -70,10 +70,12 @@ void GraphicContext::LogMemoryBudget() const {
 	vmaGetHeapBudgets(allocator, budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
 		LOGF("VMA heap %u: usage=%" PRIu64 ", budget=%" PRIu64 ", allocation=%" PRIu64
-		     ", blocks=%" PRIu64 "\n",
+		     ", blocks=%" PRIu64 ", device_local=%s\n",
 		     i, static_cast<uint64_t>(budgets[i].usage), static_cast<uint64_t>(budgets[i].budget),
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
-		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
+		     static_cast<uint64_t>(budgets[i].statistics.blockBytes),
+		     (properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) ? "true"
+		                                                                              : "false");
 	}
 }
 

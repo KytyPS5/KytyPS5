@@ -25,6 +25,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -992,6 +993,13 @@ void WindowContext::CreateVulkan() {
 	}
 
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
+	const auto& memory = graphic_ctx.physical_device_memory_properties;
+	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+		LOGF("Vulkan memory heap %u: size=%" PRIu64 " device_local=%s\n", heap,
+		     static_cast<uint64_t>(memory.memoryHeaps[heap].size),
+		     (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) ? "true"
+		                                                                             : "false");
+	}
 	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
 	    .format = vk::Format::eBc1RgbaUnormBlock,
 	    .type = vk::ImageType::e2D,

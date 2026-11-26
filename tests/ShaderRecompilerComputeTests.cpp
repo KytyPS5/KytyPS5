@@ -36255,7 +36255,7 @@ TestCase VectorVopcCmpxNgtF16CapturedSdwaExecMask() {
   return test;
 }
 
-TestCase VectorVopcCmpxNleF16CapturedSdwaExecMask() {
+TestCase VectorVopcCmpNleF16CapturedSdwa(bool cmpx) {
   using O = ShaderOpcode;
   struct CompareCase { u32 value, expected, exec = 1; bool vop3 = false; };
   const std::array<CompareCase, 10> cases{{
@@ -36268,21 +36268,25 @@ TestCase VectorVopcCmpxNleF16CapturedSdwaExecMask() {
   }};
   constexpr u32 sentinel = 0x89abcdefu;
   TestCase test;
-  test.name = "VectorVopcCmpxNleF16CapturedSdwaExecMask";
-  for (const auto &entry : cases) test.initial.push_back(entry.value);
+  test.name = cmpx ? "VectorVopcCmpxNleF16CapturedSdwaExecMask" : "VectorVopcCmpNleF16CapturedSdwaVcc";
+  for (const auto &entry : cases)
+    test.initial.push_back(cmpx || entry.vop3 ? entry.value : std::rotl(entry.value, 16));
   test.expected = test.initial;
   auto &code = test.code;
   for (u32 i = 0; i < cases.size(); ++i) {
     const auto &entry = cases[i];
     AppendVMovU32(&code, 30, i * 4u);
-    AppendBufferLoadDword(&code, 5, 30);
+    const u32 source = cmpx ? 5u : 15u;
+    AppendBufferLoadDword(&code, source, 30);
     AppendSMovLiteral(&code, 106, sentinel);
     AppendSMovLiteral(&code, 107, sentinel);
     code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
     if (entry.vop3) {
-      AppendVop3(&code, 0xfc, 106, Vgpr(5), InlineU32(0), 0, 0, 0, false, 0, 1);
-    } else {
+      AppendVop3(&code, cmpx ? 0xfc : 0xec, 106, Vgpr(source), InlineU32(0), 0, 0, 0, false, 0, 1);
+    } else if (cmpx) {
       code.insert(code.end(), {0x7df900f9u, 0x86050005u});
+    } else {
+      code.insert(code.end(), {0x7dd900f9u, 0x8606000fu}); // v_cmp_nle_f16_sdwa vcc_lo, v15, 0
     }
     code.push_back(EncodeSMovB32(8, 126));
     code.push_back(EncodeSMovB32(126, InlineU32(1)));
@@ -36290,13 +36294,18 @@ TestCase VectorVopcCmpxNleF16CapturedSdwaExecMask() {
     code.push_back(EncodeVop1(0x01, 0, 8));
     AppendStoreVgpr(&code, 0, out);
     AppendStoreSgprPair(&code, 106, out + 1u);
-    test.expected.insert(test.expected.end(), {entry.expected, sentinel, sentinel});
+    test.expected.insert(test.expected.end(), {cmpx ? entry.expected : entry.exec,
+                                               cmpx ? sentinel : entry.expected, sentinel});
   }
   AppendEnd(&code);
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
-                  O::V_CMPX_NLE_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.decoded_counts = {{"V_CMPX_NLE_F16", cases.size()}};
+                  cmpx ? O::V_CMPX_NLE_F16 : O::V_CMP_NLE_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{cmpx ? "V_CMPX_NLE_F16" : "V_CMP_NLE_F16", cases.size()}};
   test.required_spirv = {"OpFUnordGreaterThan"};
+  if (!cmpx) {
+    test.compute_info.wave_size = 32; // VCC_HI remains available as a saved mask.
+    test.has_compute_info = true;
+  }
   return test;
 }
 
@@ -50522,7 +50531,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpUF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
-  AddCase(VectorVopcCmpxNleF16CapturedSdwaExecMask);
+  AddCase([] { return VectorVopcCmpNleF16CapturedSdwa(false); });
+  AddCase([] { return VectorVopcCmpNleF16CapturedSdwa(true); });
   for (u32 mode = 0; mode < 4; ++mode) {
     cases.push_back(VectorVopcCmpxNgeF16SgprSdwaExecMask(mode));
   }
@@ -58423,7 +58433,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpNgtF16CapturedSdwaAndEdges());
     RunCase(&vulkan, VectorVopcCmpxNgtF16CapturedSdwaExecMask());
-    RunCase(&vulkan, VectorVopcCmpxNleF16CapturedSdwaExecMask());
+    for (bool cmpx : {false, true}) RunCase(&vulkan, VectorVopcCmpNleF16CapturedSdwa(cmpx));
     for (u32 mode = 0; mode < 4; ++mode) {
       RunCase(&vulkan, VectorVopcCmpxNgeF16SgprSdwaExecMask(mode));
     }

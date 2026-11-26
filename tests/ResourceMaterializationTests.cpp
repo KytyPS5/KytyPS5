@@ -1321,7 +1321,7 @@ void TestSignedStorageSpecialization() {
               !MaterializeResources(plan, runtime, snapshot, specialization),
           "signed raw storage view accepted a non-atomic read/write image");
     image.atomic = true;
-    Check((RawSignedStorageFormat(image, format) != F::kInvalid) == (format == F::k32SInt) &&
+    Check(RawSignedStorageFormat(image, format) == F::kInvalid &&
               MaterializeResources(plan, runtime, snapshot, specialization) == (format == F::k32SInt),
           "signed storage conversion changed atomic format eligibility");
     image.atomic64 = true;

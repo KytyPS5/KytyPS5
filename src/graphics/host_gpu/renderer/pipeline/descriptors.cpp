@@ -306,15 +306,11 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    ShaderRecompiler::IR::RawSignedStorageFormat(resource, format) != Prospero::BufferFormat::kInvalid;
 	const auto numeric_class =
 	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
-	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
-	                              resource.atomic && !resource.atomic64;
-	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
-	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
-	     numeric_class != Prospero::TextureNumericClass::Sint &&
-	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
-	     (!resource.atomic || format == (resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
-	                                                       : Prospero::BufferFormat::k32UInt)));
+	const bool format_ok = resource.atomic
+	    ? ShaderRecompiler::IR::IsSupportedAtomicImageFormat(format, resource.atomic64)
+	    : raw_sint_storage || (numeric_class != Prospero::TextureNumericClass::Unsupported &&
+	                           numeric_class != Prospero::TextureNumericClass::Sint &&
+	                           uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}

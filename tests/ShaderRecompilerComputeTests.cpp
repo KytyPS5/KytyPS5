@@ -25526,9 +25526,11 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         vk::Format::eUndefined, test.sampled_image_view_base_mip);
   }
   if (needs_storage_image) {
-    const bool atomic64 = std::ranges::any_of(
-        compiled.program.info.images,
-        [](const auto &image) { return image.atomic64; });
+    const auto &images = compiled.program.info.images;
+    const auto wide = std::ranges::find_if(images, [](const auto &image) { return image.atomic64; });
+    const bool atomic64 = wide != images.end();
+    const auto backing = atomic64 ? VulkanFormat(DecodeNativeDescriptor<ShaderTextureResource>(
+        compiled.resources.images[wide - images.begin()]).Format()) : vk::Format::eR32Uint;
     storage_image = vulkan->CreateImage2D(
         test.name, test.image_width, test.image_height,
         test.storage_image_format, vk::ImageUsageFlagBits::eStorage,
@@ -25536,7 +25538,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         vk::ImageLayout::eGeneral);
     storage_image_uint = vulkan->CreateImage2D(
         test.name, test.image_width, test.image_height,
-        atomic64 ? vk::Format::eR32G32Uint : vk::Format::eR32Uint,
+        backing,
         vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui, atomic64 ? 2 : 1,
         vk::ImageLayout::eGeneral,
         atomic64 ? vk::Format::eR64Uint : vk::Format::eR32Uint);
@@ -49140,7 +49142,7 @@ template <bool signed_format = false> TestCase ImageAtomicVariants() {
 }
 
 // Input and old texel cover high-DWORD ordering, carry/wrap, the unsigned sign
-// boundary, and equal-high-DWORD ordering through the RG32_UINT -> R64_UINT view.
+// boundary, and equal-high-DWORD ordering through a raw R64_UINT view of a two-channel image.
 constexpr uint64_t ImageAtomicInputs[][2] = {
     {0x0000000100000001ull, 0x00000000ffffffffull},
     {0x00000000ffffffffull, 0x0000000100000001ull},
@@ -49157,6 +49159,7 @@ struct ImageAtomicIntegerCase {
   const char *spirv;
   uint64_t expected64[std::size(ImageAtomicInputs)];
   u32 expected32[std::size(ImageAtomicInputs)];
+  Prospero::BufferFormat wide_format = Prospero::BufferFormat::k32_32UInt;
 };
 
 constexpr ImageAtomicIntegerCase ImageAtomicIntegerCases[] = {
@@ -49174,12 +49177,12 @@ constexpr ImageAtomicIntegerCase ImageAtomicIntegerCases[] = {
      "ImageAtomicUMin32GlcAndExec", "ImageAtomicUMin64GlcAndExec", "OpAtomicUMin",
      {0x00000000ffffffffull, 0x00000000ffffffffull, 0x7fffffffffffffffull,
       0x1234567800000001ull, 0x8000000000000000ull},
-     {0x00000001u, 0x00000001u, 0x00000000u, 0x00000001u, 0x00000000u}},
+     {0x00000001u, 0x00000001u, 0x00000000u, 0x00000001u, 0x00000000u}, Prospero::BufferFormat::k32_32SInt},
     {0x17u, ShaderOpcode::IMAGE_ATOMIC_UMAX,
      "ImageAtomicUMax32GlcAndExec", "ImageAtomicUMax64GlcAndExec", "OpAtomicUMax",
      {0x0000000100000001ull, 0x0000000100000001ull, 0x8000000000000000ull,
       0x12345678ffffffffull, 0xffffffffffffffffull},
-     {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu}},
+     {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu}, Prospero::BufferFormat::k32_32Float},
     {0x18u, ShaderOpcode::IMAGE_ATOMIC_AND,
      "ImageAtomicAnd32GlcAndExec", "ImageAtomicAnd64GlcAndExec", "OpAtomicAnd",
      {0x0000000000000001ull, 0x0000000000000001ull, 0x0000000000000000ull,
@@ -49201,8 +49204,7 @@ TestCase ImageAtomicIntegerGlcAndExec(const ImageAtomicIntegerCase &atomic, bool
   const u32 texel_dwords = wide ? 2 : 1;
   TestCase test;
   test.name = wide ? atomic.name64 : atomic.name32;
-  test.user_data = MakeStorageTextureData(wide ? Prospero::BufferFormat::k32_32UInt
-                                              : Prospero::BufferFormat::k32UInt);
+  test.user_data = MakeStorageTextureData(wide ? atomic.wide_format : Prospero::BufferFormat::k32UInt);
   test.has_user_data = true;
   test.storage_image_r32ui.assign(16 * texel_dwords, 0);
   test.expected_storage_image_r32ui = test.storage_image_r32ui;

@@ -168,13 +168,20 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
+[[nodiscard]] constexpr bool IsSupportedAtomicImageFormat(Prospero::BufferFormat format, bool wide) {
+	using F = Prospero::BufferFormat;
+	// An atomic treats one or two 32-bit channels as a single word regardless of their numeric type.
+	return wide ? format >= F::k32_32UInt && format <= F::k32_32Float
+	            : format >= F::k32UInt && format <= F::k32Float;
+}
+
 [[nodiscard]] constexpr Prospero::BufferFormat
 RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
-	if (image.resource_class != ImageResourceClass::Storage || !image.written)
+	if (image.resource_class != ImageResourceClass::Storage || !image.written || image.read || image.atomic)
 		return Prospero::BufferFormat::kInvalid;
-	if (format == Prospero::BufferFormat::k32SInt && (image.atomic ? !image.atomic64 : !image.read))
+	if (format == Prospero::BufferFormat::k32SInt)
 		return Prospero::BufferFormat::k32UInt;
-	if (format == Prospero::BufferFormat::k16SInt && !image.read && !image.atomic)
+	if (format == Prospero::BufferFormat::k16SInt)
 		return Prospero::BufferFormat::k16UInt;
 	return Prospero::BufferFormat::kInvalid;
 }

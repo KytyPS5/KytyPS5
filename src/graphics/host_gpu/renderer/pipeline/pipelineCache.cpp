@@ -242,6 +242,9 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 	                                               program.specialization, push_data);
 	auto info = std::move(result.program).TakeCompiledInfo();
+	if (const auto* workgroup = ShaderWorkgroupInput(key.stage, options.input_info)) {
+		info.subgroup_size = std::min(info.wave_size, workgroup->host_subgroup_size);
+	}
 
 	// The same inputs give the same module id across runs.
 	const auto function_code = program.FunctionCode();
@@ -810,10 +813,16 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
+	const auto& limits            = m_graphics.GetPhysicalDeviceProperties().limits;
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, input_info);
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	const auto        threads =
+	    input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2];
+	if (input_info.wave_size == 64u && threads > limits.maxComputeWorkGroupInvocations &&
+	    m_graphics.compute_subgroup_size_control_enabled && m_graphics.min_subgroup_size <= 32u) {
+		input_info.host_subgroup_size = 32u;
+	}
+	input_info.lds_storage = input_info.lds_size_dwords * 4u > limits.maxComputeSharedMemorySize;
 	ShaderRecompiler::IR::PushData::Window push_data;
 	const auto* module = GetProgram(params, input_info, push_data);
 	// HW_ID2 reads are translated with the graphics compute queue's values.

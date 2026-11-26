@@ -428,10 +428,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
 	comp_shader_stage_info.module = module.module;
 	comp_shader_stage_info.pName  = "main";
-	const auto wave_size = module.info.wave_size;
+	const auto subgroup_size      = module.info.subgroup_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+	    subgroup_size >= graphics.min_subgroup_size &&
+	    subgroup_size <= graphics.max_subgroup_size) {
+		comp_subgroup_size.requiredSubgroupSize = subgroup_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 

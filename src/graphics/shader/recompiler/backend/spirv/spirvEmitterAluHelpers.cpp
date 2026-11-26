@@ -95,19 +95,15 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 
 static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, uint32_t lhs_bits,
                               uint32_t rhs_bits, bool max_value) {
-	// PS5 V_MIN/V_MAX_F32 return the other source for a NaN source (S0 when both are NaN)
-	// and order -0 below +0. An ordered compare takes S1 for a NaN S0 and, unlike NMin/NMax,
-	// always returns the exact bits of one source.
-	const auto either    = EmitOrU32(state, lhs_bits, rhs_bits);
-	const auto both_zero = EmitCompareU32Constant(state, spv::OpIEqual,
-	                                              EmitAndConstant(state, either, 0x7fffffffu), 0);
-	const auto zero =
-	    EmitBitcastU32ToF32(state, max_value ? EmitAndU32(state, lhs_bits, rhs_bits) : either);
+	const auto both_negative =
+	    EmitCompareU32Constant(state, spv::OpSLessThan, EmitAndU32(state, lhs_bits, rhs_bits), 0);
+	const auto less = Binary(state, spv::OpSLessThan, TypeBool(state),
+	                         max_value ? rhs_bits : lhs_bits, max_value ? lhs_bits : rhs_bits);
 	const auto keep_lhs =
-	    Binary(state, max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
-		       TypeBool(state), lhs, rhs);
+	    Binary(state, spv::OpLogicalNotEqual, TypeBool(state), less, both_negative);
 	const auto ordered = Select(state, TypeF32(state), keep_lhs, lhs, rhs);
-	const auto numeric = Select(state, TypeF32(state), both_zero, zero, ordered);
+	const auto numeric = Select(state, TypeF32(state),
+	                            Unary(state, spv::OpIsNan, TypeBool(state), lhs), rhs, ordered);
 	return Select(state, TypeF32(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs), lhs,
 	              numeric);
 }
@@ -123,6 +119,28 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	                     EmitBitcastF32ToU32(state, rhs), max_value);
 }
 
+static constexpr uint32_t OrderKeyBiasF32 = 0x7fffffu;
+static constexpr uint32_t InfinityKeyF32  = 0x7f800000u - OrderKeyBiasF32;
+
+static uint32_t EmitOrderKeyF32(EmitterState& state, uint32_t value) {
+	const auto bits = EmitBitcastF32ToU32(state, value);
+	const auto sign =
+	    Binary(state, spv::OpShiftRightArithmetic, TypeU32(state), bits, ConstantU32(state, 31));
+	const auto magnitude_flip =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), sign, ConstantU32(state, 1));
+	return Binary(state, spv::OpISub, TypeU32(state),
+	              Binary(state, spv::OpBitwiseXor, TypeU32(state), bits, magnitude_flip),
+	              ConstantU32(state, OrderKeyBiasF32));
+}
+
+static uint32_t EmitSignedMinMaxU32(EmitterState& state, uint32_t lhs, uint32_t rhs,
+                                    bool max_value) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), result, GlslStd450(state),
+	                          max_value ? GLSLstd450SMax : GLSLstd450SMin, lhs, rhs);
+	return result;
+}
+
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	if (state.profile.relaxed_float) {
 		// The smallest pairwise maximum; a NaN source gives the minimum of the other two.
@@ -131,23 +149,34 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 		const auto ac = EmitMinMaxF32Value(state, a, c, true);
 		return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, ab, bc, false), ac, false);
 	}
-	// The median with -0 ordered below +0; a NaN source gives MIN3 in source order.
-	const auto a_bits = EmitBitcastF32ToU32(state, a);
-	const auto b_bits = EmitBitcastF32ToU32(state, b);
-	const auto c_bits = EmitBitcastF32ToU32(state, c);
-	const auto min_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, false);
-	const auto min3 =
-	    EmitMinMaxF32(state, min_ab, c, EmitBitcastF32ToU32(state, min_ab), c_bits, false);
-	const auto max_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, true);
-	const auto capped_max =
-	    EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, false);
-	const auto median = EmitMinMaxF32Value(state, min_ab, capped_max, true);
-	const auto is_nan = [&](uint32_t value) {
-		return Unary(state, spv::OpIsNan, TypeBool(state), value);
+	const auto below = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpSLessThan, TypeBool(state), lhs, rhs);
 	};
-	const auto any_nan =
-	    EmitLogicalOrBool(state, EmitLogicalOrBool(state, is_nan(a), is_nan(b)), is_nan(c));
-	return Select(state, TypeF32(state), any_nan, min3, median);
+	const auto same = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpLogicalEqual, TypeBool(state), lhs, rhs);
+	};
+	const auto pick = [&](uint32_t condition, uint32_t lhs, uint32_t rhs) {
+		return Select(state, TypeF32(state), condition, lhs, rhs);
+	};
+	const auto nan_key   = ConstantU32(state, InfinityKeyF32 + 1u);
+	const auto below_min = [&](uint32_t key, uint32_t other_key) {
+		return below(key, EmitSignedMinMaxU32(state, other_key, nan_key, false));
+	};
+	const auto a_key      = EmitOrderKeyF32(state, a);
+	const auto b_key      = EmitOrderKeyF32(state, b);
+	const auto c_key      = EmitOrderKeyF32(state, c);
+	const auto take_b     = below_min(b_key, a_key);
+	const auto min_ab     = pick(take_b, b, a);
+	const auto min_ab_key = Select(state, TypeU32(state), take_b, b_key, a_key);
+	const auto min3       = pick(below_min(c_key, min_ab_key), c, min_ab);
+	const auto max_key =
+	    EmitSignedMinMaxU32(state, EmitSignedMinMaxU32(state, a_key, b_key, true), c_key, true);
+	const auto any_nan   = Binary(state, spv::OpSGreaterThan, TypeBool(state), max_key,
+	                              ConstantU32(state, InfinityKeyF32));
+	const auto a_below_b = below(a_key, b_key);
+	const auto median    = pick(same(a_below_b, below(b_key, c_key)), b,
+	                            pick(same(a_below_b, below(a_key, c_key)), c, a));
+	return pick(any_nan, min3, median);
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {

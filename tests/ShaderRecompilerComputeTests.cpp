@@ -33058,23 +33058,21 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
 // MIN/MAX/MIN3/MAX3 on runtime inputs, so no compiler can fold them. The expected bits follow
 // the emulated rules: a NaN operand yields the other (S0 for two NaNs) and signed zeros are
 // ordered.
-// Denormal operands are left out; their expected results are not pinned down here.
 TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
   using O = ShaderOpcode;
   const auto nan = [](u32 v) { return (v & 0x7fffffffu) > 0x7f800000u; };
-  const auto zero = [](u32 v) { return (v & 0x7fffffffu) == 0u; };
-  const auto value = [](u32 v) { return std::bit_cast<float>(v); };
+  const auto order = [](u32 v) {
+    return (v & 0x80000000u) != 0u ? ~v : v | 0x80000000u;
+  };
   const auto min2 = [&](u32 a, u32 b) {
     if (nan(b)) return a;
     if (nan(a)) return b;
-    if (zero(a) && zero(b)) return a | b;
-    return value(a) < value(b) ? a : b;
+    return order(a) < order(b) ? a : b;
   };
   const auto max2 = [&](u32 a, u32 b) {
     if (nan(b)) return a;
     if (nan(a)) return b;
-    if (zero(a) && zero(b)) return a & b;
-    return value(a) >= value(b) ? a : b;
+    return order(a) >= order(b) ? a : b;
   };
   constexpr u32 cases[][3] = {
       {0x40000000u, 0x40400000u, 0x3f800000u}, {0x7fc00000u, 0x40000000u, 0xbf800000u},
@@ -33083,7 +33081,10 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
       {0x00000000u, 0x80000000u, 0x00000000u}, {0x80000000u, 0x80000000u, 0x00000000u},
       {0xff800000u, 0x7f800000u, 0x00000000u}, {0x7fc00000u, 0x00000000u, 0x80000000u},
       {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u},
-      {0x7fc01234u, 0xffc05678u, 0x7fa00001u}, {0xffc05678u, 0x7fc01234u, 0x3f800000u}};
+      {0x7fc01234u, 0xffc05678u, 0x7fa00001u}, {0xffc05678u, 0x7fc01234u, 0x3f800000u},
+      {0x00000000u, 0x00000001u, 0x80000001u}, {0x00000001u, 0x00000002u, 0x80000000u},
+      {0x80000001u, 0x80000002u, 0x00000001u}, {0x80000001u, 0x80000000u, 0x00000000u},
+      {0xff800001u, 0xff800000u, 0x7f7fffffu}, {0x7fa00001u, 0x00000001u, 0x80000001u}};
   TestCase test;
   test.name = "VectorMinMaxF32RuntimeEdges";
   test.has_compute_info = true;
@@ -33143,7 +33144,14 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
       {0x00000001u, 0x7f800000u, 0x7fc01234u, 0x00000001u},
       {0x80000001u, 0x80000001u, 0x00000000u, 0x80000001u},
       {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0x7fc01234u},
-      {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u}};
+      {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u},
+      {0x00000000u, 0x00000002u, 0x00000001u, 0x00000001u},
+      {0x80000003u, 0x80000001u, 0x80000002u, 0x80000002u},
+      {0x7f800001u, 0x7fc00000u, 0xffc05678u, 0x7f800001u},
+      {0xff800000u, 0x80000001u, 0x00000000u, 0x80000001u},
+      {0xffc05678u, 0x3f800000u, 0x40000000u, 0x3f800000u},
+      {0xff800001u, 0x40000000u, 0x3f800000u, 0x3f800000u},
+      {0x7fc01234u, 0x00000000u, 0x80000000u, 0x80000000u}};
   TestCase test;
   test.name = "VectorMed3F32NanUsesMin3Path";
   test.has_compute_info = true;
@@ -33168,8 +33176,7 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 13,727/32,230 words; keep min/max expansion growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 13737u : 32245u;
+  test.max_spirv_words = wave == 32u ? 14271u : 34793u;
   return test;
 }
 
@@ -58175,6 +58182,12 @@ int main(int argc, char **argv) {
         RunCase(&vulkan, test);
       }
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--float-med3-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMed3F32NanUsesMin3Path(32));
+    RunCase(&vulkan, VectorMed3F32NanUsesMin3Path(64));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {

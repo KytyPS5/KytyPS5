@@ -616,6 +616,8 @@ PThreadContext*             g_pthread_context        = nullptr;
 thread_local uintptr_t      g_guest_entry_return_rsp = 0;
 static std::atomic<int32_t> g_pthread_thread_id      = 0;
 
+static thread_local bool g_thread_destructors_started = false;
+
 static Common::Mutex g_guest_stack_mutex;
 static uint64_t      g_guest_stack_last = 0;
 struct CachedGuestStack {
@@ -3129,9 +3131,10 @@ int PthreadGetCurrentPriorityForKernel() {
 	return PthreadGetPriorityForKernel(g_pthread_self);
 }
 
-static void CleanupThread(void* arg) {
-	auto* thread = static_cast<Pthread>(arg);
-
+static void RunThreadDestructors() {
+	if (std::exchange(g_thread_destructors_started, true)) {
+		return;
+	}
 	LibcInternalExt::RunThreadAtexitDestructors();
 
 	auto thread_dtors = g_pthread_context->GetThreadDtors();
@@ -3141,6 +3144,12 @@ static void CleanupThread(void* arg) {
 	}
 
 	DestructPthreadSpecific();
+}
+
+static void CleanupThread(void* arg) {
+	auto* thread = static_cast<Pthread>(arg);
+
+	RunThreadDestructors();
 
 	// Guest signal handlers stop here: they would run on freed TLS.
 	{
@@ -3166,6 +3175,7 @@ static void* RunThread(void* arg) {
 
 	Loader::RuntimeLinker::CreateThreadTls();
 	g_pthread_self = thread;
+	g_thread_destructors_started = false;
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3522,6 +3532,8 @@ void KYTY_SYSV_ABI PthreadTestcancel() {
 
 void KYTY_SYSV_ABI PthreadExit(void* value) {
 	PRINT_NAME();
+
+	Fiber::FiberExitThread(value, RunThreadDestructors);
 
 #if defined(__x86_64__) || defined(_M_X64)
 	if (g_guest_entry_return_rsp != 0) {

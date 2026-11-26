@@ -701,15 +701,16 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
-void TestCompleteWaveReduction() {
+void TestCompleteWaveReduction(bool butterfly) {
   enum class Case {
     Masked, ScalarExec, Wave32, Wave32Rows, Wave32Maximum, RowMask, BankMask,
     Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
     Endpoint, EndpointSource, CrossBlock, WrongOperation, MixedJoin, MixedRows,
-    Or, Add, SignedMin, SignedMax, And, Xor
+    Or, Add, SignedMin, SignedMax, And, Xor, SameHalf, DynamicEndpoint, Wave32SameRow
   };
+  const uint32_t row_control = butterfly ? 0x160u : 0x110u;
   for (const auto test : {Case::Masked, Case::ScalarExec, Case::Wave32,
        Case::Wave32Rows, Case::Wave32Maximum, Case::RowMask, Case::BankMask,
        Case::Shift, Case::FetchInactive, Case::BoundControl, Case::Dpp8,
@@ -718,7 +719,8 @@ void TestCompleteWaveReduction() {
        Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
        Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
        Case::CrossBlock, Case::WrongOperation, Case::MixedJoin, Case::MixedRows,
-       Case::Or, Case::Add, Case::SignedMin, Case::SignedMax, Case::And, Case::Xor}) {
+       Case::Or, Case::Add, Case::SignedMin, Case::SignedMax, Case::And, Case::Xor,
+       Case::SameHalf, Case::DynamicEndpoint, Case::Wave32SameRow}) {
     Fixture fixture(test == Case::CrossBlock ? 2 : 1);
     const auto source = fixture.Emit(ValueOpcode::LaneId);
     const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
@@ -756,11 +758,11 @@ void TestCompleteWaveReduction() {
     auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
     Value preserved;
     for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
-      DppMoveFlags flags{.control = 0x110u + shift};
+      DppMoveFlags flags{.control = row_control + shift};
       if (shift == 2) {
         if (test == Case::RowMask) flags.row_mask = 7;
         if (test == Case::BankMask) flags.bank_mask = 7;
-        if (test == Case::Shift) flags.control = 0x113;
+        if (test == Case::Shift) flags.control = row_control + 3u;
         if (test == Case::FetchInactive) flags.fetch_inactive = true;
         if (test == Case::BoundControl) flags.bound_control = true;
         if (test == Case::Dpp8) flags.dpp8 = true;
@@ -792,14 +794,17 @@ void TestCompleteWaveReduction() {
     const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
     // Wave32 reads each half's row endpoint from the scan itself.
     const bool rows = test == Case::Wave32Rows || test == Case::ScalarExec ||
-                      test == Case::Wave32Maximum;
+                      test == Case::Wave32Maximum || test == Case::Wave32SameRow;
     const auto endpoints = rows ? prefix : final;
-    uint32_t low_lane = test == Case::Endpoint ? 30u : 31u;
-    if (rows) low_lane = 15u;
+    uint32_t low_lane = butterfly ? 5u : (rows ? 15u : 31u);
+    const uint32_t high_lane = butterfly ? (rows ? 24u : 56u) : (rows ? 31u : 63u);
+    if (test == Case::Endpoint) low_lane = 30u;
+    if (test == Case::SameHalf) low_lane = 32u;
+    if (test == Case::Wave32SameRow) low_lane = high_lane - 1u;
     const auto low = fixture.Emit(ValueOpcode::ReadLane,
-        {endpoints, Value(low_lane)}, 0, result_block);
+        {endpoints, test == Case::DynamicEndpoint ? source : Value(low_lane)}, 0, result_block);
     const auto high = fixture.Emit(ValueOpcode::ReadLane,
-        {test == Case::EndpointSource ? prefix : endpoints, Value(rows ? 31u : 63u)}, 0,
+        {test == Case::EndpointSource ? prefix : endpoints, Value(high_lane)}, 0,
         result_block);
     const auto result = fixture.Emit(last, {high, low}, 0, result_block);
     const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {result}, 0, result_block);
@@ -816,10 +821,12 @@ void TestCompleteWaveReduction() {
     ConstantPropagationPass(fixture.program.blocks, wave_size);
     const auto stats = EliminateReadLane(fixture.program, wave_size);
     // Each case that sets an operation other than UMin, except WrongOperation, matches.
-    const bool matches = test == Case::Masked || rows ||
-                         (operation != ValueOpcode::UMin32 && test != Case::WrongOperation);
+    const bool matches = test == Case::Masked || (rows && test != Case::Wave32SameRow) ||
+                         (operation != ValueOpcode::UMin32 && test != Case::WrongOperation) ||
+                         (butterfly && test == Case::Endpoint);
     Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
-          ("wave reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
+          ("wave reduction proof failed case " + std::to_string(static_cast<unsigned>(test)) +
+           (butterfly ? " row_xmask" : " row_shr")).c_str());
     if (matches) {
       const auto *reduction = use.Instruction()->Arg(0).ResolveInstruction();
       Check(reduction->GetOpcode() == ValueOpcode::SubgroupReduceU32 &&
@@ -999,7 +1006,8 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
-    TestCompleteWaveReduction();
+    TestCompleteWaveReduction(false);
+    TestCompleteWaveReduction(true);
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();

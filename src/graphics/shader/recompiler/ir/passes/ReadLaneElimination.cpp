@@ -112,18 +112,35 @@ public:
 		if (low == nullptr || high == nullptr || low->Arg(0).Resolve() != high->Arg(0).Resolve()) {
 			return {};
 		}
-		const auto lane = [&](Value value, uint32_t expected) {
+		const auto lane = [&](Value value) {
 			value = value.Resolve();
-			return value.IsImmediate() && value.GetType() == Type::U32 &&
-			       value.U32() % wave_size == expected;
+			return value.IsImmediate() && value.GetType() == Type::U32 ? value.U32() % wave_size
+			                                                           : wave_size;
 		};
-		const auto half = wave_size / 2u;
-		if (!((lane(low->Arg(1), half - 1u) && lane(high->Arg(1), wave_size - 1u)) ||
-		      (lane(low->Arg(1), wave_size - 1u) && lane(high->Arg(1), half - 1u)))) {
+		const auto first  = lane(low->Arg(1));
+		const auto second = lane(high->Arg(1));
+		const auto half   = wave_size / 2u;
+		if (first == wave_size || second == wave_size || (first < half) == (second < half)) {
 			return {};
 		}
-		if (wave_size == 32u) return MatchScan(low->Arg(0));
-		const auto* joined = Get(low->Arg(0), operation);
+		const bool endpoints =
+		    std::min(first, second) == half - 1u && std::max(first, second) == wave_size - 1u;
+		for (const uint32_t row_control: {RowShr, RowXmask}) {
+			if (row_control == RowShr && !endpoints) continue;
+			if (const auto seed = MatchHalf(low->Arg(0), row_control, wave_size); !seed.IsEmpty()) {
+				return seed;
+			}
+		}
+		return {};
+	}
+
+private:
+	static constexpr uint32_t RowShr   = 0x110u;
+	static constexpr uint32_t RowXmask = 0x160u;
+
+	Value MatchHalf(Value value, uint32_t row_control, uint32_t wave_size) const {
+		if (wave_size == 32u) return MatchScan(value, row_control);
+		const auto* joined = Get(value, operation);
 		if (joined == nullptr) return {};
 		for (size_t index = 0; index < 2; index++) {
 			const auto* cross = Get(joined->Arg(index), ValueOpcode::Permlane16U32);
@@ -136,16 +153,15 @@ public:
 			    cross->Arg(0).Resolve() != prefix) {
 				continue;
 			}
-			if (const auto seed = MatchScan(prefix); !seed.IsEmpty()) return seed;
+			if (const auto seed = MatchScan(prefix, row_control); !seed.IsEmpty()) return seed;
 		}
 		return {};
 	}
 
-private:
 	// The row scan's input.
-	Value MatchScan(Value prefix) const {
+	Value MatchScan(Value prefix, uint32_t row_control) const {
 		for (const uint32_t shift: {8u, 4u, 2u, 1u}) {
-			prefix = MatchRow(prefix, shift);
+			prefix = MatchRow(prefix, row_control + shift);
 		}
 		return prefix;
 	}
@@ -159,20 +175,20 @@ private:
 	// Constant propagation folds the x | ~x EXEC of s_orn2_saveexec to true.
 	static bool FullExec(Value predicate) { return predicate.Resolve() == Value(true); }
 
-	static bool IsRowShift(const Inst& inst, uint32_t shift) {
+	static bool IsRowStep(const Inst& inst, uint32_t control) {
 		const auto flags = inst.Flags<DppMoveFlags>();
-		return flags.control == 0x110u + shift && flags.row_mask == 0xf &&
-		       flags.bank_mask == 0xf && !flags.fetch_inactive && !flags.bound_control && !flags.dpp8;
+		return flags.control == control && flags.row_mask == 0xf && flags.bank_mask == 0xf &&
+		       !flags.fetch_inactive && !flags.bound_control && !flags.dpp8;
 	}
 
-	Value MatchRow(Value value, uint32_t shift) const {
+	Value MatchRow(Value value, uint32_t step) const {
 		const auto* update = Get(value, ValueOpcode::DppUpdateU32);
-		if (update == nullptr || !IsRowShift(*update, shift) || !FullExec(update->Arg(2))) return {};
+		if (update == nullptr || !IsRowStep(*update, step) || !FullExec(update->Arg(2))) return {};
 		const auto* combined = Get(update->Arg(0), operation);
 		if (combined == nullptr) return {};
 		for (size_t index = 0; index < 2; index++) {
 			const auto* move = Get(combined->Arg(index), ValueOpcode::DppMoveU32);
-			if (move == nullptr || !IsRowShift(*move, shift) || !FullExec(move->Arg(1))) continue;
+			if (move == nullptr || !IsRowStep(*move, step) || !FullExec(move->Arg(1))) continue;
 			const auto previous = combined->Arg(1 - index).Resolve();
 			if (move->Arg(0).Resolve() == previous && update->Arg(1).Resolve() == previous) {
 				return previous;

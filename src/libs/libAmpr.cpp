@@ -1502,11 +1502,30 @@ MeasureCommandSizeWriteAddressFromCounterPairOnCompletion(volatile uint64_t*, ui
 	return 0x20;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t, uint8_t, uint64_t,
-                                                                         uint8_t) {
-	PRINT_NAME();
+static int KYTY_SYSV_ABI MeasureCommandSizeWaitOnCounter(uint8_t, uint8_t access, uint64_t value,
+                                                         uint8_t compare, uint8_t mask_op,
+                                                         uint64_t mask, uint8_t flush) {
+	if (access > 7 || compare > 6 || mask_op > 1 || flush > 1) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	if (mask_op != 0) {
+		const auto operands = value | mask;
+		if (operands <= UINT16_MAX) return 8;
+		return operands <= UINT32_MAX ? 12 : 20;
+	}
+	if (access == 1 && value <= UINT8_MAX) return 4;
+	return value <= UINT32_MAX ? 8 : 12;
+}
 
-	return 0x20;
+static int KYTY_SYSV_ABI MeasureCommandSizeWriteCounter(uint8_t index, uint8_t access,
+                                                        uint64_t value, uint8_t operation, uint32_t) {
+	if (index >= 128 || access > 7 || operation > 4) return LibKernel::KERNEL_ERROR_EINVAL;
+	if (access == 1 && operation == 0 && static_cast<uint32_t>(value) < 0x1000u) return 4;
+	return access == 0 && value > UINT32_MAX ? 12 : 8;
+}
+
+static int KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t index, uint32_t value) {
+	return MeasureCommandSizeWriteCounter(index, 1, value, 0, 0);
 }
 
 static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeMap(uint64_t, uint64_t, int32_t, int32_t) {
@@ -1788,18 +1807,30 @@ static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void*              command_b
 	                           0x20);
 }
 
+static int AppendCounterRecord(void* command_buffer, CommandBufferState::CommandData command,
+                               uint32_t size, uint32_t header, uint32_t high_value) {
+	const uint32_t extra_words = size / sizeof(uint32_t) - 1u;
+	const uint32_t record[]    = {header | (extra_words << 8u), high_value};
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), std::move(command),
+	                           size, record);
+}
+
 static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_t index,
                                                     uint8_t access, uint64_t value, uint8_t compare,
-                                                    uint8_t mask_op, uint64_t, uint8_t flush) {
+                                                    uint8_t mask_op, uint64_t mask, uint8_t flush) {
 	PRINT_NAME();
 
-	if (command_buffer == nullptr || access > 7 || compare > 6 || mask_op > 1 || flush > 1) {
+	const int size = MeasureCommandSizeWaitOnCounter(index, access, value, compare, mask_op, mask, flush);
+	if (command_buffer == nullptr || size < 0) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 	EXIT_NOT_IMPLEMENTED(access != 1 || mask_op != 0 || flush != 0 || value > UINT32_MAX);
-	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer),
+	const auto operand = static_cast<uint32_t>(value);
+	const auto header  = (uint32_t {index} << 24u) | ((operand & 0xffu) << 16u) |
+	                     (uint32_t {compare} << 13u) | 2u;
+	return AppendCounterRecord(command_buffer,
 	                           CommandBufferState::WaitCommand {index, value, compare, true},
-	                           0x20);
+	                           size, header, operand >> 8u);
 }
 
 static int AppendWriteAddressCommand(void* command_buffer, volatile uint64_t* address,
@@ -1834,21 +1865,27 @@ static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t
                                                    uint8_t operation, uint32_t mode) {
 	PRINT_NAME();
 
-	if (command_buffer == nullptr || index >= 128 || access > 7 || operation > 4 || mode > 1) {
+	const int size = MeasureCommandSizeWriteCounter(index, access, value, operation, mode);
+	if (command_buffer == nullptr || size < 0 || mode > 1) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
+	uint32_t type;
+	if (!AprShared::ReadGuest(reinterpret_cast<uint64_t>(command_buffer) + COMMAND_BUFFER_TYPE_OFFSET,
+	                          &type)) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if ((type & APR_TYPE_MAP_ACTIVE) != 0) return LibKernel::KERNEL_ERROR_EPERM;
 	EXIT_NOT_IMPLEMENTED(access != 1 || operation != 0 || mode != 0);
-	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer),
-	                           CommandBufferState::WriteCounterCommand {
-	                               index, static_cast<uint32_t>(value)},
-	                           0x20);
+	const auto operand = static_cast<uint32_t>(value);
+	const auto header  = (uint32_t {index} << 24u) | ((operand & 0xfffu) << 12u) | 6u;
+	return AppendCounterRecord(command_buffer,
+	                           CommandBufferState::WriteCounterCommand {index, operand},
+	                           size, header, operand >> 12u);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t,
-                                                               uint8_t, uint64_t, uint8_t) {
-	PRINT_NAME();
-
-	return AppendNoOpCommand(command_buffer, 0x20);
+static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t index,
+                                                              uint32_t value) {
+	return CommandBufferWriteCounter(command_buffer, index, 1, value, 0, 0);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*              command_buffer,
@@ -2373,12 +2410,12 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("vxC58+DRk-U", Ampr::MeasureCommandSizeWriteAddressFromCounterPairOnCompletion);
 	LIB_FUNC("4muPEJ-x5N8", Ampr::MeasureCommandSizeWriteCounterOnCompletion);
 	LIB_FUNC("0BMj1hgG+kE", Ampr::MeasureCommandSizeFixed32);
-	LIB_FUNC("ClnsFLLLcss", Ampr::MeasureCommandSizeFixed32);
+	LIB_FUNC("ClnsFLLLcss", Ampr::MeasureCommandSizeWaitOnCounter);
 	LIB_FUNC("4fgtGfXDrFc", Ampr::MeasureCommandSizeWriteAddress);
 	LIB_FUNC("gAtc79UTt5E", Ampr::MeasureCommandSizeFixed32);
 	LIB_FUNC("JYd9g9L+TmE", Ampr::MeasureCommandSizeFixed32);
 	LIB_FUNC("2Hw8gjMdwSY", Ampr::MeasureCommandSizeFixed32);
-	LIB_FUNC("I-Qm+MEso5c", Ampr::MeasureCommandSizeFixed32);
+	LIB_FUNC("I-Qm+MEso5c", Ampr::MeasureCommandSizeWriteCounter);
 	LIB_FUNC("6hbai6KIXkk", Ampr::MeasureAmmCommandSizeMap);
 	LIB_FUNC("m+fYyX8oFqw", Ampr::MeasureAmmCommandSizeMapWithGpuMaskId);
 	LIB_FUNC("ZFDZoN9IbVU", Ampr::MeasureAmmCommandSizeMapDirect);

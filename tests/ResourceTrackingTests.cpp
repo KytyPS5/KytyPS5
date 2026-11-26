@@ -6826,18 +6826,24 @@ void TestGuardedWaterfallBufferRecords() {
     const auto root = std::ranges::find_if(plan.info.buffers, [&](const auto& buffer) {
       return plan.descriptor_sources[buffer.source].indirect_descriptor.has_value();
     });
-    Check(root != plan.info.buffers.end(), "waterfall buffer lost its indirect resource");
     const bool proven = guard == Guard::Exact || guard == Guard::Reversed || guard == Guard::Greater ||
         guard == Guard::Loop || guard == Guard::LoopReversed || guard == Guard::LoopEntries;
-    const auto& domain = *plan.descriptor_sources[root->source].indirect_descriptor;
-    Check(domain.key_count.IsEmpty() != proven && !domain.selector &&
-              domain.table_stride == 488u && domain.table_immediate == 216u,
-          "waterfall bound mixed different lanes, values or resource uses");
     const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
     if (!proven) {
-      Check(!materialize(), "unproved waterfall bypassed conservative descriptor rejection");
+      const auto& memory_info = fixture->program.memory_info;
+      Check(root == plan.info.buffers.end() &&
+                std::ranges::count(memory_info, ResourceKind::IndirectBuffer, &MemoryInfo::kind) == 2 &&
+                std::ranges::none_of(memory_info, &MemoryInfo::planning_only),
+            "unproved waterfall lost GPU-selected loads or their descriptor words");
+      memory.reads = 0;
+      Check(materialize() && memory.reads == 0u, "unproved waterfall probed unrelated record fields");
       continue;
     }
+    Check(root != plan.info.buffers.end(), "bounded waterfall buffer lost its indirect resource");
+    const auto& domain = *plan.descriptor_sources[root->source].indirect_descriptor;
+    Check(!domain.key_count.IsEmpty() && !domain.selector &&
+              domain.table_stride == 488u && domain.table_immediate == 216u,
+          "waterfall bound mixed different lanes, values or resource uses");
     for (const uint32_t count : {2u, 0u, 1u, 2u}) {
       user_data[2] = count;
       memory.reads = 0;

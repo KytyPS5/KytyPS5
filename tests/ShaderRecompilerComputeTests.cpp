@@ -14418,12 +14418,18 @@ public:
       }
       host_lds_limit = saved_lds_limit;
 
-      constexpr u32 group_threads = 16 * 16 * 6;
+      constexpr u32 group_width = 16;
+      constexpr u32 group_threads = group_width * 16 * 6;
+      constexpr u32 two_lane_threads = group_threads / 2u;
       const auto &device_limits = m_runtime_context.physical_device_properties.limits;
-      const bool group_fits = group_threads <= device_limits.maxComputeWorkGroupInvocations ||
-                              !m_runtime_context.SupportsComputeWave64() ||
-                              (m_runtime_context.compute_subgroup_size_control_enabled &&
-                               m_runtime_context.min_subgroup_size <= 32u);
+      const bool two_lane = !m_runtime_context.SupportsComputeWave64() ||
+                            (group_threads > device_limits.maxComputeWorkGroupInvocations &&
+                             m_runtime_context.compute_subgroup_size_control_enabled &&
+                             m_runtime_context.min_subgroup_size <= 32u);
+      const u32 host_threads = two_lane ? two_lane_threads : group_threads;
+      const u32 host_width = two_lane ? two_lane_threads : group_width;
+      const bool group_fits = host_threads <= device_limits.maxComputeWorkGroupInvocations &&
+                              host_width <= device_limits.maxComputeWorkGroupSize[0];
       if (!group_fits) {
         m_skipped_cases++;
       } else {
@@ -14445,7 +14451,7 @@ public:
              .code_size_bytes = static_cast<u32>(group_shader.size() * sizeof(u32))});
         cache.FillBuffer(lds_output, group_threads * sizeof(u32), sentinel, false);
         shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(group_shader.data()),
-                             .num_thread_x = 16, .num_thread_y = 16, .num_thread_z = 6,
+                             .num_thread_x = group_width, .num_thread_y = 16, .num_thread_z = 6,
                              .wave_size = 64, .user_sgpr = 4, .tidig_comp_cnt = 2,
                              .lds_size = group_threads * sizeof(u32) / 512u});
         set_buffer(0, lds_output, group_threads * sizeof(u32));

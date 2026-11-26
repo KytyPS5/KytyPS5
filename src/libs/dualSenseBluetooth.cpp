@@ -33,7 +33,10 @@ constexpr int    OPUS_FRAMES  = 480;
 constexpr int    OPUS_BYTES   = 200;
 constexpr size_t REPORT_BYTES = 547;
 constexpr int    MAX_QUEUE_MS = 80;
-constexpr uint64_t COALESCE_NS = 1000000;
+// Audio buffer length the controller is told to use (DS5Dongle allows 16-127
+// and defaults to 48). With 48, speaker speech stutters over Windows Bluetooth.
+constexpr uint8_t  AUDIO_BUFFER_LENGTH = 96;
+constexpr uint64_t COALESCE_NS         = 1000000;
 
 struct Session;
 std::mutex                              g_mutex;
@@ -219,7 +222,7 @@ bool PrepareReport(Session& session, PendingReport& pending, uint64_t now) {
 	report[2]        = 0x91;
 	report[3]        = 6;
 	report[4]        = 0x7e;
-	std::fill_n(report.begin() + 5, 4, 48);
+	std::fill_n(report.begin() + 5, 4, AUDIO_BUFFER_LENGTH);
 	session.counter += 2;
 	report[9]  = session.counter;
 	report[10] = 0xd2;

@@ -317,7 +317,13 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	// A new mapping changes how SDL translates the device. SDL sends no release or neutral axis
+	// events for the old mapping, so held input would stay stuck: reset it on every player.
+	if (f.remapped) {
+		HostInputResetGamepadTouchPad(f.id);
+		Controller::ResetInputState();
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {

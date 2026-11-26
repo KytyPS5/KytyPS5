@@ -962,6 +962,25 @@ void HostInputDisconnectGamepadTouchPad(int id) {
 	}
 }
 
+void HostInputResetGamepadTouchPad(int id) {
+	float x = 0;
+	float y = 0;
+	{
+		std::scoped_lock lock(g_touchpad_mutex);
+		if (!g_gamepad_touchpad.enabled || g_gamepad_touchpad.id != id) {
+			return;
+		}
+		// Keep the touchpad mode; drop what the old mapping held (no release events follow).
+		x                          = g_gamepad_touchpad.x;
+		y                          = g_gamepad_touchpad.y;
+		g_gamepad_touchpad.drawing = false;
+		g_gamepad_touchpad.x_axis  = 128;
+		g_gamepad_touchpad.y_axis  = 128;
+		g_mouse_touchpad.revision++;
+	}
+	Controller::SetTouchPad(id, 1, false, x, y);
+}
+
 HostInputTouchPadVisualState GetHostInputTouchPadVisualState() {
 	std::scoped_lock lock(g_touchpad_mutex);
 	auto             state = g_mouse_touchpad;

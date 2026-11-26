@@ -33,6 +33,7 @@ void               HostInputToggleGamepadTouchPad(int id);
 [[nodiscard]] bool HostInputGamepadDrawButton(int id, bool down);
 [[nodiscard]] bool HostInputGamepadAxis(int id, bool horizontal, int value);
 void               HostInputDisconnectGamepadTouchPad(int id);
+void               HostInputResetGamepadTouchPad(int id);
 [[nodiscard]] HostInputTouchPadVisualState GetHostInputTouchPadVisualState();
 void               HostInputToggleMouseToJoystick();
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);

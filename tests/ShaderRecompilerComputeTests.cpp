@@ -32553,6 +32553,49 @@ TestCase Vop1MoveRelSourceRuntimeIndex() {
   return test;
 }
 
+TestCase Vop1MoveRelFirstLaneIndex(bool restore_lane_zero) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = restore_lane_zero ? "Vop1MoveRelFirstLaneRetainsOldIndex"
+                                : "Vop1MoveRelFirstLaneBoundedIndex";
+  test.compute_info.wave_size = test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.initial = {12, 4, 0, 0, 0, 0, 0, 0, 0};
+  auto &code = test.code;
+  for (u32 reg = 12; reg < 155; ++reg) AppendVMovU32(&code, reg, reg);
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 1, 2);
+  AppendVMovU32(&code, 155, 40);
+  AppendVMovU32(&code, 4, 99);
+  // Restoring lane zero after a masked multiply exposes its old index of 40.
+  if (restore_lane_zero) code.push_back(EncodeSop1(0x04, 126, InlineU32(2)));
+  AppendVop3(&code, 0x148, 2, Vgpr(1), InlineU32(2), InlineU32(2));
+  code.push_back(EncodeVop2(0x0b, 155, InlineU32(3), 2));
+  code.push_back(EncodeSop1(0x04, 6, InlineU32(3)));
+  code.push_back(EncodeSop1(0x04, 126, 6));
+  // Each iteration consumes one lane. The relative write must preserve v155 for the next.
+  const auto loop = code.size();
+  code.insert(code.end(), {EncodeVop1(0x02, 8, Vgpr(155)), EncodeVopc(0xd2, 8, 155),
+      EncodeSMovB32(124, 8), EncodeVop1(0x43, 4, Vgpr(12)),
+      EncodeVop1(0x42, 12, InlineU32(55)), EncodeSop2(0x15, 6, 6, 126),
+      EncodeSop1(0x04, 126, 6)});
+  code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(7)));
+  const u32 lane_zero_reg = restore_lane_zero ? 52u : 21u;
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, lane_zero_reg, 0, 3);
+  AppendStoreVgprAtLaneDwordOffset(&code, 15, 0, 6);
+  AppendEnd(&code);
+  test.expected = {lane_zero_reg, 15, 99, 55, lane_zero_reg, lane_zero_reg, 15, 55, 15};
+  // Two extracted bits times three can reach only v12 through v21.
+  if (!restore_lane_zero) test.max_spirv_words = 2600;
+  test.opcodes = {O::V_BFE_U32, O::V_MUL_U32_U24, O::V_READFIRSTLANE_B32,
+                  O::V_MOVRELS_B32, O::V_MOVRELD_B32};
+  return test;
+}
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -50331,6 +50374,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelSourceRuntimeIndex);
+  for (bool restore : {false, true}) cases.push_back(Vop1MoveRelFirstLaneIndex(restore));
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
@@ -59185,6 +59229,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
+    for (bool restore : {false, true}) RunCase(&vulkan, Vop1MoveRelFirstLaneIndex(restore));
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
     return 0;
   }

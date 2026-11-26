@@ -52,6 +52,10 @@ struct PermlaneFlags {
 static_assert(sizeof(PermlaneFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<PermlaneFlags>);
 
+struct IntegerCompareFlags {
+	bool register_index = false;
+};
+
 struct FPCompareFlags {
 	bool flush_input_denorms = false;
 };

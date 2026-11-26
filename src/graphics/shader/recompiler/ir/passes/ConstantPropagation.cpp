@@ -33,11 +33,19 @@ class FoldWorklist {
 public:
 	struct Location {
 		Block::iterator instruction;
+		uint32_t index_maximum = 0;
 		bool queued = false;
+		bool tracks_index = false;
 	};
 
 	void Register(Block::iterator instruction) {
 		Queue(locations.emplace(&*instruction, Location {instruction}).first->second);
+		const auto op = instruction->GetOpcode();
+		if ((op == ValueOpcode::IEqual32 || op == ValueOpcode::ULessThan32) &&
+		    instruction->Flags<IntegerCompareFlags>().register_index) {
+			register_index_comparisons.push_back(&*instruction);
+			instruction->SetFlags(IntegerCompareFlags {});
+		}
 	}
 
 	void Queue(Location& location) {
@@ -73,12 +81,90 @@ public:
 	}
 
 	std::unordered_map<Inst*, Location> locations;
+	std::vector<Inst*>                  register_index_comparisons;
 	std::vector<Location*>              pending; // Map nodes keep their addresses across rehashes.
 	std::unordered_set<Inst*> lowered_ancillary;
 
 private:
 	std::vector<Inst*> affected;
 };
+
+// M0 indexes VGPRs across lanes. Trace only the definitions feeding its register
+// comparisons; loop-carried writes can themselves depend on those comparisons.
+void FoldRegisterIndexComparisons(FoldWorklist& worklist) {
+	const auto maximum = [&](Value value) -> uint32_t {
+		if (IsImmediate(value, Type::U32)) return value.U32();
+		if (IsImmediate(value, Type::U1)) return value.U1();
+		const auto found = worklist.locations.find(value.TryInstruction());
+		if (found == worklist.locations.end()) return UINT32_MAX;
+		auto& location = found->second;
+		if (!location.tracks_index) {
+			location.tracks_index = true;
+			worklist.Queue(location);
+		}
+		return location.index_maximum;
+	};
+	const auto evaluate = [&](const Inst& inst) -> uint32_t {
+		const auto bound = [&](size_t arg) { return maximum(inst.Arg(arg)); };
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::Phi: {
+				uint32_t result = 0;
+				for (size_t arg = 0; arg < inst.NumArgs(); ++arg) result = std::max(result, bound(arg));
+				return inst.NumArgs() != 0 ? result : UINT32_MAX;
+			}
+			case ValueOpcode::SelectU32: return bound(0) == 0 ? bound(2) : std::max(bound(1), bound(2));
+			// ReadFirstLane takes lane zero for empty EXEC, so the source bound covers every lane.
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::Identity: return bound(0);
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::BitwiseAnd32: return std::min(bound(0), bound(1));
+			case ValueOpcode::IMul32:
+				return static_cast<uint32_t>(std::min<uint64_t>(uint64_t {bound(0)} * bound(1), UINT32_MAX));
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = inst.Arg(1).Resolve(), width = inst.Arg(2).Resolve();
+				if (!offset.IsImmediate() || !width.IsImmediate() ||
+				    offset.U32() >= 32u || width.U32() > 32u - offset.U32()) return UINT32_MAX;
+				const auto mask = width.U32() == 32u ? UINT32_MAX : (1u << width.U32()) - 1u;
+				return std::min(bound(0) >> offset.U32(), mask);
+			}
+			case ValueOpcode::IEqual32:
+				for (size_t arg = 0; arg < 2; ++arg) {
+					const auto value = inst.Arg(arg).Resolve();
+					if (value.IsImmediate() && value.U32() > bound(arg ^ 1u)) return 0;
+				}
+				return 1;
+			case ValueOpcode::ULessThan32: {
+				const auto left = inst.Arg(0).Resolve();
+				return !left.IsImmediate() || left.U32() < bound(1);
+			}
+			default: return inst.GetType() == Type::U1 ? 1u : UINT32_MAX;
+		}
+	};
+	for (auto* compare: worklist.register_index_comparisons) {
+		const auto op = compare->GetOpcode();
+		if (op != ValueOpcode::Identity) maximum(compare->Arg(op == ValueOpcode::IEqual32 ? 0u : 1u));
+	}
+	for (size_t i = 0; i < worklist.pending.size(); ++i) {
+		auto& location = *worklist.pending[i];
+		auto& inst = *location.instruction;
+		location.queued = false;
+		const auto next = evaluate(inst);
+		auto& previous = location.index_maximum;
+		if (next <= previous) continue;
+		// Widen a growing loop-carried bound; only stable finite bounds can prune registers.
+		previous = inst.GetOpcode() == ValueOpcode::Phi && previous != 0 ? UINT32_MAX : next;
+		for (const auto& use: inst.Uses()) {
+			const auto user = worklist.locations.find(use.user);
+			if (user != worklist.locations.end() && user->second.tracks_index) worklist.Queue(user->second);
+		}
+	}
+	worklist.pending.clear();
+	for (auto* compare: worklist.register_index_comparisons) {
+		if (compare->GetOpcode() == ValueOpcode::Identity || evaluate(*compare) != 0) continue;
+		worklist.QueueUsers(compare->Uses());
+		Replace(*compare, Value(false));
+	}
+}
 
 // Reads an immediate operand of a fold function's parameter type.
 template <typename T>
@@ -968,6 +1054,10 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		} while (!worklist.pending.empty());
 	};
 	drain();
+	if (!worklist.register_index_comparisons.empty()) {
+		FoldRegisterIndexComparisons(worklist);
+		drain();
+	}
 	// Normalize retained PHI/select values only after every supported field read has
 	// been lowered; direct raw consumers remain unsupported.
 	bool normalized;

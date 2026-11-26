@@ -91,7 +91,6 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
-Pthread               PthreadSwapSelfForSignal(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);
 int KYTY_SYSV_ABI     PthreadDetach(Pthread thread);
@@ -112,19 +111,46 @@ int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
 void                  PthreadWakeForSignal(Pthread thread);
-void                  PthreadQueuePendingSignal(Pthread thread, int signum);
+bool                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
+bool                  PthreadHasAnyPendingSignal(Pthread thread);
+bool                  BlockGuestSignals();
+void                  RestoreGuestSignals(bool blocked);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size);
+void TestSetMutexWaitHook(void (*hook)());
+void TestSetStaticObjectProgram(Loader::Program* program);
+void TestSetSelf(Pthread thread);
 #endif
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 bool PthreadKillHost(Pthread thread, int host_signal);
 #endif
 int PthreadGetPriorityForKernel(Pthread thread);
 int PthreadGetCurrentPriorityForKernel();
+
+class GuestSignalBlock {
+public:
+	GuestSignalBlock(): m_blocked(BlockGuestSignals()) {}
+	~GuestSignalBlock() { RestoreGuestSignals(m_blocked); }
+
+	template <typename Unlock, typename Lock>
+	void RunPending(Unlock unlock, Lock lock) const {
+		if (!m_blocked && PthreadHasAnyPendingSignal(PthreadSelfOrNull())) {
+			unlock();
+			RestoreGuestSignals(false);
+			BlockGuestSignals();
+			lock();
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(GuestSignalBlock);
+
+private:
+	bool m_blocked;
+};
 
 int KYTY_SYSV_ABI          KernelUsleep(KernelUseconds microseconds);
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds);

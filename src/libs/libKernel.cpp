@@ -37,6 +37,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -721,10 +722,6 @@ static SignalUcontext CreateCurrentGuestCallSignalUcontext(uint64_t rip) {
 	return ctx;
 }
 
-static bool IsGuestCodeAddress(uint64_t addr) {
-	return addr >= 0x0000000900000000ull && addr < 0x0000000980000000ull;
-}
-
 static bool IsAddressInRange(uint64_t addr, uint64_t base, uint64_t size) {
 	return size != 0 && addr >= base && addr < base + size;
 }
@@ -744,7 +741,7 @@ static uint64_t GetFallbackStackPointer(Pthread thread) {
 }
 
 static void SanitizeNonGuestSignalUcontext(SignalUcontext* ctx, Pthread thread) {
-	if (ctx == nullptr || IsGuestCodeAddress(ctx->uc_mcontext.mc_rip)) {
+	if (ctx == nullptr || Loader::IsGuestCodeAddress(ctx->uc_mcontext.mc_rip)) {
 		return;
 	}
 
@@ -774,6 +771,57 @@ static void SanitizeNonGuestSignalUcontext(SignalUcontext* ctx, Pthread thread) 
 	ctx->uc_mcontext.mc_r14 = 0;
 	ctx->uc_mcontext.mc_r15 = 0;
 	ctx->uc_mcontext.mc_rip = 0;
+}
+
+static thread_local bool g_guest_signals_blocked = false;
+
+template <typename RunHandler>
+static void DispatchPendingSignals(Pthread thread, RunHandler run_handler) {
+	if (g_guest_signals_blocked) {
+		return;
+	}
+	bool pending = true;
+	while (pending) {
+		g_guest_signals_blocked = true;
+		pending                 = false;
+		for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
+			if (!PthreadTakePendingSignal(thread, signum)) {
+				continue;
+			}
+			pending = true;
+			if (auto* handler =
+			        reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum])) {
+				run_handler(handler, signum);
+			}
+		}
+		g_guest_signals_blocked = false;
+		for (int signum = 0; !pending && signum < static_cast<int>(std::size(g_exception_handlers));
+		     signum++) {
+			if (PthreadTakePendingSignal(thread, signum)) {
+				PthreadQueuePendingSignal(thread, signum);
+				pending = true;
+			}
+		}
+	}
+}
+
+bool BlockGuestSignals() {
+	return std::exchange(g_guest_signals_blocked, true);
+}
+
+void RestoreGuestSignals(bool blocked) {
+	g_guest_signals_blocked = blocked;
+	auto* thread            = PthreadSelfOrNull();
+	if (blocked || !PthreadHasAnyPendingSignal(thread)) {
+		return;
+	}
+	const auto return_address = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+	DispatchPendingSignals(thread,
+	                       [thread, return_address](exception_handler_func_t handler, int signum) {
+		                       auto ctx = CreateCurrentGuestCallSignalUcontext(return_address);
+		                       SanitizeNonGuestSignalUcontext(&ctx, thread);
+		                       handler(signum, &ctx);
+	                       });
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -933,7 +981,7 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
                                       void* native_context) {
 	Pthread current = PthreadSelfOrNull();
-	if (current == nullptr) {
+	if (current == nullptr || g_guest_signals_blocked) {
 		return;
 	}
 
@@ -946,8 +994,9 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 
 		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 		if (handler != nullptr) {
-			auto ctx = CreateSignalUcontextFromHost(host_ctx);
-			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
+			g_guest_signals_blocked = true;
+			auto ctx                = CreateSignalUcontextFromHost(host_ctx);
+			if (Loader::IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
 				handler(signum, &ctx);
 				ApplySignalUcontextToHost(host_ctx, ctx);
 			} else {
@@ -955,6 +1004,7 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 				SanitizeNonGuestSignalUcontext(&ctx, current);
 				handler(signum, &ctx);
 			}
+			g_guest_signals_blocked = false;
 		}
 		return;
 	}
@@ -998,30 +1048,21 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 	return nt_queue_apc_thread_ex;
 }
 
-static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
-	auto*      thread = static_cast<Pthread>(arg1);
-	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
-	if (!PthreadTakePendingSignal(thread, signum)) {
+static void SignalApcHandler(void* arg1, void* /*arg2*/, void* /*arg3*/, PCONTEXT context) {
+	auto* thread = static_cast<Pthread>(arg1);
+	if (PthreadSelfOrNull() != thread) {
 		return;
 	}
-
-	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-	if (handler != nullptr) {
+	DispatchPendingSignals(thread, [thread, context](exception_handler_func_t handler, int signum) {
 		auto ctx = CreateSignalUcontext(context);
-		if (!IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
+		if (Loader::IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
+			handler(signum, &ctx);
+			ApplySignalUcontext(context, ctx);
+		} else {
 			SanitizeNonGuestSignalUcontext(&ctx, thread);
-			std::thread([thread, signum, handler, ctx,
-			             tcb = Loader::RuntimeLinker::GetThreadTcb()]() mutable {
-				Loader::RuntimeLinker::SetThreadTcb(tcb);
-				auto* previous_self = PthreadSwapSelfForSignal(thread);
-				handler(signum, &ctx);
-				PthreadSwapSelfForSignal(previous_self);
-			}).detach();
-			return;
+			handler(signum, &ctx);
 		}
-		handler(signum, &ctx);
-		ApplySignalUcontext(context, ctx);
-	}
+	});
 }
 
 #endif
@@ -1069,26 +1110,29 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		const auto target_thread_id       = PthreadGetHostThreadId(thread);
 		auto*      nt_queue_apc_thread_ex = GetNtQueueApcThreadEx();
-		if (target_thread_id == 0) {
+		if (target_thread_id == 0 || nt_queue_apc_thread_ex == nullptr) {
 			return KERNEL_ERROR_EINVAL;
 		}
-		if (target_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
-			auto ctx = CreateCurrentGuestCallSignalUcontext(
-			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			handler(signum, &ctx);
+		if (!PthreadQueuePendingSignal(thread, signum)) {
+			return KERNEL_ERROR_ESRCH;
+		}
+		if (thread == PthreadSelfOrNull()) {
+			const auto return_address = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+			DispatchPendingSignals(
+			    thread, [return_address](exception_handler_func_t handler, int raised) {
+				    auto ctx = CreateCurrentGuestCallSignalUcontext(return_address);
+				    handler(raised, &ctx);
+			    });
 			return OK;
-		}
-		if (nt_queue_apc_thread_ex == nullptr) {
-			return KERNEL_ERROR_EINVAL;
 		}
 
 		HANDLE target_thread =
 		    OpenThread(THREAD_SET_CONTEXT, FALSE, static_cast<DWORD>(target_thread_id));
 		if (target_thread == nullptr) {
+			PthreadTakePendingSignal(thread, signum);
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		PthreadQueuePendingSignal(thread, signum);
 		KytyUserApcOption option {};
 		option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
 
@@ -1113,9 +1157,11 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		if (thread == PthreadSelfOrNull()) {
 			// Raises from other threads wait until the handler returns, as for a delivered signal.
 			const bool was_blocked = Common::HostException::SetGuestSignalDispatchBlocked(true);
+			const bool blocked     = BlockGuestSignals();
 			auto       ctx         = CreateCurrentGuestCallSignalUcontext(
 			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			handler(signum, &ctx);
+			g_guest_signals_blocked = blocked;
 			Common::HostException::SetGuestSignalDispatchBlocked(was_blocked);
 			return OK;
 		}
@@ -1124,7 +1170,9 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		PthreadQueuePendingSignal(thread, signum);
+		if (!PthreadQueuePendingSignal(thread, signum)) {
+			return KERNEL_ERROR_ESRCH;
+		}
 		if (!PthreadKillHost(thread, Common::HostException::GuestSignalDispatchSignal())) {
 			PthreadTakePendingSignal(thread, signum);
 			LOGF("\t pthread_kill failed for target thread\n");

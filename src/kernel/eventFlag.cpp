@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -19,6 +20,8 @@ constexpr uint32_t ATTR_MULTI   = 0x20;
 constexpr uint32_t WAIT_AND     = 0x01;
 constexpr uint32_t CLEAR_ALL    = 0x10;
 constexpr uint32_t CLEAR_PAT    = 0x20;
+
+constexpr uint32_t SIGNAL_APC_POLL_MICROS = 10000;
 
 class KernelEventFlagPrivate {
 public:
@@ -92,12 +95,14 @@ uint64_t TickDeadline(uint64_t now_ns, uint32_t micros) {
 } // namespace
 
 KernelEventFlagPrivate::~KernelEventFlagPrivate() {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	m_deleted = true;
 	ReleaseAll(KERNEL_ERROR_EACCES);
 	while (m_waiters != 0) {
-		m_last_waiter_left.Wait(&m_mutex);
+		m_last_waiter_left.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
+		block.RunPending([this] { m_mutex.Unlock(); }, [this] { m_mutex.Lock(); });
 	}
 }
 
@@ -118,6 +123,7 @@ int KernelEventFlagPrivate::TakeLocked(uint64_t bits, uint32_t mode, uint64_t* r
 }
 
 int KernelEventFlagPrivate::Poll(uint64_t bits, uint32_t mode, uint64_t* result) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	return TakeLocked(bits, mode, result);
@@ -125,6 +131,7 @@ int KernelEventFlagPrivate::Poll(uint64_t bits, uint32_t mode, uint64_t* result)
 
 int KernelEventFlagPrivate::Wait(uint64_t bits, uint32_t mode, uint64_t* result,
                                  KernelUseconds* timeout) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	if (int ret = TakeLocked(bits, mode, result); ret != KERNEL_ERROR_EBUSY) {
@@ -145,10 +152,13 @@ int KernelEventFlagPrivate::Wait(uint64_t bits, uint32_t mode, uint64_t* result,
 	const uint64_t deadline = (timeout != nullptr ? TickDeadline(start, *timeout) : UINT64_MAX);
 	for (uint64_t now = start; !waiter.released && now < deadline; now = Common::SteadyNs()) {
 		if (timeout == nullptr) {
-			waiter.cond_var.Wait(&m_mutex);
+			waiter.cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
 		} else {
-			waiter.cond_var.WaitFor(&m_mutex, static_cast<uint32_t>((deadline - now + 999) / 1000));
+			waiter.cond_var.WaitFor(&m_mutex,
+			                        std::min(static_cast<uint32_t>((deadline - now + 999) / 1000),
+			                                 SIGNAL_APC_POLL_MICROS));
 		}
+		block.RunPending([this] { m_mutex.Unlock(); }, [this] { m_mutex.Lock(); });
 	}
 	if (!waiter.released) {
 		std::erase(m_queue, &waiter);
@@ -168,6 +178,7 @@ int KernelEventFlagPrivate::Wait(uint64_t bits, uint32_t mode, uint64_t* result,
 }
 
 void KernelEventFlagPrivate::Set(uint64_t bits) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	m_bits |= bits;
@@ -186,12 +197,14 @@ void KernelEventFlagPrivate::Set(uint64_t bits) {
 }
 
 void KernelEventFlagPrivate::Clear(uint64_t bits) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	m_bits &= bits;
 }
 
 int KernelEventFlagPrivate::Cancel(uint64_t bits) {
+	GuestSignalBlock  block;
 	Common::LockGuard lock(m_mutex);
 
 	m_bits = bits;

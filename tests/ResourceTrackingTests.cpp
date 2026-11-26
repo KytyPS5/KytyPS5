@@ -7131,25 +7131,36 @@ void TestWorkgroupSelectedBufferRecords() {
 }
 
 void TestPackedMaterialBufferStore() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture f;
   const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
   const auto heap = f.Buffer({f.UserData(4), f.UserData(5), f.UserData(6), f.UserData(7)});
   const auto lane = f.Emit(ValueOpcode::LaneId);
+  const auto active = f.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
   const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x2,
-      {material, lane, Value(0u), Value(0u), Value(true)},
+      {material, lane, Value(0u), Value(0u), active},
       f.AddMemory({.kind = ResourceKind::Buffer, .offset = 56u, .data_dwords = 2u, .idxen = true}, 0x260u));
   const auto word = f.Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(1u)});
   const auto field = f.Emit(ValueOpcode::BitwiseAnd32, {Value(0xffffffu), word});
-  const auto selected = f.Emit(ValueOpcode::SelectU32, {Value(true), field, Value(0u)});
-  const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)});
+  const auto selected = f.Emit(ValueOpcode::SelectU32, {active, field, word});
+  auto* body = f.AddBlock();
+  auto* exit = f.AddBlock();
+  f.block->AddBranch(body);
+  f.block->AddBranch(exit);
+  f.block->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = body, .false_block = exit};
+  f.block->condition = f.Emit(ValueOpcode::ConditionRef, {active}, CFG::BranchCondition::ExecNonZero);
+  f.block = body;
+  const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, active});
+  const auto equal = f.Emit(ValueOpcode::IEqual32, {key, selected});
+  const auto writing = f.Emit(ValueOpcode::LogicalAnd, {active, equal});
   const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
   std::array<Value, 4> descriptor;
   for (uint32_t i = 0; i < descriptor.size(); ++i)
     descriptor[i] = f.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
         f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = i * 4u,
                      .component_index = i, .component_count = 4u}, 0x14f0u));
-  f.Emit(ValueOpcode::StoreBufferU32, {f.Buffer(descriptor), lane, Value(0u), Value(0u), word, Value(true)},
-         f.AddMemory({.kind = ResourceKind::Buffer, .formatted = true, .idxen = true}, 0x14fcu));
+  f.Emit(ValueOpcode::StoreBufferU32, {f.Buffer(descriptor), lane, Value(0u), Value(0u), word, writing},
+         f.AddMemory({.kind = ResourceKind::Buffer, .formatted = true, .idxen = true}, 0x6acu));
   const auto output = f.Buffer({f.UserData(8), f.UserData(9), f.UserData(10), f.UserData(11)});
   f.Emit(ValueOpcode::StoreBufferU32, {output, Value(0u), Value(0u), Value(0u), word, Value(true)},
          f.AddMemory({.kind = ResourceKind::Buffer, .offset = 4u}, 0x1504u));

@@ -3850,7 +3850,8 @@ private:
 		if (guard.IsEmpty() ? !HasActiveLane(lane.Arg(1), lane.Parent())
 		                    : !Implies(guard, lane.Arg(1))) return {};
 		auto result = FiniteSelectorDomain(lane.Arg(0), lane.Arg(1));
-		if (result.maximum == UINT32_MAX) result.maximum = PossibleU32Bits(lane.Arg(0));
+		if (result.maximum == UINT32_MAX)
+			result.maximum = PossibleU32Bits(ActiveValue(lane.Arg(0), lane.Arg(1)));
 		return result;
 	}
 

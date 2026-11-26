@@ -6482,13 +6482,13 @@ public:
             "image heap mapping failed");
     std::memset(mapped, 0, allocation_size);
     // A 4x4 linear 2D texture per index.
-    const auto descriptor = [](uint32_t texture, Format format) {
+    const auto descriptor = [](uint32_t texture, Format format, uint32_t swizzle = DstSel(4, 5, 6, 7)) {
       const uint64_t address = base + 0x10000u + texture * 0x1000u;
       std::array<uint32_t, 8> words{};
       words[0] = static_cast<uint32_t>(address >> 8u);
       words[1] = static_cast<uint32_t>(address >> 40u) | (static_cast<uint32_t>(format) << 20u);
       words[2] = 3u | (3u << 14u);
-      words[3] = DstSel(4, 5, 6, 7) |
+      words[3] = swizzle |
                  (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
       return words;
     };
@@ -6560,14 +6560,14 @@ public:
               "probes did not share equal descriptors or left a non-null gap");
       Require(name, "second view",
               acquire(unfiltered) && views.size() == 2u &&
-                  ImageHeapTestAccess::ElementCount(heap) == 5u,
-              "a second root profile did not get its own view");
+                  views[1]->slots[0] == filtered.slots[0] && ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "filtered and unfiltered slots duplicated the same image binding");
       const auto &idle = *views[1];
       draw();
       const auto resident = ImageHeapTestAccess::ImageOf(heap, filtered.slots[0]);
       Require(name, "resident images",
-              resident && textures.GetImage(resident).heap_refs.load() == 2u,
-              "resolved elements did not pin their image");
+              resident && textures.GetImage(resident).heap_refs.load() == 1u,
+              "the shared heap element did not pin its image exactly once");
       // A CPU write to a resident image reaches the next draw without rediscovering it.
       const uint32_t texel = 0xff00ff00u;
       Libs::LibKernel::Memory::WriteBacking(base + 0x10000u, &texel, sizeof(texel));
@@ -6615,6 +6615,23 @@ public:
               acquire(sampled, table, 4u) && views.size() == 3u && views[2]->slots[0] != 0u &&
                   views[2]->slots[40] == 0u,
               "a view probed descriptors past the guest table bound");
+      draw();
+
+      write(8, descriptor(57, Format::k32Float, DstSel(4, 0, 0, 1)));
+      auto raw_depth = descriptor(64, Format::k16UInt, DstSel(4, 0, 0, 1));
+      raw_depth[3] |= static_cast<u32>(Prospero::TileMode::kDepth) << 20u;
+      write(9, raw_depth);
+      auto comparison = sampled;
+      comparison.depth_compare = true;
+      Require(name, "comparison view", acquire(sampled) && acquire(unfiltered) && acquire(comparison),
+              "a sampled heap view was declined");
+      const auto &shadow = *views.back();
+      Require(name, "unfiltered slots", filtered.slots[72] != 0u && idle.slots[72] == 0u,
+              "the unfiltered view included a raw depth read that needs conversion");
+      Require(name, "comparison slots",
+              shadow.slots[0] == filtered.slots[0] && shadow.slots[56] == 0u &&
+                  filtered.slots[64] != 0u && shadow.slots[64] != 0u && shadow.slots[64] != filtered.slots[64],
+              "comparison sampling must share color views, exclude integers and keep D32 separate from R32");
       draw();
 
       // Only leaving the read state queues a change of a resident image.

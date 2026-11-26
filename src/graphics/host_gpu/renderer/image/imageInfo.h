@@ -12,6 +12,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -221,6 +222,17 @@ FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
 		}
 	}
 	return nullptr;
+}
+
+[[nodiscard]] inline constexpr std::optional<vk::Format>
+SampledDepthCompareFormat(Prospero::BufferFormat format, bool depth_compare) noexcept {
+	if (depth_compare) {
+		if (const auto* policy = FindGuestDepthFormatPolicy(format);
+		    policy && policy->depth_attachment_format != vk::Format::eUndefined) {
+			return policy->depth_attachment_format;
+		}
+	}
+	return std::nullopt;
 }
 
 [[nodiscard]] inline constexpr bool IsStencilAttachmentFormat(const DepthFormatPolicy& policy,

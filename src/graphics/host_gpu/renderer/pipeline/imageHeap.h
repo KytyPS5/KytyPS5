@@ -24,7 +24,7 @@ struct ImageHeapTestAccess;
 // Guest image tables that shaders index by GPU-computed offsets, kept resident in one bindless
 // sampled-image array. A table is keyed by its base and follows its descriptor's size. Each view
 // of a table owns device slot words, one per table dword, that select an array element; one
-// element serves a descriptor and profile in every view. CPU writes to a table fault in its
+// element serves each host binding across views. CPU writes to a table fault in its
 // snapshot, which each draw refreshes once; a view takes the changes when a draw first acquires
 // it. Images behind elements report their changes through Image::heap_changes. A smaller table
 // leaves at a suspend point if the frame did not acquire it, a larger one after
@@ -51,10 +51,13 @@ public:
 
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
+	using ImageResource   = ShaderRecompiler::IR::ImageResource;
 
 	struct Key {
-		DescriptorValue value;
-		uint32_t        profile = 0; // Index into m_profiles.
+		DescriptorValue                          value;
+		ShaderRecompiler::Decoder::ImageDimension dimension = ShaderRecompiler::Decoder::ImageDimension::Unknown;
+		bool                                     r128 = false;
+		bool                                     depth_view = false;
 
 		bool operator==(const Key&) const = default;
 	};
@@ -83,7 +86,7 @@ private:
 		uint64_t                     first   = 0;
 		uint64_t                     count   = 0;
 		uint64_t                     limit   = 0; // Probes a key domain allows, if fewer.
-		uint32_t                     profile = 0;
+		ImageResource                root;
 		std::vector<uint32_t>        slots; // Plus a trailing null slot.
 		std::vector<uint32_t>        kind_keys;
 		std::vector<DescriptorValue> kinds; // One representative per kind_keys entry.
@@ -134,7 +137,6 @@ private:
 	std::vector<View*>                   m_active; // Acquired since the last commit.
 	uint64_t                             m_draw         = 1;
 	uint64_t                             m_suspend_draw = 0; // m_draw at the last suspend point.
-	std::vector<ShaderRecompiler::IR::ImageResource>  m_profiles;
 	std::vector<Element>                              m_elements;
 	std::unordered_map<Key, uint32_t, KeyHash>        m_index;
 	std::vector<uint32_t>                             m_free;

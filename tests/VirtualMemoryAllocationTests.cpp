@@ -5054,6 +5054,26 @@ void TestCpuExtensionContexts() {
 #else
 	flush({0x65, 0x66, 0x0f, 0xae, 0x37}, 7, address - reinterpret_cast<uintptr_t>(NtCurrentTeb()));
 #endif
+	const std::array<uint8_t, 4> zero {0x67, 0x0f, 0x01, 0xfc};
+	std::copy(zero.begin(), zero.end(), instruction);
+	context.Rip() = mapping;
+	context.Gpr(0) = (uint64_t {1} << 32) | (address + 63);
+	Check(test, EmulateInstructionContext(&context.native) && context.Rip() == mapping + zero.size(),
+	      "address-size CLZERO failed");
+	_mm_sfence();
+	Check(test, std::all_of(data, data + 64, [](uint8_t b) { return b == 0; }),
+	      "address-size CLZERO did not use EAX");
+	std::fill_n(data, 64, 0xa5);
+	for (const uint8_t prefix: {0x64, 0x65}) {
+		instruction[0] = prefix;
+		context.Gpr(0) = address;
+		context.Rip() = mapping;
+		Check(test, !EmulateInstructionContext(&context.native) && context.Rip() == mapping,
+		      "segment-relative CLZERO was accepted as a flat store");
+	}
+	_mm_sfence();
+	Check(test, std::all_of(data, data + 64, [](uint8_t b) { return b == 0xa5; }),
+	      "rejected segment-relative CLZERO changed guest memory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5886,6 +5906,21 @@ void TestCpuExtensionPatches() {
 	          std::all_of(data.begin(), data.end(),
 	                      [](uint64_t value) { return value == 0x123456789abcdef0ull; }),
 	      "CLWB direct fallback changed memory or used an unexpected trap path");
+
+	code.reset();
+	code.mov(code.rax, code.rdi);
+	code.stc();
+	code.clzero();
+	code.sfence();
+	code.cmovnc(code.rax, code.rsi);
+	code.ret();
+	alignas(64) std::array<uint64_t, 24> lines;
+	lines.fill(~uint64_t {0});
+	auto expected = lines;
+	std::fill_n(expected.begin() + 8, 8, 0);
+	const auto zero = reinterpret_cast<void*(KYTY_SYSV_ABI*)(void*, void*)>(mapping);
+	Check(test, zero(&lines[15], nullptr) == &lines[15] && lines == expected,
+	      "CLZERO failed to preserve RAX, carry or adjacent cache lines");
 	std::printf("[host]    %-48s ok\n", test);
 }
 

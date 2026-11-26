@@ -707,6 +707,19 @@ static bool TryEmulateCpuExtensions(Context& context) {
 		}
 		// RDPID and guest RDTSCP observe the same host TSC_AUX; only RDPID's destination changes.
 		context.Gpr(static_cast<uint8_t>(index)) = auxiliary;
+	} else if (instruction.mnemonic == ZYDIS_MNEMONIC_CLZERO) {
+		// Zydis exposes rAX as a register, so a segment base cannot be recovered from the operand.
+		for (unsigned i = 0; i < instruction.raw.prefix_count; ++i) {
+			const auto prefix = instruction.raw.prefixes[i].value;
+			if (prefix == 0x64 || prefix == 0x65) return false;
+		}
+		constexpr uintptr_t line_size = 64;
+		const auto rax = static_cast<uintptr_t>(context.Gpr(0));
+		const auto address = instruction.address_width == 32 ? static_cast<uint32_t>(rax) : rax;
+		auto* line = reinterpret_cast<__m128i*>(address & ~(line_size - 1));
+		for (size_t i = 0; i < line_size / sizeof(*line); ++i) {
+			_mm_stream_si128(line + i, _mm_setzero_si128());
+		}
 	} else if (instruction.mnemonic == ZYDIS_MNEMONIC_CLWB &&
 	           operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
 		ZydisRegisterContext registers {};

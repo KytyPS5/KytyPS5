@@ -1290,12 +1290,14 @@ void TestSignedStorageSpecialization() {
   const SrtRuntime runtime{.user_data = data};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization, signed16;
-  for (const auto format : {F::k16SInt, F::k32SInt, F::k16SInt}) {
+  for (const auto format : {F::k16SInt, F::k32SInt, F::k16_16SInt, F::k16SInt}) {
     data[0] = uint32_t(format) << 20u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization),
           "write-only signed storage image failed materialization");
-    const auto conversion = format == F::k16SInt ? format : F::kInvalid;
-    const auto view = format == F::k16SInt ? F::k16UInt : F::k32UInt;
+    const auto conversion = format == F::k32SInt ? F::kInvalid : format;
+    const auto view = format == F::k16SInt     ? F::k16UInt
+                      : format == F::k16_16SInt ? F::k16_16UInt
+                                                : F::k32UInt;
     Check(specialization.images[0].numeric_class == N::Uint &&
               specialization.images[0].conversion_format == conversion &&
               specialization.images[0].shader_swizzle == swizzle &&
@@ -1313,7 +1315,7 @@ void TestSignedStorageSpecialization() {
     Check(binding && ImageBindingResourceClass(*binding) == ImageResourceClass::Storage,
           "signed storage conversion did not reuse the unsigned storage binding");
   }
-  for (const auto format : {F::k8SInt, F::k16SInt, F::k32SInt}) {
+  for (const auto format : {F::k8SInt, F::k16SInt, F::k16_16SInt, F::k32SInt}) {
     data[0] = uint32_t(format) << 20u;
     auto &image = plan.info.images[0];
     image.read = true;

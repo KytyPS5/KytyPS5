@@ -374,12 +374,17 @@ uint32_t DistancePointer(EmitterState& state, IR::StageOutputKind kind, uint32_t
 	if (state.program.stage == ShaderType::Mesh) {
 		return MeshOutputPointer(state, kind, index);
 	}
+	const auto type    = TypePointer(state, spv::StorageClassOutput, TypeF32(state));
+	const auto pointer = state.builder.AllocateId();
+	if (kind == IR::StageOutputKind::ClipDistance && state.clip_distance_in_per_vertex) {
+		state.builder.AddFunction(spv::OpAccessChain, type, pointer, state.per_vertex_variable,
+		                          ConstantU32(state, 1), ConstantU32(state, index));
+		return pointer;
+	}
 	const auto variable = kind == IR::StageOutputKind::ClipDistance ? state.clip_distance_variable
 	                                                                : state.cull_distance_variable;
-	const auto pointer  = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain,
-	                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)), pointer,
-	                          variable, ConstantU32(state, index));
+	state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable,
+	                          ConstantU32(state, index));
 	return pointer;
 }
 

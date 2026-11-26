@@ -93,6 +93,7 @@ const QStringList CONSOLE_LANGUAGE_NAMES = {
     "Thai",
     "Vietnamese",
     "Indonesian",
+    "Ukrainian",
 };
 
 static QString NormalizeGameDirectory(const QString& dir) {

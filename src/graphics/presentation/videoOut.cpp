@@ -1914,4 +1914,19 @@ KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* s
 	return DriverState().Get(handle) == nullptr ? VIDEO_OUT_ERROR_INVALID_HANDLE : OK;
 }
 
+KYTY_SYSV_ABI int VideoOutSetGlobalBlendSpace(int handle, uint32_t space, uint32_t option) {
+	PRINT_NAME();
+
+	auto* ctx = DriverState().Get(handle);
+	if (ctx == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+
+	LOGF("\t space  = %" PRIu32 "\n"
+	     "\t option = %" PRIu32 "\n",
+	     space, option);
+
+	return OK;
+}
+
 } // namespace Libs::VideoOut

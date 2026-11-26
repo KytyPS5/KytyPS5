@@ -49,6 +49,7 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
 	LIB_FUNC("w7Ipp9Xl7hg", VideoOut::VideoOutAllowOutputResolutionWqhdDetection);
+	LIB_FUNC("pA8xxaySl7A", VideoOut::VideoOutSetGlobalBlendSpace);
 }
 
 } // namespace LibGen5

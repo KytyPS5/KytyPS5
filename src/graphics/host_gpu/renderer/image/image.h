@@ -68,6 +68,8 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// Copies the mip-sized region at source_offset of source's level 0 into mip and layer.
+	void CopyMipRegion(Image& source, uint32_t mip, uint32_t layer, vk::Offset3D source_offset);
 
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;

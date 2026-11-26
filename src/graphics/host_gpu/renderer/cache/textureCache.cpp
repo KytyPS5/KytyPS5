@@ -38,6 +38,55 @@ constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
+// PPSA04379
+// A storage view can cover the whole Standard4KB mip-tail block of one array layer. Its texels hold
+// every tail level as a rectangle at the level's tail_x/tail_y. Construction Simulator writes the
+// small levels of its reflection cube through such a view; without them, reflections sample
+// uninitialized levels and the indirect lighting of the scene turns gray.
+// Returns the layer of array whose tail block source covers, or -1.
+[[nodiscard]] int32_t MipTailBlockLayer(const ImageInfo& source, const ImageInfo& array) {
+	const auto& block = array.tiling.block;
+	if (!source.IsCompatible(array) || source.guest_format != array.guest_format ||
+	    source.tile_mode != Prospero::TileMode::kStandard4KB ||
+	    array.tile_mode != source.tile_mode || block.family != TileBlockFamily::Standard4KB ||
+	    source.type != Prospero::ImageType::kColor2D || array.type != source.type ||
+	    source.IsBlock() || source.IsDepth() || source.HasMetadata() || array.HasMetadata() ||
+	    source.samples != 1 || source.resources != ImageSubresources {1, 1} ||
+	    array.resources.levels <= 1 || array.resources.levels > array.mip_layout.size() ||
+	    array.first_tail_level == 0 || array.first_tail_level >= array.resources.levels ||
+	    !source.data.Valid() || !array.data.Valid() || source.data.address < array.data.address ||
+	    source.data.End() > array.data.End()) {
+		return -1;
+	}
+	const auto& view = source.mip_layout[0];
+	if (source.extent != vk::Extent3D {block.block_width, block.block_height, 1} ||
+	    source.pitch != block.block_width || source.data.size != block.block_size ||
+	    view.offset != 0 || view.size != block.block_size || view.pitch != block.block_width ||
+	    view.height != block.block_height) {
+		return -1;
+	}
+	const auto stride      = array.tiled_slice_stride;
+	const auto tail_offset = array.mip_layout[array.first_tail_level].offset;
+	const auto delta       = source.data.address - array.data.address;
+	if (stride == 0 || array.data.size != stride * array.resources.layers || delta < tail_offset ||
+	    (delta - tail_offset) % stride != 0) {
+		return -1;
+	}
+	const auto layer = (delta - tail_offset) / stride;
+	if (layer >= array.resources.layers) {
+		return -1;
+	}
+	for (uint32_t level = array.first_tail_level; level < array.resources.levels; ++level) {
+		const auto& mip    = array.mip_layout[level];
+		const auto  extent = array.MipExtent(level);
+		if (mip.offset != tail_offset || mip.tail_x + extent.width > block.block_width ||
+		    mip.tail_y + extent.height > block.block_height) {
+			return -1;
+		}
+	}
+	return static_cast<int32_t>(layer);
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -602,6 +651,30 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+void TextureCache::CopyImageMipTail(ImageId destination_id, ImageId source_id, uint32_t layer) {
+	RefreshCopySource(source_id);
+	// The copy covers only the tail levels of one layer: a pending CPU write must reach the
+	// destination first, or a later refresh would upload the whole image over the copied texels.
+	RefreshImage(destination_id);
+	auto& destination = m_slot_images[destination_id];
+	auto& source      = m_slot_images[source_id];
+	TrackImage(destination_id);
+	if (source.IsBufferModified() || source.backing.samples != 1 ||
+	    destination.backing.samples != 1) {
+		EXIT("TextureCache: invalid mip-tail copy ownership or sample count\n");
+	}
+	const auto& info = destination.info;
+	for (uint32_t level = info.first_tail_level; level < info.resources.levels; ++level) {
+		const auto& mip = info.mip_layout[level];
+		destination.CopyMipRegion(
+		    source, level, layer,
+		    {static_cast<int32_t>(mip.tail_x), static_cast<int32_t>(mip.tail_y), 0});
+	}
+	if (source.IsGpuModified()) {
+		destination.MarkGpuModified();
+	}
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -889,6 +962,24 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
 		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
 		     static_cast<uint32_t>(cached.info.tile_mode));
+	}
+
+	if (const auto layer = MipTailBlockLayer(cached.info, requested); layer >= 0) {
+		if (!merged_id) {
+			merged_id                      = InsertImage(requested);
+			m_slot_images[merged_id].usage = m_slot_images[cached_id].usage;
+			InitializeImage(merged_id);
+		}
+		auto& tail = m_slot_images[cached_id];
+		tail.binding.needs_rebind |= tail.binding.is_bound || tail.binding.is_target;
+		m_slot_images[merged_id].binding.is_target |= tail.binding.is_target;
+		CopyImageMipTail(merged_id, cached_id, static_cast<uint32_t>(layer));
+		// The array now holds the view's GPU writes, so it takes over a pending writeback.
+		if (m_download_images.contains(cached_id)) {
+			m_download_images.insert(merged_id);
+		}
+		FreeImage(cached_id);
+		return {merged_id};
 	}
 
 	if (const auto view = requested.SubresourceOf(cached.info); view.mip >= 0) {

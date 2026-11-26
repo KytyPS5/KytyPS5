@@ -259,6 +259,8 @@ private:
 	[[nodiscard]] ImageId FindStencilPlane(const Image& depth, GuestRange range) const;
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
+	// Copies each tail level of one layer from a view of its whole mip-tail block.
+	void CopyImageMipTail(ImageId destination, ImageId source, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);

@@ -355,7 +355,7 @@ TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer inpu
 	auto& buffer = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
 	if (!buffer || buffer->Size() < size) {
 		if (buffer) {
-			m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });
+			m_scheduler.DeferRelease([old = std::move(buffer)]() mutable { old.reset(); });
 		}
 		buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
 		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |

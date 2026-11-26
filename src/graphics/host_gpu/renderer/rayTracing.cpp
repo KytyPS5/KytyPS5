@@ -257,14 +257,14 @@ void RayTracing::Create(Structure& structure, const vk::AccelerationStructureGeo
 // Retired buffers and structures outlive the commands recorded so far.
 void RayTracing::Retire(std::unique_ptr<Buffer>& buffer) {
 	if (buffer) {
-		m_scheduler.DeferOperation([retired = std::move(buffer)] {});
+		m_scheduler.DeferRelease([retired = std::move(buffer)] {});
 	}
 }
 
 void RayTracing::Retire(Structure& structure) {
 	if (structure.handle) {
-		m_scheduler.DeferOperation([device = m_graphics.device, handle = structure.handle,
-		                            retired = std::move(structure.buffer)] {
+		m_scheduler.DeferRelease([device = m_graphics.device, handle = structure.handle,
+		                          retired = std::move(structure.buffer)] {
 			device.destroyAccelerationStructureKHR(handle, nullptr);
 		});
 	}

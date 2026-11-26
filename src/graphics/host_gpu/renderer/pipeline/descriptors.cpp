@@ -980,7 +980,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
 	}
-	m_descriptor_images.resize(image_descriptor_count);
+	// Writes below overwrite and submit only the active prefix. Keep larger draws' scratch
+	// slots alive so alternating descriptor counts do not repeatedly initialize them.
+	if (m_descriptor_images.size() < image_descriptor_count) {
+		m_descriptor_images.resize(image_descriptor_count);
+	}
 	m_descriptor_writes.clear();
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;

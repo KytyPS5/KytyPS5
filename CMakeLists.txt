@@ -964,6 +964,44 @@ if(BUILD_TESTING)
 		vr_tracker2_tests
 		user_service_tests
 	)
+
+	set(kyty_ci_tests
+		audio_out2_port
+		ngs2_sampler
+		pad_haptics
+		controller_settings
+		host_input
+		ime_dialog
+		lru_cache
+		virtual_memory_allocation
+		resource_tracking
+		scalar_provenance
+		resource_materialization
+		shader_vertex_metadata
+		archive_file
+		avplayer_file
+		memory_tracker
+		page_manager
+		image_page_table
+		bit_array
+		build_flags
+		event_queue_lifetime
+		sync_on_address
+		save_data_memory
+		trophy_system
+		audio_out_timing
+		ajm_resample
+		png_enc
+		jpeg_dec
+		jpeg_enc
+		occlusion_queries
+		ces
+		save_data_dialog
+		psml
+	)
+	set_tests_properties(${kyty_ci_tests} PROPERTIES LABELS ci)
+	list(TRANSFORM kyty_ci_tests APPEND _tests OUTPUT_VARIABLE kyty_ci_test_targets)
+	add_custom_target(ci_tests DEPENDS ${kyty_ci_test_targets})
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.

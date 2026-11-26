@@ -630,6 +630,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                     std::countr_zero(samples));
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
+		// As with unmapped texels, a heap entry with an unusable DCC address stays null.
+		if (resource.heap && !desc.info.metadata.ValidColorRange()) {
+			return {.layout = vk::ImageLayout::eGeneral};
+		}
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);

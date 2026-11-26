@@ -36,6 +36,11 @@ struct ImageMetadataInfo {
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
 	bool                dcc_alpha_msb        = true;
+
+	// A color metadata address can be known even when its byte count is not.
+	[[nodiscard]] constexpr bool ValidColorRange() const noexcept {
+		return GuestRange {range.address, range.size == 0 ? 1 : range.size}.Valid();
+	}
 };
 
 struct ImageSubresources {

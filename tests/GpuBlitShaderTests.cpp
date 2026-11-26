@@ -9,6 +9,22 @@
 
 namespace {
 
+TEST(ImageMetadata, ColorRangeMayHaveUnknownSizeButMustHaveAValidAddress) {
+	using namespace Libs::Graphics;
+	ImageMetadataInfo metadata {};
+	EXPECT_FALSE(metadata.ValidColorRange());
+	metadata.range = {LOWER_ADDRESS_SIZE - 1, 0};
+	EXPECT_TRUE(metadata.ValidColorRange());
+	metadata.range.size = 1;
+	EXPECT_TRUE(metadata.ValidColorRange());
+	metadata.range.size = 2;
+	EXPECT_FALSE(metadata.ValidColorRange());
+	metadata.range = {LOWER_ADDRESS_SIZE, 0};
+	EXPECT_FALSE(metadata.ValidColorRange());
+	metadata.range = {UINT64_MAX, 2};
+	EXPECT_FALSE(metadata.ValidColorRange());
+}
+
 TEST(VideoOutFormat, SourceFlagsAndRouting) {
 	struct Case {
 		uint64_t format;

@@ -117,6 +117,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("C4l9fB17t8w", AgcDcbEventWriteGetSize);
 	LIB_FUNC("57labkp+rSQ", AgcDcbAcquireMem);
 	LIB_FUNC("-vnlTPPXPrw", AgcDcbAcquireMemGetSize);
+	LIB_FUNC("W0WEyog0f74", AgcAcquireMemSetEngine);
 	LIB_FUNC("oz6zQq1JwCE", AgcDcbAtomicMemGetSize);
 	LIB_FUNC("1rZSWUv1IRc", AgcDcbCopyData);
 	LIB_FUNC("b5u0Jzm8TF8", AgcDcbCopyDataGetSize);

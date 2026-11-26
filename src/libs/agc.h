@@ -279,6 +279,7 @@ int KYTY_SYSV_ABI       AgcSetRangePredication(uint32_t* start, const volatile u
                                                uint32_t predication);
 int KYTY_SYSV_ABI       AgcSetNop(uint32_t* packet);
 int KYTY_SYSV_ABI       AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state);
+int KYTY_SYSV_ABI       AgcAcquireMemSetEngine(uint32_t* cmd, uint8_t engine);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetCommandAddress(uint32_t*                cmd,
                                                           const volatile uint32_t* command);

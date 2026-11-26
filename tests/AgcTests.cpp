@@ -40,6 +40,27 @@ TEST(Agc, AcquireMemWritesBackInvalidatedGl2) {
 	}
 }
 
+TEST(Agc, AcquireMemSetEnginePatchesOnlyEngineBit) {
+	Loader::SymbolDatabase symbols;
+	Libs::InitAgcDriver_1(&symbols);
+	const auto* symbol = symbols.Find({"W0WEyog0f74", "Agc", "Agc", Loader::SymbolType::Func});
+	ASSERT_NE(symbol, nullptr);
+	using SetEngine = int(KYTY_SYSV_ABI*)(uint32_t*, uint8_t);
+	const auto set_engine = reinterpret_cast<SetEngine>(symbol->vaddr);
+
+	Packet<8> dcb;
+	auto* cmd = Agc::AgcDcbAcquireMem(dcb.Buf(), 1, 0x40u, 0x100u, nullptr, 0, 400);
+	auto expected = dcb.dw;
+	for (uint8_t engine: {0, 1}) {
+		expected[1] = 0x40u | (uint32_t{engine} << 31u);
+		EXPECT_EQ(set_engine(cmd, engine), 0);
+		EXPECT_EQ(dcb.dw, expected);
+	}
+	expected[0] = cmd[0] = 0xc0005900u; // REWIND
+	EXPECT_EQ(set_engine(cmd, 0), static_cast<int>(0x8a6c000cu));
+	EXPECT_EQ(dcb.dw, expected);
+}
+
 TEST(Agc, FixedPacketSizeExportsReturnBytes) {
 	Loader::SymbolDatabase symbols;
 	Libs::InitAgcDriver_1(&symbols);

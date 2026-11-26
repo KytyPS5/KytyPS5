@@ -3536,13 +3536,21 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
-	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_REWIND) {
+static int patch_packet_control_bit31(uint32_t* cmd, uint32_t opcode, uint8_t value) {
+	if (((cmd[0] >> 8u) & 0xffu) != opcode) {
 		return AGC_ERROR_INVALID_PACKET;
 	}
 
-	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(state) << 31u);
+	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(value) << 31u);
 	return OK;
+}
+
+int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
+	return patch_packet_control_bit31(cmd, Pm4::IT_REWIND, state);
+}
+
+int KYTY_SYSV_ABI AgcAcquireMemSetEngine(uint32_t* cmd, uint8_t engine) {
+	return patch_packet_control_bit31(cmd, Pm4::IT_ACQUIRE_MEM, engine);
 }
 
 int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {

@@ -1868,6 +1868,8 @@ static constexpr auto MakeContextIndirectTable() {
 		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, EXEC_ON_NOOP) != 0;
 		db_shader_control.alpha_to_mask_disable =
 		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, ALPHA_TO_MASK_DISABLE) != 0;
+		db_shader_control.depth_before_shader =
+		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, DEPTH_BEFORE_SHADER) != 0;
 		cp.GetCtx().SetDepthShaderControl(db_shader_control);
 	};
 

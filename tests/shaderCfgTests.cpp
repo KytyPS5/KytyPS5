@@ -10953,47 +10953,41 @@ void TestLogicalAlphaBlendExport() {
         "guest dual-source export was replaced by synthetic alpha");
 }
 
-void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
+void TestNewShaderRecompilerPixelDepthOrder() {
   constexpr uint32_t ExecutionModeEarlyFragmentTests = 9;
-
-  const uint32_t shader[] = {
-      EncodeExp0(0x00, 0xf, true, false, true),
-      EncodeExp1(0, 1, 2, 3),
-      0xbf810000u,
-  };
-
-  ShaderPixelInputInfo ps_info;
-  ps_info.ps_early_z = true;
-  ps_info.ps_pixel_kill_enable = true;
-
-  auto options = MakeCompileOptions(ShaderType::Pixel);
-  options.input_info.pixel = &ps_info;
-
-  auto result = RecompileForTest(shader, options);
-  Check(SpirvInstructionOpcodeCount(result.spirv, 252) != 0,
-        "pixel valid-mask export should still lower to OpKill");
-  Check(!SpirvContainsExecutionMode(result.spirv,
-                                    ExecutionModeEarlyFragmentTests),
-        "pixel shaders that may kill fragments must not request "
-        "EarlyFragmentTests");
-  CheckSpirvBinaryValidates(result.spirv);
-
-  const uint32_t ordinary_shader[] = {
-      EncodeExp0(0x00, 0xf),
-      EncodeExp1(0, 1, 2, 3),
-      0xbf810000u,
-  };
-  ps_info.ps_pixel_kill_enable = false;
-  auto ordinary_result = RecompileForTest(ordinary_shader, options);
-  const auto ordinary_source = DisassembleSpirvBinary(ordinary_result.spirv);
-  Check(SpirvInstructionOpcodeCount(ordinary_result.spirv, 252) == 0,
-        "ordinary pixel shader unexpectedly contains OpKill");
-  Check((ordinary_source.find("pixel_valid_mask_active") == std::string::npos),
-        "ordinary pixel shader allocated pixel-valid state");
-  Check(SpirvContainsExecutionMode(ordinary_result.spirv,
-                                   ExecutionModeEarlyFragmentTests),
-        "ordinary early-Z pixel shader lost EarlyFragmentTests");
-  CheckSpirvBinaryValidates(ordinary_result.spirv);
+  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  const std::array cases{std::array{false, false, true},
+                         std::array{true, false, false},
+                         std::array{true, true, true}};
+  for (const auto &[kill, depth_before_shader, early_tests] : cases) {
+    const uint32_t shader[] = {EncodeExp0(0x00, 0xf, true, false, kill),
+                               EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01)};
+    HW::PixelShaderInfo regs{};
+    regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+    ShaderMappedData mapped{};
+    mapped.code_size_bytes = sizeof(shader);
+    ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+    HW::ShaderRegisters sh{};
+    sh.db_shader_control.shader_z_behavior = 1;
+    sh.db_shader_control.shader_kill_enable = kill;
+    sh.db_shader_control.depth_before_shader = depth_before_shader;
+    ShaderPixelInputInfo input{};
+    const auto params = PrepareProgram(regs, sh, mappings, input);
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &input;
+    const auto result = RecompileForTest(params.code, options);
+    Check(SpirvContainsExecutionMode(result.spirv, ExecutionModeEarlyFragmentTests) ==
+              early_tests,
+          "pixel depth ordering did not match DB_SHADER_CONTROL");
+    Check((SpirvInstructionOpcodeCount(result.spirv, 252) != 0) == kill,
+          "pixel discard did not match the valid-mask export");
+    if (!kill) {
+      Check(DisassembleSpirvBinary(result.spirv).find("pixel_valid_mask_active") ==
+                std::string::npos,
+            "ordinary pixel shader allocated pixel-valid state");
+    }
+    CheckSpirvBinaryValidates(result.spirv);
+  }
 }
 
 void TestNewShaderRecompilerNativeBindingPlan() {
@@ -13788,7 +13782,7 @@ int main() {
   TestRenderTargetReverseExportMapping();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();
-  TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
+  TestNewShaderRecompilerPixelDepthOrder();
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();
   TestPatternFill();

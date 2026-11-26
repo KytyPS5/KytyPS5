@@ -335,6 +335,7 @@ struct DepthShaderControl {
 	bool    shader_dual_export_enable = false;
 	bool    shader_execute_on_noop    = false;
 	bool    alpha_to_mask_disable     = false;
+	bool    depth_before_shader       = false;
 };
 
 struct AaConfig {

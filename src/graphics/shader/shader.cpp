@@ -366,14 +366,14 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_ancillary                 = (active_inputs & 0x00002000u) != 0;
 	ps_info.ps_sample_shading            = (active_inputs & 0x00000011u) != 0;
 	ps_info.ps_no_perspective            = (sh.ps_input_ena & sh.ps_input_addr & 0x00000020u) != 0;
-	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
-	ps_info.ps_depth_export_enable       = sh.db_shader_control.shader_z_export_enable;
-	ps_info.ps_sample_mask_export_enable = sh.db_shader_control.shader_mask_export_enable;
-	// Alpha-to-mask coverage must gate depth writes, so it rules out early fragment tests.
-	ps_info.ps_early_z =
-	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
-	     !sh.db_shader_control.shader_z_export_enable &&
-	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
+	const auto& db = sh.db_shader_control;
+	ps_info.ps_pixel_kill_enable         = db.shader_kill_enable;
+	ps_info.ps_depth_export_enable       = db.shader_z_export_enable;
+	ps_info.ps_sample_mask_export_enable = db.shader_mask_export_enable;
+	ps_info.ps_early_z = db.depth_before_shader ||
+	                     (db.shader_z_behavior == 1 && !db.shader_kill_enable &&
+	                      !db.shader_z_export_enable && !db.shader_mask_export_enable &&
+	                      !sh.AlphaToMask());
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
@@ -512,7 +512,6 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
 	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
 	key.push_back(static_cast<uint32_t>(info.parameter_mode));
-	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));

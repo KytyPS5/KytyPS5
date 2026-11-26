@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <optional>
@@ -216,15 +217,33 @@ uint32_t EmitPixelAttribute(EmitterState& state, const InputBinding& input, uint
 	                                  ? IR::StageInputKind::BaryCoordNoPerspective
 	                                  : IR::StageInputKind::BaryCoordSmooth;
 	const auto barycentric      = InputVariableForKind(state, barycentric_kind);
-	uint32_t   sum              = 0;
-	for (uint32_t vertex = 0; vertex < 3u; vertex++) {
+	const auto load_weight      = [&](uint32_t vertex) {
 		const auto pointer = state.builder.AllocateId();
 		const auto weight  = state.builder.AllocateId();
-		const auto product = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain,
 		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
 		                          pointer, barycentric, ConstantU32(state, vertex));
 		state.builder.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
+		return weight;
+	};
+	std::array<uint32_t, 3> weights {};
+	if (state.profile.derive_barycentric_x) {
+		weights[1]       = load_weight(1u);
+		weights[2]       = load_weight(2u);
+		const auto other = state.builder.AllocateId();
+		weights[0]       = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFAdd, TypeF32(state), other, weights[1], weights[2]);
+		state.builder.AddFunction(spv::OpFSub, TypeF32(state), weights[0],
+		                          ConstantF32(state, 0x3f800000u), other);
+	} else {
+		for (uint32_t vertex = 0; vertex < 3u; vertex++) {
+			weights[vertex] = load_weight(vertex);
+		}
+	}
+	uint32_t sum = 0;
+	for (uint32_t vertex = 0; vertex < 3u; vertex++) {
+		const auto weight  = weights[vertex];
+		const auto product = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpFMul, TypeF32(state), product,
 		                          select(LoadVertexParameter(state, input, vertex, chan)), weight);
 		if (vertex == 0u) {

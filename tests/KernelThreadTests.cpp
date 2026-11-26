@@ -24,6 +24,16 @@ TEST(KernelThread, SleepEndsAtItsDeadline) {
 	EXPECT_LT(elapsed, 1004000000u);
 }
 
+TEST(KernelThread, PosixSoloschedAttributeRoundTrips) {
+	LibKernel::PthreadAttr attr = nullptr;
+	ASSERT_EQ(LibKernel::PthreadAttrInit(&attr), 0);
+	int solosched = 0;
+	EXPECT_EQ(Libs::Posix::pthread_attr_setsolosched_np(&attr, 1), 0);
+	EXPECT_EQ(LibKernel::PthreadAttrGetsolosched(&attr, &solosched), 0);
+	EXPECT_EQ(solosched, 1);
+	EXPECT_EQ(LibKernel::PthreadAttrDestroy(&attr), 0);
+}
+
 TEST(KernelThread, ThreadsWithoutACpuSetTakeTheCreatorsCpus) {
 	LibKernel::KernelCpumask mask = 0;
 	EXPECT_EQ(LibKernel::PthreadGetaffinity(LibKernel::PthreadSelf(), &mask), 0);

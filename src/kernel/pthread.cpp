@@ -4194,6 +4194,12 @@ int KYTY_SYSV_ABI pthread_attr_setinheritsched(LibKernel::PthreadAttr* attr, int
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetinheritsched(attr, inherit_sched));
 }
 
+int KYTY_SYSV_ABI pthread_attr_setsolosched_np(LibKernel::PthreadAttr* attr, int solosched) {
+	// PRINT_NAME();
+
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetsolosched(attr, solosched));
+}
+
 int KYTY_SYSV_ABI pthread_attr_setschedparam(LibKernel::PthreadAttr*            attr,
                                              const LibKernel::KernelSchedParam* param) {
 	// PRINT_NAME();

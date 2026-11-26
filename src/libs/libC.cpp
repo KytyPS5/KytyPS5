@@ -25,6 +25,7 @@
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -55,6 +56,31 @@ using InitEnvParams = Loader::EntryParams;
 static int                g_argc = 0;
 static const char* const* g_argv = nullptr;
 static const char* const* g_envp = nullptr;
+
+struct GuestEnvironment {
+	std::mutex                                   mutex;
+	std::unordered_map<std::string, std::string> values;
+};
+
+static GuestEnvironment& GetGuestEnvironment() {
+	static GuestEnvironment environment;
+	return environment;
+}
+
+static void ResetGuestEnvironment(const char* const* envp) {
+	auto&                       environment = GetGuestEnvironment();
+	std::lock_guard<std::mutex> lock(environment.mutex);
+
+	environment.values.clear();
+
+	for (const char* const* entry = envp; entry != nullptr && *entry != nullptr; entry++) {
+		const char* separator = std::strchr(*entry, '=');
+		if (separator == nullptr || separator == *entry) {
+			continue;
+		}
+		environment.values.emplace(std::string(*entry, separator), std::string(separator + 1));
+	}
+}
 
 int GetArgc() {
 	return g_argc;
@@ -254,6 +280,7 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 		g_argc = 0;
 		g_argv = nullptr;
 		g_envp = nullptr;
+		ResetGuestEnvironment(nullptr);
 		return;
 	}
 
@@ -262,6 +289,7 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 	g_argc = params->argc;
 	g_argv = params->argv;
 	g_envp = params->argv + params->argc + 1;
+	ResetGuestEnvironment(g_envp);
 
 	LOGF("\t argc = %d\n"
 	     "\t argv = 0x%016" PRIx64 "\n"
@@ -312,7 +340,35 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 	}
 
 	// Guest environment changes must not leak into emulator host libraries.
+	auto&                       environment = GetGuestEnvironment();
+	std::lock_guard<std::mutex> lock(environment.mutex);
+
+	auto [it, inserted] = environment.values.try_emplace(name, value);
+	if (!inserted && overwrite != 0) {
+		it->second = value;
+	}
+
 	return 0;
+}
+
+static KYTY_SYSV_ABI char* getenv(const char* name) {
+	PRINT_NAME();
+
+	LOGF("\t name = %s\n", (name != nullptr ? name : "<null>"));
+
+	if (name == nullptr || name[0] == '\0' || name[0] == '=') {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return nullptr;
+	}
+
+	const char* separator = std::strchr(name, '=');
+	const auto  key       = separator != nullptr ? std::string(name, separator) : std::string(name);
+
+	auto&                       environment = GetGuestEnvironment();
+	std::lock_guard<std::mutex> lock(environment.mutex);
+
+	auto it = environment.values.find(key);
+	return it != environment.values.end() ? it->second.data() : nullptr;
 }
 
 static KYTY_SYSV_ABI int64_t libc_time(int64_t* timer) {
@@ -796,6 +852,7 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("hcuQgD53UxM", LibC::libc_printf);
 	LIB_FUNC("YQ0navp+YIc", LibC::puts);
 	LIB_FUNC("M4YYbSFfJ8g", LibC::setenv);
+	LIB_FUNC("smbQukfxYJM", LibC::getenv);
 	LIB_FUNC("wLlFkwG9UcQ", LibC::libc_time);
 	LIB_FUNC("-VVn74ZyhEs", LibC::libc_difftime);
 	LIB_FUNC("1mecP7RgI2A", LibC::libc_gmtime);

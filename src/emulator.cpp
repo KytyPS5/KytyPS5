@@ -104,6 +104,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	}
 
 	// Initialization order is explicit; destruction is automatic and reversed.
+	// Memory::Initialize reserves Region 0 first. After the Vulkan device is created,
+	// agc.cpp reserves Regions 1 and 2, leaving room for driver initialization.
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();

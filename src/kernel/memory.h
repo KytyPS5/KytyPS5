@@ -5,6 +5,11 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+#include <utility>
+#include <vector>
+#endif
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -13,6 +18,9 @@ enum class PageFaultAccess;
 namespace Libs::LibKernel::Memory {
 
 void Initialize();
+// Reserves the host virtual address ranges that the PS5 guest uses. Must be called after
+// all host subsystems that allocate address space (e.g. Graphics / DLSS) are initialised.
+void ReserveGuestAddressSpace();
 void Shutdown();
 
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
@@ -232,6 +240,7 @@ void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
+uint64_t TestGuestRegionFreePage(size_t region);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
 uint64_t TestFlexibleBackingHighWater();
@@ -240,6 +249,11 @@ uint64_t TestDirectMappingCount();
 uint64_t TestFlexibleMappingCount();
 uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
+// Pure helper used by POSIX guest-region reservation; [start, end) occupied, aligned free out.
+std::vector<std::pair<uint64_t, uint64_t>>
+TestAlignedFreeRangesInRegion(uint64_t region_start, uint64_t region_end,
+                              const std::vector<std::pair<uint64_t, uint64_t>>& occupied,
+                              uint64_t                                          alignment);
 #endif
 
 } // namespace Libs::LibKernel::Memory

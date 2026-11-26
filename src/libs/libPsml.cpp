@@ -583,20 +583,14 @@ int CheckDispatch(const Context* context, const CommandSpace* space,
 	if (output.Width5() + 1u < context->width || output.Height5() + 1u < context->height) {
 		return INVALID_TEXTURE;
 	}
-	const auto is_valid = [](const Graphics::ShaderTextureResource& descriptor) {
-		return Pssr::IsColorFormat(descriptor.Format()) &&
-		       descriptor.Type() == Graphics::Prospero::ImageType::kColor2D &&
-		       descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
-		       descriptor.BaseArray5() == 0 && descriptor.Depth() == 0;
-	};
-	if (!is_valid(output)) {
+	if (!Pssr::IsMfsr2Texture(output)) {
 		return INVALID_TEXTURE;
 	}
 	if (params->color == nullptr) {
 		return TEXTURE_NULL;
 	}
 	std::memcpy(color.fields, params->color, sizeof(color.fields));
-	if (!is_valid(color) || params->x + params->width > color.Width5() + 1u ||
+	if (!Pssr::IsMfsr2Texture(color) || params->x + params->width > color.Width5() + 1u ||
 	    params->y + params->height > color.Height5() + 1u) {
 		return INVALID_TEXTURE;
 	}
@@ -719,7 +713,8 @@ int KYTY_SYSV_ABI GetDispatchPackets(Context* context, const CommandSpace* space
 	}
 	constexpr uint32_t DILATED_MOTION = 1u << 2;
 	// Reverse depth and auto exposure are bits 0 and 1.
-	uint32_t flags = params->flags & (Pssr::kReverseDepth | Pssr::kAutoExposure);
+	uint32_t flags =
+	    Pssr::kFromMfsr2 | (params->flags & (Pssr::kReverseDepth | Pssr::kAutoExposure));
 	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
 		flags |= Pssr::kSpatialOnly;
 	}

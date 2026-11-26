@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_PSSR_H_
 
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/shaderBindings.h"
 
 #include <cstdint>
 
@@ -12,6 +13,7 @@ enum Flags : uint32_t {
 	kAutoExposure = 1u << 1,
 	kReset        = 1u << 2, // the history is discarded
 	kSpatialOnly  = 1u << 3, // the inputs fit no temporal upscaler
+	kFromMfsr2    = 1u << 4,
 };
 
 // Zeroed depth, motion and exposure descriptors are absent inputs. Motion vectors times
@@ -44,6 +46,12 @@ inline bool IsColorFormat(Prospero::BufferFormat format) {
 		case Prospero::BufferFormat::k16_16_16_16Float: return true;
 		default: return false;
 	}
+}
+
+inline bool IsMfsr2Texture(const ShaderTextureResource& descriptor) {
+	return IsColorFormat(descriptor.Format()) &&
+	       descriptor.Type() == Prospero::ImageType::kColor2D && descriptor.BaseLevel() == 0 &&
+	       descriptor.LastLevel() == 0 && descriptor.BaseArray5() == 0 && descriptor.Depth() == 0;
 }
 
 } // namespace Libs::Graphics::Pssr

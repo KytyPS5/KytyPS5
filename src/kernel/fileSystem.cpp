@@ -29,6 +29,20 @@
 #include <system_error>
 #include <vector>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h> // IWYU pragma: keep
+// common/file.h declares members with these names and removes the aliases before doing so;
+// including windows.h afterwards would put them back.
+#ifdef CreateDirectory
+#undef CreateDirectory
+#endif
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
+#else
+#include <sys/time.h>
+#endif
+
 namespace Libs::LibKernel::FileSystem {
 
 LIB_NAME("libkernel", "libkernel");
@@ -126,8 +140,18 @@ static void SetStatTimes(FileStat* stat, std::optional<Common::File::Times> time
 		times = {now, now};
 	}
 	constexpr int64_t NANOS_PER_SEC = 1000000000;
-	stat->st_atim     = {times->access_ns / NANOS_PER_SEC, times->access_ns % NANOS_PER_SEC};
-	stat->st_mtim     = {times->write_ns / NANOS_PER_SEC, times->write_ns % NANOS_PER_SEC};
+	// Truncating division rounds negative values toward zero, so normalize the remainder.
+	const auto split = [](int64_t nanos) {
+		auto seconds     = nanos / NANOS_PER_SEC;
+		auto nanoseconds = nanos % NANOS_PER_SEC;
+		if (nanoseconds < 0) {
+			--seconds;
+			nanoseconds += NANOS_PER_SEC;
+		}
+		return KernelTimespec {seconds, nanoseconds};
+	};
+	stat->st_atim     = split(times->access_ns);
+	stat->st_mtim     = split(times->write_ns);
 	stat->st_ctim     = stat->st_atim;
 	stat->st_birthtim = stat->st_mtim;
 }
@@ -1185,10 +1209,12 @@ int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {
 
 	FileStat stat {};
 	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
+	// Reading a directory can update its access time, so query the times before enumerating.
+	const auto     times = Common::File::GetTimes(real_file_name);
 	const uint64_t size =
 	    is_dir ? PackDirents(Common::File::GetDirEntries(real_file_name)).size() : info->size;
 	SetStatSize(&stat, size, is_dir);
-	SetStatTimes(&stat, is_dir ? std::nullopt : Common::File::GetTimes(real_file_name));
+	SetStatTimes(&stat, times);
 	*sb = stat;
 
 	return OK;
@@ -1240,6 +1266,7 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 		SetStatSize(&stat, size, false);
 	} else {
 		SetStatSize(&stat, file->dirents.size(), true);
+		times = Common::File::GetTimes(file->real_name);
 	}
 
 	SetStatTimes(&stat, times);
@@ -1447,6 +1474,139 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	}
 
 	LOGF("\tKernelRename: %s -> %s\n", from, to);
+
+	return OK;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// FILETIME counts 100 ns intervals from 1601-01-01; the Unix epoch is 11644473600 s later.
+// Values outside the 64-bit FILETIME range are rejected instead of wrapping.
+static bool UnixTimevalToFileTime(const KernelTimeval& value, FILETIME& result) {
+	constexpr int64_t  EpochDelta     = 11644473600ll;
+	constexpr uint64_t TicksPerSecond = 10000000ull;
+	const int64_t      seconds        = value.tv_sec;
+	if (seconds < -EpochDelta || seconds > INT64_MAX - EpochDelta) return false;
+	const auto     since_epoch = static_cast<uint64_t>(seconds + EpochDelta);
+	const uint64_t sub_ticks   = static_cast<uint64_t>(value.tv_usec) * 10ull;
+	if (since_epoch > (UINT64_MAX - sub_ticks) / TicksPerSecond) return false;
+	const uint64_t ticks = since_epoch * TicksPerSecond + sub_ticks;
+	// Some hosts read a zero FILETIME as "leave unchanged"; reject the exact 1601 epoch so a
+	// successful call always stores the requested value.
+	if (ticks == 0) return false;
+	result               = {};
+	result.dwLowDateTime  = static_cast<DWORD>(ticks);
+	result.dwHighDateTime = static_cast<DWORD>(ticks >> 32u);
+	return true;
+}
+
+static int WindowsErrorToErrno(DWORD error) {
+	switch (error) {
+		case ERROR_FILE_NOT_FOUND:
+		case ERROR_PATH_NOT_FOUND: return ENOENT;
+		case ERROR_ACCESS_DENIED:
+		case ERROR_SHARING_VIOLATION: return EACCES;
+		case ERROR_DIRECTORY: return ENOTDIR;
+		case ERROR_WRITE_PROTECT: return EROFS;
+		case ERROR_INVALID_NAME: return EINVAL;
+		case ERROR_FILENAME_EXCED_RANGE: return ENAMETOOLONG;
+		default: return EIO;
+	}
+}
+#endif
+
+int KYTY_SYSV_ABI KernelUtimes(const char* path, const KernelTimeval* times) {
+	PRINT_NAME();
+
+	// FreeBSD validates the microseconds before it resolves the path.
+	if (times != nullptr && (times[0].tv_usec < 0 || times[0].tv_usec >= 1000000 ||
+	                         times[1].tv_usec < 0 || times[1].tv_usec >= 1000000)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (path == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (path[0] == '\0') {
+		return KERNEL_ERROR_ENOENT;
+	}
+	size_t component_length = 0;
+	for (size_t i = 0; path[i] != '\0'; ++i) {
+		if (i >= 1023) {
+			return KERNEL_ERROR_ENAMETOOLONG;
+		}
+		if (path[i] == '/' || path[i] == '\\') {
+			component_length = 0;
+		} else if (++component_length > 255) {
+			return KERNEL_ERROR_ENAMETOOLONG;
+		}
+	}
+
+	bool       read_only = false;
+	const auto real_name = g_mount_points->ResolvePath(path, &read_only);
+	if (real_name.empty()) {
+		return KERNEL_ERROR_ENOENT;
+	}
+	if (read_only) {
+		return KERNEL_ERROR_EROFS;
+	}
+
+	int result = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// _wutime carries whole seconds and cannot open directories. SetFileTime takes 100 ns
+	// values and a directory handle, so it keeps tv_usec and accepts directories.
+	FILETIME access {};
+	FILETIME modified {};
+	if (times != nullptr) {
+		if (!UnixTimevalToFileTime(times[0], access) ||
+		    !UnixTimevalToFileTime(times[1], modified)) {
+			return KERNEL_ERROR_EOVERFLOW;
+		}
+	}
+	const HANDLE handle = ::CreateFileW(real_name.wstring().c_str(), FILE_WRITE_ATTRIBUTES,
+	                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	                                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+	                                    nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		errno  = WindowsErrorToErrno(::GetLastError());
+		result = -1;
+	} else {
+		if (times == nullptr) {
+			// A null pointer leaves a time unchanged, so pass the current time explicitly.
+			::GetSystemTimeAsFileTime(&access);
+			modified = access;
+		}
+		if (!::SetFileTime(handle, nullptr, &access, &modified)) {
+			errno  = WindowsErrorToErrno(::GetLastError());
+			result = -1;
+		}
+		::CloseHandle(handle);
+	}
+#else
+	struct timeval        values[2] {};
+	const struct timeval* native_times = nullptr;
+	if (times != nullptr) {
+		values[0] = {static_cast<time_t>(times[0].tv_sec),
+		             static_cast<suseconds_t>(times[0].tv_usec)};
+		values[1] = {static_cast<time_t>(times[1].tv_sec),
+		             static_cast<suseconds_t>(times[1].tv_usec)};
+		native_times = values;
+	}
+	result = ::utimes(real_name.c_str(), native_times);
+#endif
+	if (result != 0) {
+		switch (static_cast<std::errc>(
+		    std::error_code(errno, std::generic_category()).default_error_condition().value())) {
+			case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;
+			case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
+			case std::errc::permission_denied: return KERNEL_ERROR_EACCES;
+			case std::errc::operation_not_permitted: return KERNEL_ERROR_EPERM;
+			case std::errc::read_only_file_system: return KERNEL_ERROR_EROFS;
+			case std::errc::invalid_argument: return KERNEL_ERROR_EINVAL;
+			case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
+			default: return KERNEL_ERROR_EIO;
+		}
+	}
+
+	LOGF("\tKernelUtimes: %s\n", Common::PathToString(real_name).c_str());
 
 	return OK;
 }

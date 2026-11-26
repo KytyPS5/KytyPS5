@@ -3174,6 +3174,7 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("WlyEA-sLDf0", FileSystem::KernelTruncate);
 	LIB_FUNC("AUXVxWeJU-A", FileSystem::KernelUnlink);
 	LIB_FUNC("52NcYU9+lEo", FileSystem::KernelRename);
+	LIB_FUNC("0Cq8ipKr9n0", FileSystem::KernelUtimes);
 	LIB_FUNC("taRWhTJFTgE", FileSystem::KernelGetdirentries);
 	LIB_FUNC("oib76F-12fk", FileSystem::KernelLseek);
 	LIB_FUNC("j2AIqSqJP0w", FileSystem::KernelGetdents);

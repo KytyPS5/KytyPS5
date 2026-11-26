@@ -952,6 +952,88 @@ void TestStatTimes() {
   Check(FileSystem::KernelClose(fd) == OK, "close stat time fixture");
 }
 
+void TestUtimes() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto* symbol = symbols.Find(
+      {"0Cq8ipKr9n0", "libkernel", "libkernel", Loader::SymbolType::Func});
+  Check(symbol != nullptr, "sceKernelUtimes export resolves");
+  const auto utimes = reinterpret_cast<int (KYTY_SYSV_ABI *)(
+      const char*, const Kernel::KernelTimeval *)>(symbol->vaddr);
+
+  constexpr char Path[] = "/savedata0/utimes-save.dat";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelClose(fd) == OK, "create utimes fixture");
+
+  const Kernel::KernelTimeval times[2] {{1600000000, 0}, {1700000000, 0}};
+  FileSystem::FileStat stat {};
+  Check(utimes(Path, times) == OK && FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_atim.tv_sec == 1600000000 &&
+            stat.st_mtim.tv_sec == 1700000000,
+        "sceKernelUtimes sets access and modification times");
+
+  // A null times pointer must store the current time, in both fields, not an old value.
+  const auto now_seconds = [] {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+  };
+  const auto update_current = [&](const char* path, const char* text) {
+    const auto before = now_seconds();
+    Check(utimes(path, nullptr) == OK && FileSystem::KernelStat(path, &stat) == OK, text);
+    const auto after = now_seconds();
+    // Coarse filesystems may round down; allow two seconds on either side.
+    Check(stat.st_atim.tv_sec >= before - 2 && stat.st_atim.tv_sec <= after + 2 &&
+              stat.st_mtim.tv_sec >= before - 2 && stat.st_mtim.tv_sec <= after + 2,
+          text);
+  };
+
+  const Kernel::KernelTimeval precise[2] {{1600000000, 123456}, {1700000000, 654321}};
+  Check(utimes(Path, precise) == OK && FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_atim.tv_sec == 1600000000 && stat.st_atim.tv_nsec == 123456000 &&
+            stat.st_mtim.tv_sec == 1700000000 && stat.st_mtim.tv_nsec == 654321000,
+        "sceKernelUtimes preserves microseconds");
+
+  constexpr char DirPath[] = "/savedata0/utimes-dir";
+  Check(FileSystem::KernelMkdir(DirPath, 0777) == OK, "create utimes directory fixture");
+  Check(utimes(DirPath, times) == OK && FileSystem::KernelStat(DirPath, &stat) == OK &&
+            stat.st_mtim.tv_sec == 1700000000,
+        "sceKernelUtimes updates directory times");
+  update_current(DirPath, "sceKernelUtimes without times updates directories");
+  Check(FileSystem::KernelRmdir(DirPath) == OK, "remove utimes directory fixture");
+
+  SetUnixWriteTime(FileSystem::GetRealFilename(Path), -500000000);
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_mtim.tv_sec == -1 &&
+            stat.st_mtim.tv_nsec == 500000000,
+        "negative host times normalize the nanosecond field");
+  SetUnixWriteTime(FileSystem::GetRealFilename(Path), 1600000000000000000);
+  Check(FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_mtim.tv_sec == 1600000000,
+        "reset utimes modification time");
+  update_current(Path, "sceKernelUtimes without times uses the current time");
+
+  const Kernel::KernelTimeval invalid[2] {{1700000000, -1}, {1700000000, 0}};
+  const Kernel::KernelTimeval invalid_high[2] {{1700000000, 1000000},
+                                                {1700000000, 0}};
+  Check(utimes(Path, invalid) == Kernel::KERNEL_ERROR_EINVAL &&
+            utimes(Path, invalid_high) == Kernel::KERNEL_ERROR_EINVAL,
+        "sceKernelUtimes rejects out-of-range microseconds");
+  Check(utimes(nullptr, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
+            utimes("", nullptr) == Kernel::KERNEL_ERROR_ENOENT &&
+            utimes("/unmapped/utimes.dat", nullptr) ==
+                Kernel::KERNEL_ERROR_ENOENT,
+        "sceKernelUtimes reports null, empty and unmapped paths");
+  const std::string separated =
+      "/savedata0/" + std::string(128, 'a') + "\\" + std::string(128, 'b');
+  Check(utimes(separated.c_str(), nullptr) == Kernel::KERNEL_ERROR_ENOENT,
+        "backslashes separate pathname components for the limit");
+  const std::string too_long = "/savedata0/" + std::string(1100, 'a');
+  Check(utimes(too_long.c_str(), nullptr) == Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "overlong guest pathnames are rejected");
+  Check(FileSystem::KernelUnlink(Path) == OK, "remove utimes fixture");
+}
+
 void TestFsync() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
@@ -3208,6 +3290,7 @@ int main(int argc, char** argv) {
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestStatTimes();
+  TestUtimes();
   TestFsync();
   TestSaveTruncate();
   TestSaveWritev();

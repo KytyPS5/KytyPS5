@@ -1815,6 +1815,11 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
                                           uint8_t, uint8_t, uint64_t, uint8_t);
   using WriteCounter = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint8_t, uint64_t,
                                            uint8_t, uint32_t);
+  using WriteCounterOnCompletion = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint32_t);
+  using MeasureWaitCounter = int (KYTY_SYSV_ABI *)(uint8_t, uint8_t, uint64_t, uint8_t,
+                                                  uint8_t, uint64_t, uint8_t);
+  using MeasureWriteCounter = int (KYTY_SYSV_ABI *)(uint8_t, uint8_t, uint64_t, uint8_t, uint32_t);
+  using MeasureWriteCounterOnCompletion = int (KYTY_SYSV_ABI *)(uint8_t, uint32_t);
   using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
   using WriteImmediately = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t,
                                                uint32_t);
@@ -1838,6 +1843,12 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
   const auto wait_counter = reinterpret_cast<WaitCounter>(find("cQb8Zr8Q0Y0"));
   const auto write_counter = reinterpret_cast<WriteCounter>(find("jK+yuYCI7MA"));
+  const auto write_counter_on_completion =
+      reinterpret_cast<WriteCounterOnCompletion>(find("3wn42MWTzTs"));
+  const auto measure_wait_counter = reinterpret_cast<MeasureWaitCounter>(find("ClnsFLLLcss"));
+  const auto measure_write_counter = reinterpret_cast<MeasureWriteCounter>(find("I-Qm+MEso5c"));
+  const auto measure_counter_on_completion =
+      reinterpret_cast<MeasureWriteCounterOnCompletion>(find("4muPEJ-x5N8"));
   const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
   const auto write_immediately = reinterpret_cast<WriteImmediately>(find("j0+3uJMxYJY"));
   const auto measure_write_address = reinterpret_cast<MeasureWriteAddress>(find("C+IEj+BsAFM"));
@@ -1976,6 +1987,46 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
             "submission wait observes the completed result");
     }
   }
+  constexpr std::array counter_words {0x07ff2002u, 0x07002102u, 0x00000001u,
+                                      0x07fff006u, 0x07000106u, 0x00000001u};
+  reset(1, sizeof(counter_words));
+  auto &counter_buffer = buffers[0];
+  auto *counter_header = counter_buffer.header.data();
+  const auto check_counter_size = [&](auto write, auto measure, auto... args) {
+    const auto start = offset(counter_header);
+    Check(write(counter_header, args...) == OK &&
+              static_cast<int>(offset(counter_header) - start) == measure(args...),
+          "counter record occupies its measured byte count");
+  };
+  check_counter_size(wait_counter, measure_wait_counter, 7, 1, 0xff, 1, 0, 0, 0);
+  check_counter_size(wait_counter, measure_wait_counter, 7, 1, 0x100, 1, 0, 0, 0);
+  check_counter_size(write_counter, measure_write_counter, 7, 1, 0xfff, 0, 0);
+  check_counter_size(write_counter_on_completion, measure_counter_on_completion, 7, 0x1000);
+  Check(offset(counter_header) == sizeof(counter_words) &&
+            std::equal(counter_words.begin(), counter_words.end(), counter_buffer.data.begin()),
+        "counter commands fill the buffer with their compact and extended records");
+  const auto full = counter_buffer;
+  Check(wait_counter(counter_header, 7, 1, 0xff, 1, 0, 0, 0) == Libs::LibKernel::KERNEL_ERROR_EBUSY &&
+            write_counter(counter_header, 7, 1, 0xfff, 0, 0) == Libs::LibKernel::KERNEL_ERROR_EBUSY &&
+            counter_buffer.header == full.header && counter_buffer.data == full.data,
+        "full counter command buffer preserves its header and data on overflow");
+  counter_header[0] |= 0x20000u; // APR map active
+  Check(write_counter_on_completion(counter_header, 7, 1) == Libs::LibKernel::KERNEL_ERROR_EPERM &&
+            offset(counter_header) == sizeof(counter_words),
+        "counter write rejected inside an APR map");
+  constexpr uint64_t wide = uint64_t{1} << 32;
+  constexpr int invalid_counter = Libs::LibKernel::KERNEL_ERROR_EINVAL;
+  Check(measure_wait_counter(7, 0, 0, 1, 1, 0xffff, 0) == 8 &&
+            measure_wait_counter(7, 0, 0, 1, 1, 0x10000, 0) == 12 &&
+            measure_wait_counter(7, 0, wide, 1, 1, wide, 0) == 20 &&
+            measure_wait_counter(7, 0, wide, 1, 0, 0, 0) == 12 &&
+            measure_write_counter(7, 0, wide, 0, 0) == 12 &&
+            measure_counter_on_completion(7, 0xfff) == 4,
+        "counter measurements account for wide operands, masks and immediate boundaries");
+  Check(measure_wait_counter(7, 1, 0, 7, 0, 0, 0) == invalid_counter &&
+            measure_write_counter(7, 1, 0, 5, 0) == invalid_counter &&
+            measure_counter_on_completion(128, 0) == invalid_counter,
+        "counter measurements return the signed error for invalid parameters");
   constexpr std::array counter_comparisons {
       Comparison{1, 0, 0, 1}, Comparison{1, 0, 0, 1},
       Comparison{4, 0x7ffffffe, 0x7fffffff, 0x80000000},

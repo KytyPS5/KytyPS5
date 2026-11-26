@@ -205,9 +205,63 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	while (info.pixel_format != vk::Format::eUndefined &&
+	       m_slot_images[id].backing.image == nullptr) {
+		m_slot_images.erase(id);
+		if (!ReleaseIdleImages(info.data)) {
+			EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
+			     info.extent.width, info.extent.height, info.extent.depth,
+			     static_cast<int>(info.pixel_format), info.IsVolume() ? 1u : info.resources.layers,
+			     info.resources.levels);
+		}
+		id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	}
 	RegisterImage(id);
 	return id;
+}
+
+bool TextureCache::ReleaseIdleImages(GuestRange requested) {
+	if (!m_scheduler.Active() || m_gc_tick == 0) {
+		return false;
+	}
+	std::vector<ImageId> candidates;
+	m_lru_cache.ForEachItemBelow(m_gc_tick - 1, [&](ImageId id) { candidates.push_back(id); });
+	std::vector<ImageId> released;
+	uint64_t             released_size = 0;
+	for (const auto id: candidates) {
+		if (released_size >= requested.size) {
+			break;
+		}
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->backing.image == nullptr || image->tick_accessed_last == m_gc_tick ||
+		    image->heap_refs.load(std::memory_order_relaxed) != 0u || image->binding.is_bound ||
+		    image->binding.is_target || image->usage.video_out ||
+		    image->Overlaps(requested.address, requested.size)) {
+			continue;
+		}
+		if (image->IsGpuModified() && image->IsMaybeCpuDirty()) {
+			TrackImage(id);
+			image->ResolveMaybeCpuHash(image->HashGuestEdges());
+		}
+		if (image->SafeToDownload() && (image->info.HasStencil() || !DownloadImageMemory(id))) {
+			continue;
+		}
+		released_size += image->AccountedSize();
+		released.push_back(id);
+		FreeImage(id);
+	}
+	if (released.empty()) {
+		return false;
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto id: released) {
+		m_slot_images[id].ReleaseBacking();
+	}
+	return true;
 }
 
 void TextureCache::RegisterImage(ImageId id) {

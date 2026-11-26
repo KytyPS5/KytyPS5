@@ -44,6 +44,7 @@ using callback_func_t = void (*)(uintptr_t addr, size_t size);
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
 constexpr uint64_t kExtendedMemoryBase       = 0x080000000000ull;
 constexpr uint64_t kExtendedMemorySize       = 512ull * 1024 * 1024 * 1024;
+constexpr int      AMM_ERROR_OUT_OF_PA_PAGES = static_cast<int>(0x8191200a);
 constexpr int      AMM_ERROR_REGION_NOT_FULLY_MAPPED = static_cast<int>(0x81912011);
 
 struct VirtualQueryInfo {
@@ -129,7 +130,8 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
-int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+bool IsAmmMemoryRange(uint64_t vaddr, size_t size);
+int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot, bool require_prt = false);
 int MapPrtMemory(uint64_t vaddr, size_t size);
 int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);

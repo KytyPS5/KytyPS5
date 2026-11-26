@@ -2860,6 +2860,14 @@ uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type) {
 	return (event_type & 0xfeu) == 0x38u ? 16u : 8u;
 }
 
+uint64_t KYTY_SYSV_ABI AgcDcbAtomicMemGetSize() {
+	return 9 * sizeof(uint32_t);
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbAtomicMemGetSize() {
+	return AgcDcbAtomicMemGetSize();
+}
+
 uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* /*address*/) {
 	if (buf == nullptr) {
@@ -2876,6 +2884,10 @@ uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	cmd[1] = (static_cast<uint32_t>(event_type) & 0x3fu) | (event_type == 7u ? 0x400u : 0u);
 
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbEventWriteGetSize() {
+	return 2 * sizeof(uint32_t);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
@@ -3011,6 +3023,10 @@ uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, 
 		cmd[1] |= (static_cast<uint32_t>(offload & 0x1u) << 24u);
 	}
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbRewindGetSize() {
+	return AgcDcbRewindGetSize();
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
@@ -3203,6 +3219,10 @@ uint32_t* KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf) {
 	return cmd;
 }
 
+uint64_t KYTY_SYSV_ABI AgcDcbStallCommandBufferParserGetSize() {
+	return 2 * sizeof(uint32_t);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
                                        uint64_t src_address_or_immediate, uint8_t item_size,
@@ -3334,7 +3354,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbJumpGetSize() {
 	return 16;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbRewindGetSize() {
+uint64_t KYTY_SYSV_ABI AgcDcbRewindGetSize() {
 	PRINT_NAME();
 
 	return 8;

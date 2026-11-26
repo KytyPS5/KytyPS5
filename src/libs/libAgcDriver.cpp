@@ -55,7 +55,9 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("hL7C0IRpWZI", AgcCbQueueEndOfPipeActionGetSize);
 	LIB_FUNC("T6xuVw0KUJo", AgcDebugRaiseException);
 	LIB_FUNC("JrtiDtKeS38", AgcAcbResetQueue);
+	LIB_FUNC("da1Sm8-QDoU", AgcAcbAtomicMemGetSize);
 	LIB_FUNC("cFazmnXpJOE", AgcAcbEventWrite);
+	LIB_FUNC("Y-5vneiBtzk", AgcAcbEventWriteGetSize);
 	LIB_FUNC("KT-hTp-Ch14", AgcAcbAcquireMem);
 	LIB_FUNC("ewobAQeMo5k", AgcAcbAcquireMemGetSize);
 	LIB_FUNC("qyM2bxYFPAk", AgcAcbCondExec);
@@ -63,6 +65,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("e1DFTg+Sd8U", AgcAcbJump);
 	LIB_FUNC("b-oySn+G2tE", AgcAcbJumpGetSize);
 	LIB_FUNC("DwICrVxerkY", AgcAcbRewind);
+	LIB_FUNC("0ZOG0jc9nRg", AgcAcbRewindGetSize);
 	LIB_FUNC("htn36gPnBk4", AgcAcbWaitRegMem);
 	LIB_FUNC("q4VuU-QsLOE", AgcAcbMemSemaphore);
 	LIB_FUNC("idlaArvdXEs", AgcAcbWaitOnAddressGetSize);
@@ -114,6 +117,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("C4l9fB17t8w", AgcDcbEventWriteGetSize);
 	LIB_FUNC("57labkp+rSQ", AgcDcbAcquireMem);
 	LIB_FUNC("-vnlTPPXPrw", AgcDcbAcquireMemGetSize);
+	LIB_FUNC("oz6zQq1JwCE", AgcDcbAtomicMemGetSize);
 	LIB_FUNC("1rZSWUv1IRc", AgcDcbCopyData);
 	LIB_FUNC("b5u0Jzm8TF8", AgcDcbCopyDataGetSize);
 	LIB_FUNC("WmAc2MEj6Io", AgcDcbDmaData);
@@ -139,6 +143,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("+kSrjIVxKFE", AgcDcbPushMarker);
 	LIB_FUNC("H7uZqCoNuWk", AgcDcbPopMarker);
 	LIB_FUNC("u2T2DiA5hRI", AgcDcbStallCommandBufferParser);
+	LIB_FUNC("+u6dKSLWM2o", AgcDcbStallCommandBufferParserGetSize);
 	LIB_FUNC("3KDcnM3lrcU", AgcWaitRegMemPatchAddress);
 	LIB_FUNC("7nOoijNPvEU", AgcWaitRegMemPatchReference);
 	LIB_FUNC("n485EBnIWmk", AgcWaitRegMemPatchCompareFunction);

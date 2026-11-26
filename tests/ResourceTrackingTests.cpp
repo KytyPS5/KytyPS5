@@ -8081,13 +8081,19 @@ void TestPackedDescriptorWaterfall() {
       return words;
     };
     const auto image = f.Image(descriptor(image_key, 0u, 8u, 5u));
-    const auto sampler_words = descriptor(sampler_key, 4u, 4u, 4u);
+    auto sampler_words = descriptor(sampler_key, 4u, 4u, 4u);
+    if (variant == 2u) {
+      const auto scratch = f.Emit(ValueOpcode::ShiftLeftLogical32, {image_key, Value(12u)});
+      sampler_words[3] = f.Emit(ValueOpcode::BitwiseOr32, {sampler_words[3], scratch});
+    }
     const auto sampler = f.Sampler({sampler_words[0], sampler_words[1],
                                    sampler_words[2], sampler_words[3]});
     f.Emit(ValueOpcode::ImageSampleRaw,
         {image, sampler, f.ImageAddress(), variant == 1u ? Value(true) : selected_active},
         f.AddMemory({.kind = ResourceKind::Image,
-                     .image_dimension = Decoder::ImageDimension::Dim2D}, 0x6cu));
+                     .image_sample_flags = variant == 2u ? uint32_t(Decoder::ImageSampleFlagAdjust) : 0u,
+                     .image_dimension = Decoder::ImageDimension::Dim2D},
+                    0x6cu));
     if (variant == 3u) {
       CheckFatal([&] { f.PlanAndTrack(); }, "not a valid runtime value",
                  "unbounded sampler table accepted a descriptor crossing packed row boundaries");
@@ -8119,6 +8125,7 @@ void TestPackedDescriptorWaterfall() {
       memory.words[word] = row;
       memory.words[word + 1u] = 0x00fff000u;
       memory.words[word + 2u] = (row & 1u) ? 0x0a500000u : 0u;
+      memory.words[word + 3u] = 0x80000abcu;
     }
     const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
         .read_specialization_memory = ReadLinearTestMemory};
@@ -8141,7 +8148,8 @@ void TestPackedDescriptorWaterfall() {
                 offset == 4u && root.indirect_search_iterations == 0u &&
                 snapshot.flattened_srt[mapping] == 59u &&
                 snapshot.flattened_srt[mapping + 1u + offset / 4u] == 2u &&
-                snapshot.samplers[2].dwords[0] == 1u && snapshot.samplers[2].dwords[2] == 0x0a500000u,
+                snapshot.samplers[2].dwords[0] == 1u && snapshot.samplers[2].dwords[2] == 0x0a500000u &&
+                snapshot.samplers[2].dwords[3] == 0x80000abcu,
             "wrapped packed sampler index selected the wrong descriptor");
       user_data[5] = 0u;
       user_data[6] = 24u;

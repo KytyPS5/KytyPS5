@@ -870,8 +870,9 @@ private:
 		return cached->second;
 	}
 
-	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
-	                uint32_t base_reg, DescriptorSource& descriptor, uint32_t pc) {
+	void MakeSource(const Inst& handle, uint32_t width, uint32_t base_reg,
+	                DescriptorSource& descriptor, uint32_t pc, uint32_t sample_flags = 0) {
+		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
 		const auto [resolved, inserted] =
 		    m_resolved_handles.try_emplace({reinterpret_cast<uintptr_t>(&handle), pc});
 		if (inserted) {
@@ -898,7 +899,7 @@ private:
 		} else {
 			descriptor = resolved->second.source;
 		}
-		if (sample_adjust) {
+		if (sampler && (sample_flags & Decoder::ImageSampleFlagAdjust) != 0) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
 		}
 	}
@@ -943,7 +944,7 @@ private:
 				    handle->GetOpcode() != (width == 4u ? ValueOpcode::GetBufferResource
 				                                        : ValueOpcode::GetAddressResource))
 					Fail(step.use_pc, "scalar read has an invalid resource handle");
-				MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
+				MakeSource(*handle, width, ScalarReadBase(*inst), source,
 				           inst->Flags<MemoryFlags>().pc);
 				const auto offset = inst->Arg(1).Resolve();
 				if (offset.IsImmediate() && offset.GetType() == Type::U32)
@@ -988,9 +989,7 @@ private:
 					    ? (memory.kind == ResourceKind::ScalarAddress ? ScalarReadBase(inst) : UINT32_MAX)
 					    : (sampler ? memory.sampler : memory.resource) * 4u;
 					DescriptorSource source;
-					MakeSource(*handle, width, sampler,
-					           sampler && (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
-					           base, source, flags.pc);
+					MakeSource(*handle, width, base, source, flags.pc, memory.image_sample_flags);
 					for (uint32_t word = 0; word < width; ++word)
 						CollectScalarRead(source.dwords[word], flags.pc);
 				}
@@ -1222,7 +1221,7 @@ private:
 		const auto kind = m_program.memory_info[flags.index].kind;
 		const auto base = kind == ResourceKind::ScalarAddress || kind == ResourceKind::ScalarBuffer
 		    ? ScalarReadBase(read) : UINT32_MAX;
-		MakeSource(*handle, width, false, false, base, descriptor, flags.pc);
+		MakeSource(*handle, width, base, descriptor, flags.pc);
 		uint32_t bad_dword = 0;
 		return ValidateSource(descriptor, bad_dword);
 	}
@@ -4167,8 +4166,20 @@ private:
 				const auto plan_handle = [&](Value value, uint32_t width, uint32_t base, bool sampler) {
 					auto* handle = value.Resolve().TryInstruction();
 					if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) return;
+					auto sample_flags = memory.image_sample_flags;
+					if (sampler && (sample_flags & Decoder::ImageSampleFlagAdjust) != 0u) {
+						// A shared indirect plan may strip adjustment bits only for adjusted uses.
+						for (const auto& use: handle->Uses()) {
+							if (use.operand != 1u || !ImageOpcodeInfoOf(use.user->GetOpcode()).needs_sampler) {
+								sample_flags = 0u;
+								break;
+							}
+							const auto index = use.user->Flags<MemoryFlags>().index;
+							sample_flags &= m_program.memory_info[index].image_sample_flags;
+						}
+					}
 					DescriptorSource descriptor;
-					MakeSource(*handle, width, sampler, false, base, descriptor, flags.pc);
+					MakeSource(*handle, width, base, descriptor, flags.pc, sample_flags);
 					uint32_t bad_dword = 0;
 					if (ValidateSource(descriptor, bad_dword)) return;
 					IndirectDescriptorPlan plan;
@@ -4221,14 +4232,13 @@ private:
 	}
 
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
-	               uint32_t base_reg, Inst*& handle, uint32_t& source, bool sampler = false,
-	               bool sample_adjust = false) {
+	               uint32_t base_reg, Inst*& handle, uint32_t& source, uint32_t sample_flags = 0) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
 			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
 		DescriptorSource descriptor;
-		MakeSource(*handle, width, sampler, sample_adjust, base_reg, descriptor, pc);
+		MakeSource(*handle, width, base_reg, descriptor, pc, sample_flags);
 		uint32_t bad_dword = 0;
 		if (!ValidateSource(descriptor, bad_dword)) {
 			if (expected == ValueOpcode::GetBufferResource &&
@@ -4550,8 +4560,6 @@ private:
 			}
 			Inst*      sampler_handle = nullptr;
 			uint32_t   sampler_source = 0;
-			const bool sample_adjust =
-			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
 			sampler_handle = inst.Arg(1).Resolve().TryInstruction();
 			const auto* selected_sampler = sampler_handle != nullptr
 			    ? FindIndirectDescriptor(*sampler_handle) : nullptr;
@@ -4559,7 +4567,7 @@ private:
 				sampler_source = selected_sampler->source;
 			} else {
 				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
-				          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
+				          memory.sampler * 4u, sampler_handle, sampler_source, memory.image_sample_flags);
 			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {

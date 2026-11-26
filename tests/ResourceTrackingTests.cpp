@@ -7124,6 +7124,73 @@ void TestWorkgroupSelectedBufferRecords() {
         "a plan without workgroup counts read the indirect argument pointer");
 }
 
+void TestPackedMaterialBufferStore() {
+  Fixture f;
+  const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+  const auto heap = f.Buffer({f.UserData(4), f.UserData(5), f.UserData(6), f.UserData(7)});
+  const auto lane = f.Emit(ValueOpcode::LaneId);
+  const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x2,
+      {material, lane, Value(0u), Value(0u), Value(true)},
+      f.AddMemory({.kind = ResourceKind::Buffer, .offset = 56u, .data_dwords = 2u, .idxen = true}, 0x260u));
+  const auto word = f.Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(1u)});
+  const auto field = f.Emit(ValueOpcode::BitwiseAnd32, {Value(0xffffffu), word});
+  const auto selected = f.Emit(ValueOpcode::SelectU32, {Value(true), field, Value(0u)});
+  const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)});
+  const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+  std::array<Value, 4> descriptor;
+  for (uint32_t i = 0; i < descriptor.size(); ++i)
+    descriptor[i] = f.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
+        f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = i * 4u,
+                     .component_index = i, .component_count = 4u}, 0x14f0u));
+  f.Emit(ValueOpcode::StoreBufferU32, {f.Buffer(descriptor), lane, Value(0u), Value(0u), word, Value(true)},
+         f.AddMemory({.kind = ResourceKind::Buffer, .formatted = true, .idxen = true}, 0x14fcu));
+  const auto output = f.Buffer({f.UserData(8), f.UserData(9), f.UserData(10), f.UserData(11)});
+  f.Emit(ValueOpcode::StoreBufferU32, {output, Value(0u), Value(0u), Value(0u), word, Value(true)},
+         f.AddMemory({.kind = ResourceKind::Buffer, .offset = 4u}, 0x1504u));
+  f.PlanAndTrack();
+  auto plan = ExtractResourcePlan(f.program);
+  LinearTestMemory memory;
+  const auto material_base = static_cast<uint32_t>(memory.base);
+  const auto heap_base = material_base + 512u;
+  std::array<uint32_t, 12> data{material_base, 176u << 16u, 2u, 0x5204u,
+                               heap_base, 16u << 16u, 196608u, 0x5204u};
+  SrtRuntime runtime{.user_data = data, .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+  memory.words[15] = 0xab000002u;
+  memory.words[44u + 15u] = 0xcd000002u;
+  const uint32_t row = (heap_base - material_base) / 4u + 2u * 4u;
+  const std::array<uint32_t, 4> target{0x100000u, 4u << 16u, 32u, 0x14204u};
+  std::copy(target.begin(), target.end(), memory.words.begin() + row);
+  Check(materialize() && memory.reads == 3u, "packed material keys did not bound the large V# table");
+  const auto root = std::ranges::find_if(specialization.buffers, [](const auto& buffer) {
+    return buffer.indirect_search_iterations != 0u;
+  });
+  Check(root != specialization.buffers.end() &&
+            snapshot.flattened_srt[root->indirect_mapping_offset + 3u] == 2u * 4u,
+        "sparse buffer map lost the GPU selection's DWORD offset");
+  const auto source = plan.info.buffers[root - specialization.buffers.begin()].source;
+  auto& indirect = *plan.descriptor_sources[source].indirect_descriptor;
+  memory.words[row] = material_base + 60u;
+  Check(!materialize(), "overlapping indirect write specialized mutable material keys");
+  indirect.key_count = Value(3u);
+  Check(materialize(), "a bounded key count in a large heap unnecessarily read mutable material keys");
+  indirect.key_count = {};
+  data[6] = 3u;
+  Check(materialize(), "a small overlapping table lost its complete GPU-selectable domain");
+  data[6] = 196608u;
+  memory.words[row] = target[0];
+  data[8] = material_base + 56u;
+  data[10] = 1u;
+  data[11] = 0x20005204u;
+  Check(!materialize(), "a zero-stride vector store overlapped a key past NumRecords bytes");
+  memory.words[row] = 0u;
+  Check(!materialize(), "an all-null sparse lookup lost its overlapping selector write");
+  data[8] -= 4u;
+  Check(materialize(), "a zero-stride store ending before the key was considered overlapping");
+}
+
 void TestGpuSelectedFormattedRecordStore() {
   namespace Prospero = Libs::Graphics::Prospero;
   enum class Prefix { None, Forward, Reversed, Lane, TwoAxes };
@@ -9573,6 +9640,7 @@ int main() {
     });
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
+    Run("packed material buffer store", TestPackedMaterialBufferStore);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("guarded carried buffer key", TestGuardedCarriedBufferKey);

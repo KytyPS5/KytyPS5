@@ -1671,6 +1671,11 @@ private:
 			    width == 0u || width > 32u - selector.bit_offset) return nullptr;
 			selector.bit_mask = width == 32u ? UINT32_MAX : (1u << width) - 1u;
 			read = ActiveValue(read->Arg(0), active).TryInstruction();
+		} else if (read != nullptr && read->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			if (ImmediateU32(read->Arg(0), selector.bit_mask)) value = read->Arg(1);
+			else if (ImmediateU32(read->Arg(1), selector.bit_mask)) value = read->Arg(0);
+			else return nullptr;
+			read = ActiveValue(value, active).TryInstruction();
 		}
 		return read;
 	}
@@ -3638,12 +3643,14 @@ private:
 			indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
 			return finish();
 		}
+		DescriptorSource material_source;
 		if (table_source.dword_count == 4u && !plan.split_offsets &&
 		    plan.selection_anchor != nullptr && SetExactTableMaximum(key, indirect)) {
+			if (*indirect.table_maximum >= MaxIndirectDescriptorProbes)
+				MatchUniformizedMaterialKey(key, handle, indirect, material_source, MaterialKey::Heap);
 			indirect.table_scalar = true;
 			return finish();
 		}
-		DescriptorSource material_source;
 		if (!plan.split_offsets && MatchScalarMaterialKey(key, indirect, material_source, true)) {
 			plan.retain_reads = true;
 			return finish();

@@ -33,10 +33,13 @@ TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 	Loader::SymbolDatabase symbols;
 	Libs::InitLibKernel_1(&symbols);
 	const auto* query = symbols.FindByNid("tU5e3f9gSiU", Loader::SymbolType::Func);
+	const auto* hardware = symbols.FindByNid("yu17wG8L5FI", Loader::SymbolType::Func);
 	const auto* operation = symbols.FindByNid("NH6xARDOVv8", Loader::SymbolType::Func);
 	ASSERT_NE(query, nullptr);
+	ASSERT_NE(hardware, nullptr);
 	ASSERT_NE(operation, nullptr);
 	const auto is_trinity = reinterpret_cast<int(KYTY_SYSV_ABI*)()>(query->vaddr);
+	const auto is_pro_hardware = reinterpret_cast<int(KYTY_SYSV_ABI*)()>(hardware->vaddr);
 	const auto operation_mode = reinterpret_cast<int(KYTY_SYSV_ABI*)(int*, int*)>(operation->vaddr);
 
 	struct CommandBuffer {
@@ -66,6 +69,7 @@ TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 		std::filesystem::remove(path);
 		EXPECT_EQ(Loader::SystemContentIsTrinityMode(), test.expected);
 		EXPECT_EQ(is_trinity(), test.expected ? 1 : 0);
+		EXPECT_EQ(is_pro_hardware(), test.enabled ? 1 : 0);
 		int mode = -1, submode = -1;
 		EXPECT_EQ(operation_mode(&mode, &submode), 0);
 		EXPECT_EQ(mode, test.expected ? 3 : 2);

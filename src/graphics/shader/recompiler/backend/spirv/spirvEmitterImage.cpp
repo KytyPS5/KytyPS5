@@ -1108,8 +1108,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);
 			}
-			// MinLod follows the offset in operand order.
-			if (min_lod != 0) {
+			// MinLod follows the offset in operand order. Devices without shaderResourceMinLod
+			// (Adreno on Windows ARM64, see #2434) cannot take it; the sampler clamp is dropped
+			// rather than making the module fail validation.
+			if (min_lod != 0 && state.profile.shader_resource_min_lod) {
 				state.builder.RequireCapability(spv::CapabilityMinLod);
 				sample_operand_count = std::max(size_t{1}, sample_operand_count);
 				sample_operands[0] |= spv::ImageOperandsMinLodMask;

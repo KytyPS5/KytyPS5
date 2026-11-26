@@ -13,6 +13,9 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
+	// Samples with a sampler clamp use the MinLod operand; without the feature the clamp is
+	// dropped (explicit-LOD samples still clamp through FMax).
+	bool shader_resource_min_lod = false;
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
 	// Storage buffer elements past the descriptor range, to the byte, read zero and drop writes.

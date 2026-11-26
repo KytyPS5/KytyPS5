@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshSlices.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -8204,6 +8205,57 @@ void TestEmbeddedVertexFormatSwizzle() {
   }
 }
 
+void TestMeshSlices() {
+  using Libs::Graphics::MeshGridLimits;
+  using Libs::Graphics::MeshSlice;
+  struct Case {
+    uint32_t groups, instances;
+    MeshGridLimits limits;
+    std::vector<std::array<uint32_t, 4>> slices;
+  };
+  const MeshGridLimits amd{65535, 65535, 67107840};
+  const MeshGridLimits nvidia{4194304, 65535, 4194304};
+  const std::vector<Case> cases = {
+      {3, 4, amd, {{0, 0, 3, 4}}},
+      {1, 76426, nvidia, {{0, 0, 1, 65535}, {0, 65535, 1, 10891}}},
+      {173400, 1, amd, {{0, 0, 65535, 1}, {65535, 0, 65535, 1}, {131070, 0, 42330, 1}}},
+      {5, 2, {2, 8, 100}, {{0, 0, 2, 1}, {2, 0, 2, 1}, {4, 0, 1, 1}, {0, 1, 2, 1}, {2, 1, 2, 1}, {4, 1, 1, 1}}},
+      {4, 10, {8, 8, 12}, {{0, 0, 4, 3}, {0, 3, 4, 3}, {0, 6, 4, 3}, {0, 9, 4, 1}}},
+      {3, 6, {65535, 65535, 10}, {{0, 0, 3, 3}, {0, 3, 3, 3}}},
+      {65535, 2, amd, {{0, 0, 65535, 2}}},
+      {1, 1, {65535, 0, 4194304}, {}},
+      {1, 1, {0, 65535, 4194304}, {}},
+      {1, 1, {65535, 65535, 0}, {}},
+      {0, 5, amd, {}},
+      {5, 0, amd, {}},
+  };
+  for (const auto &test : cases) {
+    std::vector<std::array<uint32_t, 4>> slices;
+    Libs::Graphics::ForEachMeshSlice(test.groups, test.instances, test.limits, [&](const MeshSlice &slice) {
+      slices.push_back({slice.base_group, slice.base_instance, slice.groups, slice.instances});
+    });
+    Check(slices == test.slices, "mesh draw slices differ from the expected launch order");
+  }
+  for (const auto &[groups, instances, limits] :
+       {std::tuple{UINT32_MAX, 1u, amd}, std::tuple{1u, UINT32_MAX, nvidia}}) {
+    uint64_t covered = 0;
+    uint64_t next_group = 0;
+    uint64_t next_instance = 0;
+    Libs::Graphics::ForEachMeshSlice(groups, instances, limits, [&](const MeshSlice &slice) {
+      Check(slice.groups != 0 && slice.instances != 0 && slice.groups <= limits.groups &&
+                slice.instances <= limits.instances &&
+                uint64_t{slice.groups} * slice.instances <= limits.total,
+            "mesh draw slice exceeds a host workgroup limit");
+      Check(slice.base_group == next_group % groups && slice.base_instance == next_instance,
+            "mesh draw slices skip or repeat workgroups");
+      next_group = slice.base_group + uint64_t{slice.groups};
+      next_instance = slice.base_instance + (next_group == groups ? slice.instances : 0);
+      covered += uint64_t{slice.groups} * slice.instances;
+    });
+    Check(covered == uint64_t{groups} * instances, "mesh draw slices do not cover the draw");
+  }
+}
+
 void TestMeshInputAssembly() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -8313,50 +8365,56 @@ void TestMeshInputAssembly() {
     options.wave_size = test.wave_size;
     options.user_data_count = 0;
     options.input_info.vertex = &input;
-    auto program = Frontend::TranslateProgram(decoded, graph, options);
-    const uint32_t draw[] = {test.count, test.base_vertex, test.width,
-                             test.address_low, 0x12};
-    Inst *load = nullptr;
-    for (auto &inst : *program.blocks.front()) {
-      if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
-        inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
-      } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
-        const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
-        const uint32_t value = kind == StageInputKind::LocalInvocationIndex
-                                   ? test.lane
-                                   : inst.Arg(1).U32() == 0 ? test.group : 2;
-        inst.ReplaceUsesWith(Value(value));
-      } else if (inst.GetOpcode() == ValueOpcode::LoadDeviceAddressU32) {
-        Check(load == nullptr, "mesh index fetch emitted duplicate loads");
-        load = &inst;
+    struct Launch {
+      uint32_t group, instance, base_group, base_instance;
+    };
+    for (const Launch launch : {Launch{test.group, 2u, 0u, 0u}, Launch{0u, 0u, test.group, 2u}}) {
+      auto program = Frontend::TranslateProgram(decoded, graph, options);
+      const uint32_t draw[] = {test.count,   test.base_vertex, test.width,
+                               test.address_low, 0x12, launch.base_group,
+                               launch.base_instance};
+      Inst *load = nullptr;
+      for (auto &inst : *program.blocks.front()) {
+        if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+          inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
+        } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
+          const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
+          const uint32_t value = kind == StageInputKind::LocalInvocationIndex
+                                     ? test.lane
+                                     : inst.Arg(1).U32() == 0 ? launch.group : launch.instance;
+          inst.ReplaceUsesWith(Value(value));
+        } else if (inst.GetOpcode() == ValueOpcode::LoadDeviceAddressU32) {
+          Check(load == nullptr, "mesh index fetch emitted duplicate loads");
+          load = &inst;
+        }
       }
-    }
-    ConstantPropagationPass(program.blocks);
-    if (test.fast_launch) {
-      Check(load == nullptr, "fast launch emitted an ordinary input-assembly index fetch");
-    } else {
-      Check(load != nullptr && load->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
-                load->Arg(1).Resolve().U32() == 0x12 &&
-                load->Arg(2).Resolve().U32() == test.byte_offset &&
-                load->Arg(3).Resolve().U1() == test.fetch,
-            "mesh index fetch address or active-lane predicate is wrong");
-      load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
       ConstantPropagationPass(program.blocks);
-    }
-    std::array<uint32_t, 9> vgprs{};
-    std::array<uint32_t, 4> sgprs{};
-    for (const auto &inst : *program.blocks.front()) {
-      if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
-        vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
-      } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
-        sgprs[RegIndex(inst.Arg(0).ScalarRegister())] = inst.Arg(1).Resolve().U32();
+      if (test.fast_launch) {
+        Check(load == nullptr, "fast launch emitted an ordinary input-assembly index fetch");
+      } else {
+        Check(load != nullptr && load->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
+                  load->Arg(1).Resolve().U32() == 0x12 &&
+                  load->Arg(2).Resolve().U32() == test.byte_offset &&
+                  load->Arg(3).Resolve().U1() == test.fetch,
+              "mesh index fetch address or active-lane predicate is wrong");
+        load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
+        ConstantPropagationPass(program.blocks);
       }
+      std::array<uint32_t, 9> vgprs{};
+      std::array<uint32_t, 4> sgprs{};
+      for (const auto &inst : *program.blocks.front()) {
+        if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
+          vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
+        } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
+          sgprs[RegIndex(inst.Arg(0).ScalarRegister())] = inst.Arg(1).Resolve().U32();
+        }
+      }
+      Check(sgprs[2] == test.group_info && sgprs[3] == test.wave_info &&
+                vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
+                vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
+                vgprs[test.fast_launch ? 6 : 8] == 2u,
+            "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
     }
-    Check(sgprs[2] == test.group_info && sgprs[3] == test.wave_info &&
-              vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
-              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
-              vgprs[test.fast_launch ? 6 : 8] == 2u,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
 }
 
@@ -13749,6 +13807,7 @@ int main() {
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
+  TestMeshSlices();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();

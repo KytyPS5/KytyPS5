@@ -50,6 +50,10 @@
 #include <unistd.h>
 #endif
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
@@ -128,17 +132,53 @@ SignalExports ResolveSignalExports() {
           reinterpret_cast<decltype(SignalExports::raise)>(find("il03nluKfMk"))};
 }
 
+#if defined(__APPLE__)
+// Reports whether the host thread with this pthread_threadid_np id is blocked; macOS has no
+// /proc, so the thread is found through the Mach task and its state read as THREAD_BASIC_INFO.
+bool IsHostThreadWaiting(uint64_t thread_id) {
+	thread_act_array_t threads      = nullptr;
+	mach_msg_type_number_t count    = 0;
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return false;
+	}
+	bool waiting = false;
+	for (mach_msg_type_number_t i = 0; i < count; ++i) {
+		thread_identifier_info_data_t identifier {};
+		mach_msg_type_number_t identifier_count = THREAD_IDENTIFIER_INFO_COUNT;
+		thread_basic_info_data_t basic {};
+		mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
+		if (thread_info(threads[i], THREAD_IDENTIFIER_INFO,
+		                reinterpret_cast<thread_info_t>(&identifier),
+		                &identifier_count) == KERN_SUCCESS &&
+		    identifier.thread_id == thread_id &&
+		    thread_info(threads[i], THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&basic),
+		                &basic_count) == KERN_SUCCESS) {
+			waiting = basic.run_state == TH_STATE_WAITING;
+		}
+		mach_port_deallocate(mach_task_self(), threads[i]);
+	}
+	vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
+	              count * sizeof(thread_act_t));
+	return waiting;
+}
+#endif
+
 // Waits until a guest thread's host thread sleeps in a blocking call.
 void WaitUntilSleeping(Libs::LibKernel::Pthread thread) {
-  const auto path = "/proc/self/task/" +
-                    std::to_string(Libs::LibKernel::PthreadGetHostThreadId(thread)) + "/stat";
-  WaitForMutexTest([&] {
-    std::ifstream stat(path);
-    std::string line;
-    std::getline(stat, line);
-    const auto state = line.rfind(") ");
-    return state != std::string::npos && line[state + 2] == 'S';
-  });
+#if defined(__APPLE__)
+	const auto thread_id = Libs::LibKernel::PthreadGetHostThreadId(thread);
+	WaitForMutexTest([&] { return IsHostThreadWaiting(thread_id); });
+#else
+	const auto path = "/proc/self/task/" +
+	                  std::to_string(Libs::LibKernel::PthreadGetHostThreadId(thread)) + "/stat";
+	WaitForMutexTest([&] {
+		std::ifstream stat(path);
+		std::string line;
+		std::getline(stat, line);
+		const auto state = line.rfind(") ");
+		return state != std::string::npos && line[state + 2] == 'S';
+	});
+#endif
 }
 
 void TestStaticRwlockDestroy() {

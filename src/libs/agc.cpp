@@ -77,6 +77,9 @@ void Initialize() {
 	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
+	// Gen5Driver::Initialize() maps DMEM at a fixed guest address and needs the
+	// placeholder reservations already in place.
+	Libs::LibKernel::Memory::ReserveGuestAddressSpace();
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
 	EXIT_IF(AgcDriver::Initialize() != OK);
 	ShaderInit();

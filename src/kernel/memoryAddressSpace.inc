@@ -18,6 +18,97 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 	return candidate <= range_end && size <= range_end - candidate;
 }
 
+static uint64_t AlignUpValue(uint64_t value, uint64_t alignment) {
+	const auto remainder = value % alignment;
+	return remainder != 0 ? value + (alignment - remainder) : value;
+}
+
+static uint64_t AlignDownValue(uint64_t value, uint64_t alignment) {
+	return value - (value % alignment);
+}
+
+// Pure helper: free subranges of [region_start, region_end) after subtracting sorted occupied
+// [start, end) intervals, then aligning each remainder to `alignment`. Empty results omitted.
+[[nodiscard]] static std::vector<std::pair<uint64_t, uint64_t>> AlignedFreeRangesInRegion(
+    uint64_t region_start, uint64_t region_end,
+    const std::vector<std::pair<uint64_t, uint64_t>>& occupied, uint64_t alignment) {
+	std::vector<std::pair<uint64_t, uint64_t>> free_ranges;
+	if (region_end <= region_start || alignment == 0) {
+		return free_ranges;
+	}
+
+	auto current = region_start;
+	for (const auto& [mapping_start, mapping_end]: occupied) {
+		if (mapping_end <= current) {
+			continue;
+		}
+		if (mapping_start >= region_end) {
+			break;
+		}
+		if (mapping_start > current) {
+			const auto start = AlignUpValue(current, alignment);
+			const auto end   = AlignDownValue(std::min(mapping_start, region_end), alignment);
+			if (end > start) {
+				free_ranges.emplace_back(start, end);
+			}
+		}
+		current = std::max(current, mapping_end);
+		if (current >= region_end) {
+			break;
+		}
+	}
+	if (current < region_end) {
+		const auto start = AlignUpValue(current, alignment);
+		const auto end   = AlignDownValue(region_end, alignment);
+		if (end > start) {
+			free_ranges.emplace_back(start, end);
+		}
+	}
+	return free_ranges;
+}
+
+static constexpr std::array<std::pair<uint64_t, uint64_t>, 3> GuestAddressRegions() {
+	return {{
+	    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
+	    {HOST_USER_MIN, HOST_USER_MAX + 1u},
+	    {kExtendedMemoryBase, kExtendedMemoryBase + kExtendedMemorySize},
+	}};
+}
+
+[[nodiscard]] static bool RangeOverlapsGuestAddressRegions(uint64_t base, uint64_t size) {
+	if (size == 0 || UINT64_MAX - base < size) {
+		return false;
+	}
+	const auto end = base + size;
+	for (const auto& [region_start, region_end]: GuestAddressRegions()) {
+		if (base < region_end && end > region_start) {
+			return true;
+		}
+	}
+	return false;
+}
+
+[[nodiscard]] static bool FindOverlappingGuestAddressRegion(uint64_t base, uint64_t size,
+                                                            uint64_t* region_start,
+                                                            uint64_t* region_end) {
+	if (size == 0 || UINT64_MAX - base < size) {
+		return false;
+	}
+	const auto end = base + size;
+	for (const auto& [start, stop]: GuestAddressRegions()) {
+		if (base < stop && end > start) {
+			if (region_start != nullptr) {
+				*region_start = start;
+			}
+			if (region_end != nullptr) {
+				*region_end = stop;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	return VirtualFree(reinterpret_cast<void*>(vaddr), size,
@@ -73,11 +164,46 @@ public:
 			EXIT("direct-memory backing: ftruncate to %" PRIu64 " MB failed: %d\n",
 			     m_size / (1024U * 1024U), errno);
 		}
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
+		// Prefer an address above every guest region so Phase-2 MAP_FIXED reservations cannot
+		// replace this alias. The hint is not binding without MAP_FIXED, so verify and retry.
+		constexpr uint64_t AliasHintAlign    = 0x10000;
+		constexpr int      AliasHintAttempts = 8;
+		uint64_t hint =
+		    AlignUpValue(kExtendedMemoryBase + kExtendedMemorySize, AliasHintAlign);
+		uint8_t* mapped = nullptr;
+		for (int attempt = 0; attempt < AliasHintAttempts; ++attempt) {
+			void* backing =
+			    mmap(reinterpret_cast<void*>(hint), m_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			         m_fd, 0);
+			if (backing == MAP_FAILED) {
+				EXIT("direct-memory backing: writable alias failed: %d\n", errno);
+			}
+			const auto base = reinterpret_cast<uint64_t>(backing);
+			if (!RangeOverlapsGuestAddressRegions(base, m_size)) {
+				mapped = static_cast<uint8_t*>(backing);
+				break;
+			}
+			uint64_t conflict_start = 0;
+			uint64_t conflict_end   = 0;
+			FindOverlappingGuestAddressRegion(base, m_size, &conflict_start, &conflict_end);
+			munmap(backing, m_size);
+			if (attempt + 1 == AliasHintAttempts) {
+				EXIT("direct-memory backing: alias landed at 0x%016" PRIx64 " size 0x%016" PRIx64
+				     " overlapping guest region [0x%016" PRIx64 ", 0x%016" PRIx64
+				     ") after %d attempts\n",
+				     base, m_size, conflict_start, conflict_end, AliasHintAttempts);
+			}
+			hint = AlignUpValue(base + m_size, AliasHintAlign);
+		}
+		m_backing_base = mapped;
+#else
 		auto* backing = mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
 		if (backing == MAP_FAILED) {
 			EXIT("direct-memory backing: writable alias failed: %d\n", errno);
 		}
 		m_backing_base = static_cast<uint8_t*>(backing);
+#endif
 #endif
 	}
 
@@ -454,8 +580,25 @@ public:
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
 #endif
-		ReserveGuestRegions();
+		// Reserve the fixed system regions (Region 0: 0x40000 - 0x1000000000) first.
+		// This protects fixed system bases like DriverDmemBase (0xfe0000000) and thread
+		// stacks from host libraries, while leaving the high address space open for host
+		// drivers (such as NVIDIA Vulkan DLSS/NGX) to make their allocations without failing.
+		ReserveGuestRegions(0, 1);
 		m_backing = new GuestBackingStore(backing_size);
+	}
+
+	// Reserves the user address space and extended memory (Regions 1 and 2:
+	// [HOST_USER_MIN, HOST_USER_MAX] and kExtendedMemoryBase).
+	// Must be called after host GPU/DLSS initialization has completed.
+	// Returns true if the regions were newly reserved on this call.
+	bool ReserveRemainingGuestRegions() {
+		if (m_remaining_reserved) {
+			return false;
+		}
+		ReserveGuestRegions(1, 3);
+		m_remaining_reserved = true;
+		return true;
 	}
 
 	~GuestAddressSpace() {
@@ -875,17 +1018,14 @@ private:
 	}
 #endif
 
-	void ReserveGuestRegions() {
-		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
-		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
-		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
-		    {kExtendedMemoryBase, kExtendedMemoryBase + kExtendedMemorySize},
-		}};
+	void ReserveGuestRegions(size_t first_region = 0, size_t last_region = 3) {
+		const auto regions = GuestAddressRegions();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
 		const auto         process           = GetCurrentProcess();
-		for (const auto& [guest_start, guest_end]: regions) {
+		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
+			const auto [guest_start, guest_end] = regions[i];
 			auto next_addr = guest_start;
 			while (next_addr < guest_end) {
 				MEMORY_BASIC_INFORMATION info {};
@@ -935,13 +1075,11 @@ private:
 		fclose(maps);
 
 		auto reserve_range = [this](uint64_t start, uint64_t end) {
-			start = AlignUp(start, PageSize());
-			end   = AlignDown(end, PageSize());
 			if (end <= start) {
 				return;
 			}
 
-			const auto size = end - start;
+			const auto size  = end - start;
 			int        flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 #if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
 			flags |= MAP_FIXED;
@@ -966,50 +1104,67 @@ private:
 			}
 		};
 
-		for (const auto& [region_start, region_end]: regions) {
-			auto current = region_start;
-
-			for (const auto& [mapping_start, mapping_end]: occupied) {
-				if (mapping_end <= current) {
-					continue;
-				}
-				if (mapping_start >= region_end) {
-					break;
-				}
-
-				if (mapping_start > current) {
-					reserve_range(current, std::min(mapping_start, region_end));
-				}
-
-				current = std::max(current, mapping_end);
-				if (current >= region_end) {
-					break;
-				}
-			}
-
-			if (current < region_end) {
-				reserve_range(current, region_end);
+		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
+			const auto [region_start, region_end] = regions[i];
+			for (const auto& [start, end]:
+			     AlignedFreeRangesInRegion(region_start, region_end, occupied, PageSize())) {
+				reserve_range(start, end);
 			}
 		}
 #else
-		for (const auto& [start, end]: regions) {
-			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+		// macOS / other non-Linux POSIX: never MAP_FIXED over the backing alias (created in
+		// Phase 1 before Regions 1–2 are reserved).
+		std::vector<std::pair<uint64_t, uint64_t>> occupied;
+		if (m_backing != nullptr) {
+			const auto alias_base = m_backing->GetBackingBase();
+			const auto alias_size = m_backing->GetBackingSize();
+			occupied.emplace_back(alias_base, alias_base + alias_size);
+		}
+
+		auto reserve_range = [this](uint64_t start, uint64_t end) {
+			if (end <= start) {
+				return;
+			}
+			const auto size  = end - start;
+			int        flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 #if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
 			flags |= MAP_FIXED;
 #elif defined(MAP_FIXED_NOREPLACE)
 			flags |= MAP_FIXED_NOREPLACE;
 #endif
-			void* ptr = mmap(reinterpret_cast<void*>(start), end - start, PROT_NONE, flags, -1, 0);
+			void* ptr = mmap(reinterpret_cast<void*>(start), size, PROT_NONE, flags, -1, 0);
 			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
+				const auto obtained =
+				    ptr == MAP_FAILED ? 0 : reinterpret_cast<uint64_t>(ptr);
 				if (ptr != MAP_FAILED) {
-					munmap(ptr, end - start);
+					munmap(ptr, size);
 				}
 				EXIT("failed to reserve guest address space at 0x%016" PRIx64
-				     ", size 0x%016" PRIx64 "\n",
-				     start, end - start);
+				     ", size 0x%016" PRIx64 " (mmap returned 0x%016" PRIx64
+				     "; conflict with an existing mapping)\n",
+				     start, size, obtained);
 			}
-			AddFreeUnlocked(start, end - start);
-			m_owned.emplace_back(start, end - start);
+			AddFreeUnlocked(start, size);
+			if (!m_owned.empty() && m_owned.back().first + m_owned.back().second == start) {
+				m_owned.back().second += size;
+			} else {
+				m_owned.emplace_back(start, size);
+			}
+		};
+
+		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
+			const auto [region_start, region_end] = regions[i];
+			const auto free_ranges =
+			    AlignedFreeRangesInRegion(region_start, region_end, occupied, m_granularity);
+			if (free_ranges.empty()) {
+				EXIT("failed to reserve guest address space region [0x%016" PRIx64
+				     ", 0x%016" PRIx64 "): no aligned free range left after skipping "
+				     "occupied mappings (fully covered or unsafe to split)\n",
+				     region_start, region_end);
+			}
+			for (const auto& [start, end]: free_ranges) {
+				reserve_range(start, end);
+			}
 		}
 #endif
 #endif
@@ -1143,4 +1298,5 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
+	bool                                       m_remaining_reserved = false;
 };

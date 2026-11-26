@@ -5,6 +5,11 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+#include <utility>
+#include <vector>
+#endif
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -13,19 +18,22 @@ enum class PageFaultAccess;
 namespace Libs::LibKernel::Memory {
 
 void Initialize();
+// Reserves the host virtual address ranges that the PS5 guest uses. Must be called after
+// all host subsystems that allocate address space (e.g. Graphics / DLSS) are initialised.
+void ReserveGuestAddressSpace();
 void Shutdown();
 
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.
 struct DebugStats {
-	uint64_t direct_total        = 0;
-	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
-	uint64_t pooled_allocated    = 0; // Memory pool expansions.
-	uint64_t automatic_allocated = 0; // Extended memory.
-	uint64_t direct_mapped       = 0;
-	uint64_t flexible_total      = 0;
-	uint64_t flexible_used       = 0;
-	uint64_t pool_committed      = 0;
+	uint64_t direct_total           = 0;
+	uint64_t direct_allocated       = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated       = 0; // Memory pool expansions.
+	uint64_t automatic_allocated    = 0; // Extended memory.
+	uint64_t direct_mapped          = 0;
+	uint64_t flexible_total         = 0;
+	uint64_t flexible_used          = 0;
+	uint64_t pool_committed         = 0;
 	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
 	uint64_t gpu_page_entries       = 0;
 	uint64_t cpu_page_entries_total = 0;
@@ -240,6 +248,11 @@ uint64_t TestDirectMappingCount();
 uint64_t TestFlexibleMappingCount();
 uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
+// Pure helper used by POSIX guest-region reservation; [start, end) occupied, aligned free out.
+std::vector<std::pair<uint64_t, uint64_t>>
+TestAlignedFreeRangesInRegion(uint64_t region_start, uint64_t region_end,
+                              const std::vector<std::pair<uint64_t, uint64_t>>& occupied,
+                              uint64_t                                          alignment);
 #endif
 
 } // namespace Libs::LibKernel::Memory

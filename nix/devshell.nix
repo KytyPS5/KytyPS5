@@ -4,6 +4,7 @@ let
   # Build-time dependencies for the bundled SDL3 audio, video and input backends.
   buildDeps = with pkgs; [
     qt6.qtbase # Concurrent, Network, Widgets (launcher)
+    qt6.qttools # LinguistTools / lrelease (launcher)
     vulkan-headers
     vulkan-loader
     vulkan-tools

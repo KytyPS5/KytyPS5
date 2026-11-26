@@ -203,8 +203,9 @@ sudo apt-get install --no-install-recommends \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
-Qt 6 (Concurrent, Network, and Widgets) is required for the launcher. Use your distribution's
-packages (`qt6-base-dev`) or an official Qt installation.
+Qt 6 (Concurrent, Network, Widgets, and LinguistTools) is required for the launcher. On Debian
+or Ubuntu, install `qt6-base-dev` and `qt6-tools-dev-tools`; other distributions package the
+equivalent LinguistTools component separately or with their base Qt development package.
 
 ```bash
 git submodule update --init --recursive
@@ -241,8 +242,8 @@ The CMake source root is the repository root.
 
 ### Building on NixOS
 
-A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
-libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
+A development shell provides Clang, CMake, Ninja, Qt 6 with LinguistTools, Vulkan headers, and the
+SDL3 backend libraries. Enter it and configure as on other Linux distributions; the shell exports
 `CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
 needed:
 
@@ -282,7 +283,7 @@ sudo dnf install -y \
   mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
   libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
   alsa-lib-devel pulseaudio-libs-devel systemd-devel dbus-devel \
-  wayland-devel wayland-protocols-devel qt6-qtbase-devel
+  wayland-devel wayland-protocols-devel qt6-qtbase-devel qt6-qttools-devel
 ```
 
 From the repository root, follow the launcher configure, build and install steps in
@@ -310,8 +311,9 @@ Requirements:
 - An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
 - Xcode (or the Command Line Tools)
 - Homebrew packages: `brew install cmake ninja glslang python`
-- Qt 6 (Concurrent, Network, and Widgets) with x86-64 support. The official Qt installation is
-  universal and works; Homebrew's Qt is arm64-only and will not link
+- Qt 6 (Concurrent, Network, Widgets, and LinguistTools) with x86-64 support. Ensure the Qt
+  LinguistTools component (`lrelease`) is selected. The official Qt installation is universal and
+  works; Homebrew's Qt is arm64-only and will not link
 
 ```bash
 git submodule update --init --recursive

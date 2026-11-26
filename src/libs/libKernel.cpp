@@ -2054,6 +2054,11 @@ int KYTY_SYSV_ABI getsockname(int s, void* addr, uint32_t* addrlen) {
 	return Network::Net::Getsockname(s, addr, addrlen);
 }
 
+int KYTY_SYSV_ABI getpeername(int s, void* addr, uint32_t* addrlen) {
+	PRINT_NAME();
+	return Network::Net::Getpeername(s, addr, addrlen);
+}
+
 int KYTY_SYSV_ABI getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
 	PRINT_NAME();
 	return Network::Net::Getsockopt(s, level, optname, optval, optlen);
@@ -2279,6 +2284,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC_POSIX_KERNEL("TUuiYS2kE8s", Posix::shutdown);
 	LIB_FUNC_POSIX_KERNEL("3e+4Iv7IJ8U", Posix::accept);
 	LIB_FUNC_POSIX_KERNEL("RenI1lL1WFk", Posix::getsockname);
+	LIB_FUNC_POSIX_KERNEL("TXFFFiNldU8", Posix::getpeername);
 	LIB_FUNC_POSIX_KERNEL("6O8EwYOgH9Y", Posix::getsockopt);
 	LIB_FUNC_POSIX_KERNEL("fFxGkxF2bVo", Posix::setsockopt);
 	LIB_FUNC_POSIX_KERNEL("T8fER+tIGgk", Posix::select);

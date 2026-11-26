@@ -124,6 +124,17 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+#if defined(__APPLE__)
+	// SPIRV-Cross keeps a NoContraction multiply and add apart in MSL with two calls to
+	// [[clang::optnone]] functions (spvFMul, spvFAdd); on Apple GPUs that cost GTA V about 40 % of
+	// its frame time. fma(a, b, -0.0) is the rounded product (-0.0 keeps the sign of a zero
+	// product), and the Metal compiler does not contract it with the following add, as it would
+	// a plain a * b + c even in safe math mode. The result is the same as with separate roundings,
+	// except for the sign of a zero result when the GPU flushes a negative denormal addend.
+	const auto rounded_product =
+	    EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, ConstantF32(state, 0x80000000u));
+	return EmitFPAdd32(state, rounded_product, c);
+#endif
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
 	// a = EmitFlushF32DenormToSignedZero(state, a);

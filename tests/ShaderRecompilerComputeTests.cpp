@@ -11055,6 +11055,53 @@ public:
       texture_cache.UnmapMemory(reused_stencil_color.info.data.address,
                                 reused_stencil_color.info.data.size);
 
+      // An R8 image that exactly matches a stencil plane is adopted as the
+      // association. A resident heap that sampled it must see the rewrite.
+      auto adopted_stencil_color = MakeLinearDesc(
+          base + 0x2280000, 0x10000, vk::Format::eR8Unorm,
+          Prospero::BufferFormat::k8UNorm, Prospero::ImageType::kColor2D,
+          {128, 128, 1}, 1, 1, 1);
+      const auto adopted_stencil_color_id =
+          texture_cache.FindImage(adopted_stencil_color);
+      auto &adopted_stencil = texture_cache.GetImage(adopted_stencil_color_id);
+      const auto adopted_serial = adopted_stencil.serial;
+      const auto adopted_changes = [&] {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        return std::ranges::count(Libs::Graphics::Image::heap_changes,
+                                  adopted_serial,
+                                  &Libs::Graphics::Image::HeapChange::serial);
+      };
+      adopted_stencil.heap_refs.fetch_add(1u);
+      const auto adopted_changes_before = adopted_changes();
+      auto adopting_depth = reused_stencil_depth;
+      adopting_depth.info.data.address = base + 0x22a0000;
+      adopting_depth.info.stencil = adopted_stencil_color.info.data;
+      const auto adopting_depth_id = texture_cache.FindImage(adopting_depth);
+      TextureCacheTestAccess::AssociateStencil(texture_cache, adopting_depth_id,
+                                               adopting_depth.info.stencil);
+      Require(name, "stencil plane adopts an exact R8 image",
+              texture_cache.FindImageFromRange(
+                  adopting_depth.info.stencil.address,
+                  adopting_depth.info.stencil.size,
+                  false) == adopted_stencil_color_id &&
+                  texture_cache.GetImage(adopted_stencil_color_id).depth_id ==
+                      adopting_depth_id,
+              "the stencil plane did not adopt the R8 image at its range");
+      Require(name, "adopted stencil plane queues a heap change",
+              adopted_changes() == adopted_changes_before + 1,
+              "rewriting a heap-pinned image as a stencil plane left the heap "
+              "sampling its old backing");
+      texture_cache.GetImage(adopted_stencil_color_id).heap_refs.fetch_sub(1u);
+      {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        std::erase_if(Libs::Graphics::Image::heap_changes,
+                      [&](const Libs::Graphics::Image::HeapChange &change) {
+                        return change.serial == adopted_serial;
+                      });
+      }
+      texture_cache.UnmapMemory(adopting_depth.info.data.address,
+                                adopting_depth.info.data.size);
+
       constexpr uint64_t exact_image_offset = 0x334100;
       constexpr uint64_t dirty_sibling_offset = 0x334200;
       constexpr uint32_t dirty_sibling_value = 0xc001d00du;

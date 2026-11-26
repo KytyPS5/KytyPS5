@@ -242,8 +242,8 @@ The CMake source root is the repository root.
 
 ### Building on NixOS
 
-A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
-libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
+A development shell provides Clang, CMake, Ninja, Qt 6 with LinguistTools, Vulkan headers, and the
+SDL3 backend libraries. Enter it and configure as on other Linux distributions; the shell exports
 `CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
 needed:
 
@@ -311,8 +311,9 @@ Requirements:
 - An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
 - Xcode (or the Command Line Tools)
 - Homebrew packages: `brew install cmake ninja glslang python`
-- Qt 6 (Concurrent, Network, and Widgets) with x86-64 support. The official Qt installation is
-  universal and works; Homebrew's Qt is arm64-only and will not link
+- Qt 6 (Concurrent, Network, Widgets, and LinguistTools) with x86-64 support. Ensure the Qt
+  LinguistTools component (`lrelease`) is selected. The official Qt installation is universal and
+  works; Homebrew's Qt is arm64-only and will not link
 
 ```bash
 git submodule update --init --recursive

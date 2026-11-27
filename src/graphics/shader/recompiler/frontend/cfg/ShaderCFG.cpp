@@ -1694,9 +1694,9 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uin
 	return InstructionWritesScalarCode(inst, code);
 }
 
-std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                                             uint32_t before, uint32_t code, uint32_t wave_size,
-                                             std::vector<uint32_t>& crossed_calls) {
+std::vector<uint32_t> FindScalarDefinitions(const Decoder::Program& program, const Graph& graph,
+                                            uint32_t before, uint32_t code, uint32_t wave_size,
+                                            std::vector<uint32_t>& crossed_calls) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
@@ -1704,7 +1704,10 @@ std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, co
 	EXIT_IF(found == graph.blocks.end());
 	std::vector<std::pair<uint32_t, uint32_t>> pending {{found->id, before}};
 	std::set<std::pair<uint32_t, uint32_t>> visited;
-	std::optional<uint32_t> definition;
+	// Several writes can reach one use, e.g. a callee address loaded before a loop and
+	// reloaded on the back edge after the call clobbered it. Callers decide whether the
+	// candidates agree.
+	std::vector<uint32_t> definitions;
 	while (!pending.empty()) {
 		const auto point = pending.back();
 		pending.pop_back();
@@ -1721,18 +1724,28 @@ std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, co
 			}
 			if (MayWriteScalarRegister(inst, code, wave_size)) { index = i; break; }
 		}
-		if (index != UINT32_MAX || block->id == graph.entry_block) {
-			if (definition && *definition != index) return std::nullopt;
-			definition = index;
+		if (index != UINT32_MAX) {
+			definitions.push_back(index);
 			continue;
 		}
-		EXIT_IF(block->predecessors.empty());
+		// No local writer. The launch pair reaches the use from the entry block, but a back edge
+		// into the entry block (a call re-entered with a reloaded pair) reaches it too, so record
+		// the sentinel and keep walking. An entry block without predecessors yields only that.
+		if (block->id == graph.entry_block) {
+			definitions.push_back(UINT32_MAX);
+		} else {
+			EXIT_IF(block->predecessors.empty());
+		}
 		for (const auto predecessor: block->predecessors) {
 			pending.emplace_back(predecessor, graph.blocks[predecessor].inst_end);
 		}
 	}
-	EXIT_IF(!definition);
-	return definition;
+	EXIT_IF(definitions.empty());
+	std::ranges::sort(definitions);
+	definitions.erase(std::unique(definitions.begin(), definitions.end()), definitions.end());
+	std::ranges::sort(crossed_calls);
+	crossed_calls.erase(std::unique(crossed_calls.begin(), crossed_calls.end()), crossed_calls.end());
+	return definitions;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

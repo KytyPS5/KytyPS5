@@ -505,6 +505,26 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return TranslateProgram(source.decoded, options);
 }
 
+namespace {
+
+// S_GETPC_B64 in the native caller yields shader base + pc, a real guest address (embedded
+// constant data). Only PCs inside linked leaves or call returns are synthetic.
+bool IsNativePcRead(const IR::Inst& base, uint32_t native_bytes) {
+	if (native_bytes == 0u) return false;
+	// Each use must be "base + immediate" with the immediate inside the native code: the
+	// translator emits exactly that for S_GETPC_B64 (pc + 4). Return addresses written by linked
+	// SWAPPCs and pcs inside appended bodies are beyond native_bytes.
+	for (const auto& use: base.Uses()) {
+		const auto* user = use.user;
+		if (user->GetOpcode() != IR::ValueOpcode::IAdd64 || !user->Arg(1).IsImmediate() ||
+		    use.operand != 0u || user->Arg(1).U64() > native_bytes)
+			return false;
+	}
+	return true;
+}
+
+} // namespace
+
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
 	EXIT_IF(decoded.instructions.empty());
 	if (decoded.has_swap_pc) {
@@ -609,7 +629,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
 		for (const auto* block: ir.blocks)
 			for (const auto& inst: *block)
-				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
+				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase &&
+				                     !IsNativePcRead(inst, decoded.native_bytes));
 	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;

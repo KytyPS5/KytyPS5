@@ -902,6 +902,8 @@ struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_swap_pc = false;
+	// Bytes of the original caller code; appended linked leaf bodies and dispatchers lie past it.
+	uint32_t                 native_bytes = 0;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

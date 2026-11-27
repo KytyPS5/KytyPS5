@@ -30,6 +30,11 @@ void RestoreProcessAffinity();
 
 } // namespace Thread
 
+using thread_func_t = void (*)(void*);
+// Runs func(arg) to completion on a temporary thread with at least stack_bytes of stack.
+// For deeply recursive work (e.g. large linked shaders) that would overflow a default thread stack.
+void RunWithStack(size_t stack_bytes, thread_func_t func, void* arg);
+
 // Recursive.
 class Mutex {
 public:

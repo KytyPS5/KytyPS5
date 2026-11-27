@@ -42,7 +42,26 @@ namespace Libs::Graphics {
 
 namespace {
 
+// Linked leaf bodies produce very deep IR value graphs; translate and compile them on a large stack.
+constexpr size_t LinkedShaderStackBytes = size_t {256} << 20u;
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
+
+// Plan extraction clones the descriptor and SRT value graphs recursively, so it runs on the
+// same large stack as linked-shader translation.
+ShaderRecompiler::IR::ResourcePlan ExtractPlanOnLargeStack(
+    const ShaderRecompiler::TranslateResult& translated) {
+	struct Job {
+		const ShaderRecompiler::TranslateResult* translated;
+		ShaderRecompiler::IR::ResourcePlan*      plan;
+	};
+	ShaderRecompiler::IR::ResourcePlan plan;
+	Job                               job {&translated, &plan};
+	Common::RunWithStack(LinkedShaderStackBytes, [](void* arg) {
+		auto& job = *static_cast<Job*>(arg);
+		*job.plan = ShaderRecompiler::IR::ExtractResourcePlan(job.translated->program);
+	}, &job);
+	return plan;
+}
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -206,15 +225,25 @@ std::span<const uint32_t> PipelineCache::Program::FunctionCode() const {
 bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 	const auto revision = call_source->revision;
 	ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
-	resource_plan.source_reads = call_source->reads;
+	skip_dispatch = call_source->unlinkable_call_pc != UINT32_MAX;
+	if (skip_dispatch) return true;
+	resource_plan.source_reads     = call_source->reads;
+	resource_plan.call_table_reads = call_source->table_reads;
 	return revision != call_source->revision;
 }
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  ShaderRecompiler::IR::PushData::Window push_data) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+	bool retry = false;
+	if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+	                                                specialization, &retry)) {
+		if (!retry) EXIT("shader resource specialization failed");
+		// The write overlaps the function table this link was resolved from. Skip this
+		// dispatch; the next refresh re-reads the table and re-links.
+		skip_dispatch = true;
+		return nullptr;
+	}
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword !=
@@ -330,14 +359,20 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	bool source_changed = false;
 	if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
-		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
+			// The table is re-read on every dispatch: a table that was empty (GPU-written or
+			// uploaded after the pipeline was built) can become linkable later.
 			source_changed = cached.RefreshCallSource(runtime);
+			if (cached.skip_dispatch) return nullptr;
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data);
 		} else {
+			// A shader the SRT walker could not resolve at all is permanently unsupported.
+			if (cached.skip_dispatch) return nullptr;
 			module = cached.FindModule<false>(runtime, push_data);
 		}
+		// Materialization rejected this dispatch (a write overlaps the linked table).
+		if (cached.skip_dispatch) return nullptr;
 		if (module != nullptr) return bind(*module);
 	}
 
@@ -346,6 +381,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	options.function_table_calls = Config::FunctionTableCallsEnabled();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -364,7 +400,32 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if (current != nullptr) {
 		if (!current->calls.empty()) {
 			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
-			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+			if (current->unlinkable_call_pc != UINT32_MAX) {
+				PipelineCacheLog("!!! COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
+				                 "reason=GPU-selected callable cannot be linked yet; rendering is incomplete",
+				                 params.hash, current->unlinkable_call_pc);
+				// Keep the source: a later refresh re-reads the table and may be able to link.
+				if (entry == m_program_cache.end()) {
+					auto retained = source.calls.empty()
+					                    ? nullptr
+					                    : std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source));
+					entry = m_program_cache
+					            .emplace(m_lookup_key, Program {.call_source = std::move(retained)})
+					            .first;
+				}
+				entry->second.skip_dispatch = true;
+				return nullptr;
+			}
+			// The callback is a plain function pointer, so everything it needs goes through `job`.
+			struct Job {
+				const ShaderRecompiler::ShaderSource*  source;
+				const ShaderRecompiler::CompileOptions* options;
+				ShaderRecompiler::TranslateResult*    result;
+			} job {current, &options, &translated};
+			Common::RunWithStack(LinkedShaderStackBytes, [](void* arg) {
+				auto& job = *static_cast<Job*>(arg);
+				*job.result = ShaderRecompiler::TranslateProgram(job.source->linked->decoded, *job.options);
+			}, &job);
 			translated.program.source_reads = current->reads;
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
@@ -378,19 +439,50 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		                    : nullptr;
 		entry = m_program_cache.emplace(m_lookup_key, Program {
 		    .call_source   = std::move(retained),
-		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+		    .resource_plan = ExtractPlanOnLargeStack(translated),
 		}).first;
+		if (entry->second.call_source != nullptr)
+			entry->second.resource_plan.call_table_reads = entry->second.call_source->table_reads;
 		auto& program = entry->second;
-		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-		    program.resource_plan, runtime, program.resources, program.specialization));
+		bool  retry   = false;
+		if (!ShaderRecompiler::IR::MaterializeResources(program.resource_plan, runtime,
+		                                                program.resources, program.specialization,
+		                                                &retry)) {
+			if (!retry) EXIT("shader resource specialization failed");
+			program.skip_dispatch = true;
+			return nullptr;
+		}
 	} else if (source_changed) {
-		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		entry->second.resource_plan = ExtractPlanOnLargeStack(translated);
+		if (entry->second.call_source != nullptr)
+			entry->second.resource_plan.call_table_reads = entry->second.call_source->table_reads;
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data)) {
 			return bind(*module);
 		}
+		if (entry->second.skip_dispatch) return nullptr;
 	}
-	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data));
+	// Later passes and SPIR-V emission walk the same deep graphs, so compile on the large stack too.
+	ShaderModule* compiled = nullptr;
+	if (entry->second.call_source != nullptr) {
+		struct Job {
+			PipelineCache*                          self;
+			Program*                                program;
+			const ProgramKey*                       key;
+			const ShaderRecompiler::CompileOptions* options;
+			ShaderRecompiler::TranslateResult*      translated;
+			ShaderRecompiler::IR::PushData::Window* push_data;
+			ShaderModule*                           result;
+		} job {this, &entry->second, &entry->first, &options, &translated, &push_data, nullptr};
+		Common::RunWithStack(LinkedShaderStackBytes, [](void* arg) {
+			auto& job = *static_cast<Job*>(arg);
+			job.result = &job.self->CompileModule(*job.program, *job.key, *job.options,
+			                                      std::move(*job.translated), *job.push_data);
+		}, &job);
+		compiled = job.result;
+	} else {
+		compiled = &CompileModule(entry->second, entry->first, options, std::move(translated), push_data);
+	}
+	return bind(*compiled);
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,

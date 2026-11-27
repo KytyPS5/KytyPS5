@@ -273,6 +273,12 @@
               </item>
              </layout>
             </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_reduced_motion">
+              <property name="toolTip"><string>Show notifications in place instead of sliding in from the right, and shorten their fades. Applies to trophy unlocks and system notices such as a controller connecting.</string></property>
+              <property name="text"><string>Reduce motion</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

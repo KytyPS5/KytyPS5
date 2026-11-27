@@ -28,6 +28,9 @@ void                     InitializeSystemOverlayInput(SDL_Window* window);
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
+/// Notes that the game has presented a frame, so notices shown from then on reach the player
+/// rather than a loading screen. Cheap enough to call on every present.
+void                     NoteGameFramePresented() noexcept;
 void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                                               std::span<const std::byte> icon_png);
 

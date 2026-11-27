@@ -277,6 +277,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--flush-draws" << QString::number(info.flush_draws);
 	AddFlag(args, !info.trophy_enabled, "--no-trophy-notifications");
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
+	AddFlag(args, info.reduced_motion_enabled, "--reduced-motion");
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
 	if (!info.launch_activity.isEmpty()) {

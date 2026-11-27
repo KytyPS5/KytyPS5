@@ -1,4 +1,6 @@
 // Exercise the production controller with deterministic host output and time.
+#include "graphics/presentation/system/events/subscribe.h"
+
 #include <SDL3/SDL.h>
 #include <array>
 #include <cstdio>
@@ -542,6 +544,69 @@ void TestMultiplayerRouting() {
 	      "shutdown did not close each registered host pad exactly once");
 }
 
+// Each pad that takes a player slot publishes that the player's controller connected, whether it
+// just connected or waited for a slot, and a pad leaving a slot publishes that it disconnected,
+// in the console's language, here the en-US text every language falls back to. A duplicate
+// report, a pad left waiting and an unknown pad publish nothing.
+void TestPlayerNotices() {
+	using Libs::Graphics::SystemUi::NotificationEvent;
+	using Libs::Graphics::SystemUi::Status;
+	auto notices = Libs::Graphics::SystemUi::Subscribe<NotificationEvent>(32);
+	std::vector<NotificationEvent> seen;
+	const auto take = [&notices, &seen] {
+		seen.clear();
+		notices.DrainInto(seen);
+		return seen;
+	};
+	const auto is = [](const NotificationEvent& event, const char* text,
+	                   Status status) {
+		return event.text == text && event.status == status;
+	};
+	Controller controller;
+	auto events = take();
+	Check(events.size() == 1 && is(events[0], "Controller 1 connected", Status::Info),
+	      "a pad taking a slot did not say its player connected");
+	Connect(1);
+	Check(take().empty(), "a duplicate device report published a notice");
+	for (int id = 2; id <= Config::MAX_PLAYERS; id++) {
+		Connect(id);
+	}
+	events = take();
+	Check(events.size() == static_cast<size_t>(Config::MAX_PLAYERS - 1) &&
+	          is(events.back(), "Controller 4 connected", Status::Info),
+	      "each pad taking a slot did not say its own player connected");
+	const int waiting = Config::MAX_PLAYERS + 1;
+	Connect(waiting);
+	Check(take().empty(), "a pad left waiting for a slot published a notice");
+	Disconnect(waiting);
+	Check(take().empty(), "a waiting pad leaving published a notice");
+	Connect(waiting);
+	Check(take().empty(), "a pad left waiting for a slot published a notice");
+	Disconnect(2);
+	events = take();
+	Check(events.size() == 2 &&
+	          is(events[0], "Controller 2 disconnected", Status::Warning) &&
+	          is(events[1], "Controller 2 connected", Status::Info),
+	      "a pad leaving did not say so, or the waiting pad taking its slot did not say it "
+	      "connected");
+	// Every slot is full, so moving the keyboard to player 1 sends pad 1 to wait, and moving it
+	// back gives pad 1 a slot again. Nothing was plugged in, so neither is announced.
+	CycleKeyboardPlayer();
+	Check(GetActiveControllerId() == HOST_INPUT_CONTROLLER_ID,
+	      "the keyboard did not take player 1's slot");
+	Check(take().empty(), "the keyboard taking a pad's slot published a notice");
+	for (int mode = 1; mode <= Config::MAX_PLAYERS; mode++) {
+		CycleKeyboardPlayer();
+	}
+	Check(GetActiveControllerId() != HOST_INPUT_CONTROLLER_ID,
+	      "the keyboard did not give player 1's slot back to a pad");
+	Check(take().empty(), "a pad getting its slot back from the keyboard published a notice");
+	// An unknown pad changes nothing but publishes whatever is pending, so a keyboard move that
+	// left notices behind would show here.
+	Disconnect(99);
+	Check(take().empty(), "an unknown pad leaving published a notice, or a keyboard move left one");
+}
+
 void TestDedicatedKeyboardOutputs() {
 	Config::ConfigOptions options;
 	options.keyboard_player  = 1;
@@ -859,6 +924,7 @@ int main() {
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
 	TestVrControllerInformation();
+	TestPlayerNotices();
 	Config::Shutdown();
 	return 0;
 }

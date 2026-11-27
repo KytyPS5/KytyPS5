@@ -18,6 +18,7 @@
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -1144,6 +1145,7 @@ bool FlipQueue::Flip() {
 		}
 		if (layer_count != 0) {
 			m_presenter.Present(std::span(layers.data(), layer_count));
+			Graphics::NoteGameFramePresented();
 		}
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(m_width, m_height);

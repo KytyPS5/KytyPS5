@@ -4,9 +4,11 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/localization.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/presentation/system/events.h"
 #include "kernel/pthread.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
@@ -19,6 +21,9 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Libs::Controller {
@@ -192,6 +197,21 @@ static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_specia
 // Maps host gamepads to players; the keyboard follows the configured keyboard player.
 static Common::Mutex g_router_mutex;
 static std::vector<std::pair<int, int>> g_pad_players;
+
+// A pad that took a player slot or left one, for the player's notice.
+struct PlayerNotice {
+	int  player    = 0;
+	bool connected = false;
+};
+// Noted under g_router_mutex and published once it is released, so nothing the system UI does
+// runs under the router lock.
+static std::vector<PlayerNotice> g_player_notices;
+
+// Where a notice's text says the player's number.
+constexpr std::string_view PLAYER_PLACEHOLDER = "{player}";
+
+static std::vector<PlayerNotice> TakePlayerNotices();
+static void PublishPlayerNotices(const std::vector<PlayerNotice>& notices);
 
 static uint32_t g_keyboard_player = 0;
 
@@ -467,6 +487,9 @@ void Initialize() {
 	}
 	g_keyboard_player = Config::GetKeyboardPlayer();
 	RefreshPlayers();
+	// No pad connects before the controller starts, so there is nothing to announce, and a notice
+	// left by an earlier session is dropped rather than published late.
+	g_player_notices.clear();
 }
 
 void Shutdown() {
@@ -1033,6 +1056,24 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 	return ret_num;
 }
 
+// Gives each waiting pad a slot not in `taken`, while any is free, in the order they connected.
+// Caller holds g_router_mutex.
+static void AssignWaitingPads(std::array<bool, Config::MAX_PLAYERS>& taken) {
+	for (auto& [id, player]: g_pad_players) {
+		if (player >= 0) {
+			continue;
+		}
+		const auto free = std::find(taken.begin(), taken.end(), false);
+		if (free != taken.end()) {
+			player = static_cast<int>(free - taken.begin());
+			*free  = true;
+			LOGF("Controller %d assigned to player %d\n", id, player + 1);
+			// Whether it just connected or waited for a slot, the player now has a pad.
+			g_player_notices.push_back({.player = player, .connected = true});
+		}
+	}
+}
+
 // Keep every opened pad, including those waiting for a free player slot.
 // Caller holds g_router_mutex.
 static void RefreshPlayers() {
@@ -1049,17 +1090,7 @@ static void RefreshPlayers() {
 			taken[player] = true;
 		}
 	}
-	for (auto& [id, player]: g_pad_players) {
-		if (player >= 0) {
-			continue;
-		}
-		const auto free = std::find(taken.begin(), taken.end(), false);
-		if (free != taken.end()) {
-			player = static_cast<int>(free - taken.begin());
-			*free  = true;
-			LOGF("Controller %d assigned to player %d\n", id, player + 1);
-		}
-	}
+	AssignWaitingPads(taken);
 	std::array<int, Config::MAX_PLAYERS> active;
 	active.fill(-1);
 	active[keyboard] = HOST_INPUT_CONTROLLER_ID;
@@ -1085,30 +1116,79 @@ static void RefreshPlayers() {
 	}
 }
 
-void Connect(int id) {
-	Common::LockGuard lock(g_router_mutex);
-	if (std::any_of(g_pad_players.begin(), g_pad_players.end(),
-	                [id](const auto& pad) { return pad.first == id; })) {
-		return;
+// Takes the notices noted so far. Caller holds g_router_mutex.
+static std::vector<PlayerNotice> TakePlayerNotices() {
+	return std::exchange(g_player_notices, {});
+}
+
+// The text of `notice` in the console's language, with the player's number in place of the
+// placeholder, counting players from one as the player sees them.
+static std::string PlayerNoticeText(const PlayerNotice& notice) {
+	const auto language = static_cast<int>(Config::GetConsoleLanguage());
+	std::string text(Common::Localization::Get(
+	    language, notice.connected ? "controller.toast.connected" : "controller.toast.disconnected"));
+	if (const auto at = text.find(PLAYER_PLACEHOLDER); at != std::string::npos) {
+		text.replace(at, PLAYER_PLACEHOLDER.size(), std::to_string(notice.player + 1));
 	}
-	g_pad_players.emplace_back(id, -1);
-	RefreshPlayers();
+	return text;
+}
+
+// Publishes `notices` as notifications. Called with g_router_mutex released. Pads connect and
+// disconnect on the one thread that handles SDL's events, so notices reach the channel in the
+// order they happened.
+static void PublishPlayerNotices(const std::vector<PlayerNotice>& notices) {
+	for (const PlayerNotice& notice: notices) {
+		Graphics::SystemUi::PublishNotification(
+		    PlayerNoticeText(notice), notice.connected ? Graphics::SystemUi::Status::Info
+		                                               : Graphics::SystemUi::Status::Warning);
+	}
+}
+
+void Connect(int id) {
+	std::vector<PlayerNotice> notices;
+	{
+		Common::LockGuard lock(g_router_mutex);
+		if (std::any_of(g_pad_players.begin(), g_pad_players.end(),
+		                [id](const auto& pad) { return pad.first == id; })) {
+			return;
+		}
+		g_pad_players.emplace_back(id, -1);
+		RefreshPlayers();
+		notices = TakePlayerNotices();
+	}
+	PublishPlayerNotices(notices);
 }
 
 void Disconnect(int id) {
-	Common::LockGuard lock(g_router_mutex);
-	std::erase_if(g_pad_players, [id](const auto& pad) { return pad.first == id; });
-	RefreshPlayers();
+	std::vector<PlayerNotice> notices;
+	{
+		Common::LockGuard lock(g_router_mutex);
+		const auto removed = std::find_if(g_pad_players.begin(), g_pad_players.end(),
+		                                  [id](const auto& pad) { return pad.first == id; });
+		// Only a pad that held a slot leaves a player without one. A waiting pad was never shown.
+		if (removed != g_pad_players.end() && removed->second >= 0) {
+			g_player_notices.push_back({.player = removed->second, .connected = false});
+		}
+		std::erase_if(g_pad_players, [id](const auto& pad) { return pad.first == id; });
+		RefreshPlayers();
+		notices = TakePlayerNotices();
+	}
+	PublishPlayerNotices(notices);
 }
 
 void CycleKeyboardPlayer() {
-	Common::LockGuard lock(g_router_mutex);
-	g_keyboard_player = (g_keyboard_player + 1) % (Config::MAX_PLAYERS + 1);
-	RefreshPlayers();
-	if (g_keyboard_player == 0) {
-		LOGF("Keyboard shared with player 1\n");
-	} else {
-		LOGF("Keyboard assigned to player %u\n", g_keyboard_player);
+	{
+		Common::LockGuard lock(g_router_mutex);
+		g_keyboard_player = (g_keyboard_player + 1) % (Config::MAX_PLAYERS + 1);
+		RefreshPlayers();
+		if (g_keyboard_player == 0) {
+			LOGF("Keyboard shared with player 1\n");
+		} else {
+			LOGF("Keyboard assigned to player %u\n", g_keyboard_player);
+		}
+		// Moving the keyboard reshuffles pads without anything being plugged in, so the pads it
+		// moves aren't announced, and nothing is left to be published by a later call.
+		g_player_notices.clear();
 	}
 }
 

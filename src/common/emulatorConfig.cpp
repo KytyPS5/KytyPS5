@@ -117,6 +117,14 @@ bool StretchEnabled() {
 	return g_config->stretch_enabled;
 }
 
+bool SystemNoticesEnabled() {
+	return g_config->system_notices_enabled;
+}
+
+bool ReducedMotionEnabled() {
+	return g_config->reduced_motion_enabled;
+}
+
 bool VrEnabled() {
 	return g_config->vr_enabled;
 }

@@ -1148,11 +1148,13 @@ void TestReadsIntoProtectedPages() {
             FileSystem::KernelWrite(fd, payload.data(), payload.size()) ==
                 static_cast<int64_t>(payload.size()),
         "create protected-read fixture");
-  constexpr uint64_t memory = 0x0000000200010000ull;
-  Check(Common::VirtualMemory::AllocFixed(
-            memory, Half * 4, Common::VirtualMemory::Mode::ReadWrite) &&
+  constexpr int CpuReadWrite = 0x02;
+  void *mapped = nullptr;
+  Check(Libs::LibKernel::Memory::KernelMapFlexibleMemory(&mapped, Half * 4,
+                                                         CpuReadWrite, 0) == OK &&
             Common::HostException::InstallHandler(UnprotectGuard),
         "allocate the read target and install the guard handler");
+  const auto memory = reinterpret_cast<uint64_t>(mapped);
   g_guard_base = memory + Half;
   g_guard_size = Half;
   static uint64_t recoverable_base = 0;
@@ -1210,7 +1212,7 @@ void TestReadsIntoProtectedPages() {
         "pread into an unresolvable destination returns zero without crashing");
   SysFileSetRecoverableDestination(nullptr);
   g_guard_size = 0;
-  Check(Common::VirtualMemory::Free(memory, Half * 4),
+  Check(Libs::LibKernel::Memory::KernelMunmap(memory, Half * 4) == OK,
         "free protected-read target");
   Check(FileSystem::KernelClose(fd) == OK &&
             FileSystem::KernelUnlink("/savedata0/protected-read.dat") == OK,

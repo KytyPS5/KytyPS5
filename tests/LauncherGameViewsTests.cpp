@@ -52,7 +52,9 @@ int main(int argc, char **argv) {
   // Breeze, where installed, paints its own color behind scroll bars; Fusion's are opaque.
   const bool breeze = QApplication::setStyle(QStringLiteral("Breeze")) != nullptr;
   // A fixed light palette, whatever the desktop colors: a black panel then stands out.
-  QApplication::setPalette(QPalette(Qt::white));
+  QPalette palette(Qt::white);
+  palette.setColor(QPalette::Highlight, Qt::black);
+  QApplication::setPalette(palette);
   LauncherTheme::Initialize(application);
 
   QTemporaryDir game;
@@ -83,6 +85,21 @@ int main(int argc, char **argv) {
 
   Check(ShowsBackground(views->grab().toImage().pixelColor(empty)),
         "the game background is hidden behind the list view");
+
+  const auto row = list->visualRect(list->model()->index(0, GAME_NAME_COLUMN))
+                       .translated(list->viewport()->mapTo(views, QPoint()));
+  const QPoint inside(row.right() - 6, row.center().y());
+  const auto   unselected = views->grab().toImage().pixelColor(inside);
+  list->setCurrentItem(item);
+  QApplication::processEvents();
+  const auto selected = views->grab().toImage().pixelColor(inside);
+  Check(ShowsBackground(selected), "the game background is hidden behind the selected list row");
+  Check(qAbs(selected.red() - unselected.red()) + qAbs(selected.green() - unselected.green()) +
+                qAbs(selected.blue() - unselected.blue()) >
+            48,
+        "the selected list row is not distinct from an unselected one");
+  list->clearSelection();
+  QApplication::processEvents();
 
   views->setCurrentWidget(grid);
   QApplication::processEvents();

@@ -14,8 +14,8 @@ QTreeWidget#cfgs_list::item {
 }
 
 QTreeWidget#cfgs_list::item:selected {
-    background: palette(highlight);
-    color: palette(highlighted-text);
+    background: @selection;
+    color: palette(text);
 }
 
 QTreeWidget#cfgs_list QHeaderView::section {

@@ -507,6 +507,12 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+# The system UI's event channel. The channel is header only, so it links nothing.
+add_executable(system_ui_event_channel_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiEventChannelTests.cpp"
+)
+target_include_directories(system_ui_event_channel_tests PRIVATE ${inc_headers})
+
 # The system UI's linear gradients and boxes drawn with them. It links system_ui for DrawBox.
 add_executable(system_ui_gradient_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiGradientTests.cpp"
@@ -840,6 +846,7 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME system_ui_event_channel COMMAND $<TARGET_FILE:system_ui_event_channel_tests>)
 	add_test(NAME system_ui_gradient COMMAND $<TARGET_FILE:system_ui_gradient_tests>)
 	add_test(NAME system_ui_animation COMMAND $<TARGET_FILE:system_ui_animation_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
@@ -964,6 +971,7 @@ if(BUILD_TESTING)
 		vdecsw_tests
 		bit_array_tests
 		lru_cache_tests
+		system_ui_event_channel_tests
 		system_ui_gradient_tests
 		system_ui_animation_tests
 		common_tests

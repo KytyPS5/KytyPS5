@@ -312,6 +312,30 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (normalized.format == vk::Format::eR8Srgb || normalized.format == vk::Format::eR8G8Srgb) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
 	}
+	// The view format can differ from the backing format, and the declared usage must be
+	// supported by the view format: VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, for example, cannot
+	// be a color attachment on some implementations.
+	const auto view_features =
+	    m_graphics.GetFormatProperties(normalized.format).optimalTilingFeatures;
+	struct UsageFeature {
+		vk::ImageUsageFlagBits    usage;
+		vk::FormatFeatureFlagBits feature;
+	};
+	const UsageFeature usage_features[] = {
+	    {vk::ImageUsageFlagBits::eTransferSrc, vk::FormatFeatureFlagBits::eTransferSrc},
+	    {vk::ImageUsageFlagBits::eTransferDst, vk::FormatFeatureFlagBits::eTransferDst},
+	    {vk::ImageUsageFlagBits::eSampled, vk::FormatFeatureFlagBits::eSampledImage},
+	    {vk::ImageUsageFlagBits::eStorage, vk::FormatFeatureFlagBits::eStorageImage},
+	    {vk::ImageUsageFlagBits::eColorAttachment, vk::FormatFeatureFlagBits::eColorAttachment},
+	    {vk::ImageUsageFlagBits::eDepthStencilAttachment,
+	     vk::FormatFeatureFlagBits::eDepthStencilAttachment},
+	};
+	for (const auto& entry: usage_features) {
+		if ((usage.usage & entry.usage) != vk::ImageUsageFlags {} &&
+		    (view_features & entry.feature) == vk::FormatFeatureFlags {}) {
+			usage.usage &= ~entry.usage;
+		}
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +

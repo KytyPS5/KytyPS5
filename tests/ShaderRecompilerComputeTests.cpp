@@ -7628,6 +7628,87 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckCompressedMipStorage() {
+    constexpr const char *name = "CompressedMipStorage";
+    constexpr uintptr_t base = 0x0000000200600000ull;
+    constexpr uint64_t size = 0x4000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t physical = -1;
+    Require(name, "allocate guest backing",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+                size, 0, &physical) == 0,
+            "could not allocate direct memory");
+    auto *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map guest backing",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "could not map direct memory");
+    Libs::LibKernel::Memory::InstallGpuResources(&context);
+    context.MapMemory(base, size);
+    auto &texture_cache = context.GetTextureCache();
+
+    constexpr uint32_t levels = 7;
+    constexpr auto tile = Prospero::TileMode::kStandard4KB;
+    constexpr auto type = Prospero::ImageType::kColor2D;
+    auto compressed = MakeLinearDesc(base, 0, vk::Format::eBc3UnormBlock,
+                                     Prospero::BufferFormat::kBc3UNorm, type,
+                                     {64, 64, 1}, 1, 16, 1);
+    auto raw = MakeLinearDesc(base, 0, vk::Format::eR32G32B32A32Uint,
+                              Prospero::BufferFormat::k32_32_32_32UInt, type,
+                              {16, 16, 1}, 1, 16, 1);
+    for (auto *desc : {&compressed, &raw}) {
+      desc->info.tile_mode = tile;
+      desc->info.resources.levels = levels;
+      desc->view_info.level_count = levels;
+      desc->info.UpdateSize();
+    }
+    raw.type = BindingType::Storage;
+    raw.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+    Require(name, "raw aliases every compressed mip",
+            raw.info.data == compressed.info.data &&
+                raw.info.mip_layout == compressed.info.mip_layout,
+            "fixture does not share the compressed mip offsets");
+    std::memset(mapped, 0, compressed.info.data.size);
+    const auto compressed_id = texture_cache.FindImage(compressed);
+    if (texture_cache.GetImage(compressed_id).backing.usage &
+        vk::ImageUsageFlagBits::eStorage) {
+      const auto raw_id = texture_cache.FindImage(raw);
+      Require(name, "long raw chain reuses compressed backing",
+              raw_id == compressed_id,
+              "raw storage chain allocated a separate native image");
+      raw.view_info.level_count = 1;
+      for (uint32_t level = 0; level < levels; ++level) {
+        raw.view_info.base_level = level;
+        Require(name, "raw storage mip view",
+                texture_cache.FindTexture(raw_id, raw) != nullptr,
+                "could not bind a writable view of a compressed mip");
+      }
+      std::printf("[gpu]     %-32s ok\n", name);
+    } else {
+      std::printf("[gpu]     %-32s skipped (BC storage unsupported)\n", name);
+    }
+
+    context.UnmapMemory(base, size);
+    scheduler.Finish();
+    Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap guest backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "could not unmap direct memory");
+    Require(name, "release guest backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "could not release direct memory");
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -59169,6 +59250,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-upload-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLargeSparseImageUpload();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compressed-mip-storage-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckCompressedMipStorage();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {

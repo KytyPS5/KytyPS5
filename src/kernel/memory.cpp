@@ -869,6 +869,7 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	SysFileRecoverableDestination probe = nullptr;
 	if (resources != nullptr) {
 		probe = [](const void* data, uint64_t size) {
+			std::shared_lock state(g_memory_state_mutex);
 			if (g_virtual_ranges == nullptr) {
 				return false;
 			}

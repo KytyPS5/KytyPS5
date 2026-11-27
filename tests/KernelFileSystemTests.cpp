@@ -65,6 +65,10 @@ namespace Libs::LibAmpr {
 void InitAmpr_1(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibAudioPropagation {
+void InitAudio_1_AudioPropagation(Loader::SymbolDatabase *symbols);
+}
+
 namespace Libs::LibNet {
 void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 }
@@ -633,6 +637,17 @@ void TestSessionSignalingDescriptors() {
   const int after_terminate = FileSystem::KernelOpen("/dev/urandom", 0, 0);
   Check(after_terminate == file && FileSystem::KernelClose(after_terminate) == OK,
         "terminate releases the library's descriptors");
+}
+
+void TestAudioPropagationSourceDestroyExport() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibAudioPropagation::InitAudio_1_AudioPropagation(&symbols);
+  const auto* symbol = symbols.Find(
+      {"wkseM3LWPuc", "AudioPropagation", "AudioPropagation", Loader::SymbolType::Func});
+  Check(symbol != nullptr, "AudioPropagation source destroy export resolves");
+  const auto destroy =
+      reinterpret_cast<int32_t (KYTY_SYSV_ABI *)(uint64_t)>(symbol->vaddr);
+  Check(destroy(1) == 0, "AudioPropagation source destroy accepts a source handle");
 }
 
 void TestSysmoduleReferences() {
@@ -3191,6 +3206,7 @@ int main(int argc, char** argv) {
   CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
   TestSysmoduleReferences();
+  TestAudioPropagationSourceDestroyExport();
   TestSystemServiceEntitlementEvents();
   TestAddContent(temporary.Path());
   TestRandomDevices();

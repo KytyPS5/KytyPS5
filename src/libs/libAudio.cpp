@@ -87,6 +87,13 @@ static int32_t KYTY_SYSV_ABI AudioPropagationSourceCreate(
 }
 
 static int32_t KYTY_SYSV_ABI
+AudioPropagationSourceDestroy(AudioPropagationHandle /*source_handle*/) {
+	PRINT_NAME();
+
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI
 AudioPropagationSourceSetAttributes(AudioPropagationHandle /*source_handle*/,
                                     const void* /*attributes*/, uint32_t /*num_attributes*/) {
 	PRINT_NAME();
@@ -157,6 +164,7 @@ LIB_DEFINE(InitAudio_1_AudioPropagation) {
 	LIB_FUNC("aNEqtSHdUSo", LibAudioPropagation::AudioPropagationSystemCreate);
 	LIB_FUNC("8bI5h8req30", LibAudioPropagation::AudioPropagationRoomCreate);
 	LIB_FUNC("d84otraxt2s", LibAudioPropagation::AudioPropagationSourceCreate);
+	LIB_FUNC("wkseM3LWPuc", LibAudioPropagation::AudioPropagationSourceDestroy);
 	LIB_FUNC("-wsUTr31yeg", LibAudioPropagation::AudioPropagationSourceSetAttributes);
 	LIB_FUNC("eEeKqFeNI3o", LibAudioPropagation::AudioPropagationSourceGetAudioPath);
 	LIB_FUNC("tKSmk2JsMAA", LibAudioPropagation::AudioPropagationSourceSetAudioPath);

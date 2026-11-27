@@ -507,11 +507,33 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
-# The system UI's event channel. The channel is header only, so it links nothing.
+# The system UI's event channel and toast list. The channel is header only. The toast test builds
+# trophy toasts, whose views draw with the framework, so it links system_ui.
 add_executable(system_ui_event_channel_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiEventChannelTests.cpp"
 )
 target_include_directories(system_ui_event_channel_tests PRIVATE ${inc_headers})
+
+add_executable(system_ui_toasts_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiToastsTests.cpp"
+	# stb_image's implementation, which the image cache a trophy toast decodes through needs from
+	# whoever links it.
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/stbImage.cpp"
+)
+target_include_directories(system_ui_toasts_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_toasts_tests PRIVATE system_ui)
+# The downloaded Noto Sans files, for checking that the system UI instance loads them.
+target_compile_definitions(system_ui_toasts_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
+
+# The system UI's insets where they are built from separate values, checked side by side through
+# the framework, so it links system_ui. The trophy toast it builds asks the image cache for its
+# icon, so it also compiles stb_image's implementation, as the toast test does.
+add_executable(system_ui_layout_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiLayoutTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/stbImage.cpp"
+)
+target_include_directories(system_ui_layout_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_layout_tests PRIVATE system_ui)
 
 # The system UI's linear gradients and boxes drawn with them. It links system_ui for DrawBox.
 add_executable(system_ui_gradient_tests EXCLUDE_FROM_ALL
@@ -855,6 +877,8 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME system_ui_event_channel COMMAND $<TARGET_FILE:system_ui_event_channel_tests>)
+	add_test(NAME system_ui_toasts COMMAND $<TARGET_FILE:system_ui_toasts_tests>)
+	add_test(NAME system_ui_layout COMMAND $<TARGET_FILE:system_ui_layout_tests>)
 	add_test(NAME system_ui_gradient COMMAND $<TARGET_FILE:system_ui_gradient_tests>)
 	add_test(NAME system_ui_animation COMMAND $<TARGET_FILE:system_ui_animation_tests>)
 	add_test(NAME system_ui_scroll COMMAND $<TARGET_FILE:system_ui_scroll_tests>)
@@ -981,6 +1005,8 @@ if(BUILD_TESTING)
 		bit_array_tests
 		lru_cache_tests
 		system_ui_event_channel_tests
+		system_ui_toasts_tests
+		system_ui_layout_tests
 		system_ui_gradient_tests
 		system_ui_animation_tests
 		system_ui_scroll_tests

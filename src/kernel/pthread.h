@@ -249,6 +249,7 @@ int KYTY_SYSV_ABI pthread_attr_getstacksize(const LibKernel::PthreadAttr* attr, 
 int KYTY_SYSV_ABI pthread_attr_setdetachstate(LibKernel::PthreadAttr* attr, int state);
 int KYTY_SYSV_ABI pthread_attr_setguardsize(LibKernel::PthreadAttr* attr, size_t guard_size);
 int KYTY_SYSV_ABI pthread_attr_setinheritsched(LibKernel::PthreadAttr* attr, int inherit_sched);
+int KYTY_SYSV_ABI pthread_attr_setsolosched_np(LibKernel::PthreadAttr* attr, int solosched);
 int KYTY_SYSV_ABI pthread_attr_setschedparam(LibKernel::PthreadAttr*            attr,
                                              const LibKernel::KernelSchedParam* param);
 int KYTY_SYSV_ABI pthread_attr_setschedpolicy(LibKernel::PthreadAttr* attr, int policy);

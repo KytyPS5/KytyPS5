@@ -2239,6 +2239,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC_POSIX_KERNEL("E+tyo3lp5Lw", Posix::pthread_attr_setdetachstate);
 	LIB_FUNC("euKRgm0Vn2M", Posix::pthread_attr_setschedparam);
 	LIB_FUNC("7ZlAakEf0Qg", Posix::pthread_attr_setinheritsched);
+	LIB_FUNC_POSIX_KERNEL("2+pVfgiEd7A", Posix::pthread_attr_setsolosched_np);
 	LIB_FUNC("0qOtCR-ZHck", Posix::pthread_attr_getstacksize);
 	LIB_FUNC("VUT1ZSrHT0I", Posix::pthread_attr_getdetachstate);
 	LIB_FUNC("JKyG3SWyA10", Posix::pthread_attr_setguardsize);

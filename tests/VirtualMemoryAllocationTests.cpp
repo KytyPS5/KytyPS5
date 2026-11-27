@@ -5924,25 +5924,28 @@ void TestCpuExtensionPatches() {
 		      "segment-prefixed CLZERO was changed by the flat-address patcher");
 	}
 
-	code.reset();
-	Xbyak::Label zero_address;
-	code.test(code.rdi, code.rdi);
-	code.jnz(zero_address);
-	// This address is the CLZERO replacement's saved RAX slot.
-	code.lea(code.rdi, code.ptr[code.rsp - 144]);
-	code.mov(code.qword[code.rdi], 1);
-	code.L(zero_address);
-	code.mov(code.rax, code.rdi);
-	code.stc();
-	code.clzero();
-	code.sfence();
-	code.cmovnc(code.rax, code.rsi);
-	code.cmp(code.rdx, code.rcx);
-	code.cmovne(code.rax, code.rsi);
-	code.cmp(code.qword[code.rdi], 0);
-	code.cmovne(code.rax, code.rsi);
-	code.ret();
-	Check(test, Xbyak::GetError() == 0, "failed to generate CLZERO fixture");
+	const auto emit_zero_fixture = [&](bool stack_overlap) {
+		code.reset();
+		if (stack_overlap) {
+			// The replacement saves RAX after the 128-byte red zone and RFLAGS.
+			code.lea(code.rdi, code.ptr[code.rsp - 144]);
+			code.mov(code.qword[code.rdi], 1);
+		}
+		code.mov(code.rax, code.rdi);
+		code.stc();
+		code.clzero();
+		code.sfence();
+		code.cmovnc(code.rax, code.rsi);
+		code.cmp(code.rdx, code.rcx);
+		code.cmovne(code.rax, code.rsi);
+		code.cmp(code.qword[code.rdi], 0);
+		code.cmovne(code.rax, code.rsi);
+		code.cmp(code.rax, code.rdi);
+		code.cmovne(code.rax, code.rsi);
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate CLZERO fixture");
+	};
+	emit_zero_fixture(false);
 	const std::vector<uint8_t> zero_original(code.getCode(), code.getCurr());
 	alignas(64) std::array<uint64_t, 24> lines;
 	const auto zero = reinterpret_cast<void*(KYTY_SYSV_ABI*)(void*, void*, uint64_t, uint64_t)>(mapping);
@@ -5977,8 +5980,14 @@ void TestCpuExtensionPatches() {
 	Check(test, native_zero.found == 1 && native_zero.native == 1 &&
 	                g_instruction_traps == native_zero_traps,
 	      "native CLZERO did not eliminate the trap");
-	Check(test, zero(nullptr, nullptr, scratch, scratch) != nullptr &&
-	                g_instruction_traps == native_zero_traps + !host.clzero,
+	emit_zero_fixture(true);
+	register_module(code_size);
+	const auto overlap_zero =
+	    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true, {}).clzero;
+	const auto overlap_traps = g_instruction_traps;
+	Check(test, overlap_zero.found == 1 && overlap_zero.native == 1 &&
+	                zero(nullptr, nullptr, scratch, scratch) != nullptr &&
+	                g_instruction_traps == overlap_traps + !host.clzero,
 	      "CLZERO failed to fall back when the cleared line overlaps the spills");
 	std::printf("[host]    %-48s ok\n", test);
 }

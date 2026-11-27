@@ -5064,7 +5064,8 @@ void TestCpuExtensionContexts() {
 	Check(test, std::all_of(data, data + 64, [](uint8_t b) { return b == 0; }),
 	      "address-size CLZERO did not use EAX");
 	std::fill_n(data, 64, 0xa5);
-	for (const uint8_t prefix: {0x64, 0x65}) {
+	constexpr std::array<uint8_t, 2> segment_prefixes {0x64, 0x65};
+	for (const auto prefix: segment_prefixes) {
 		instruction[0] = prefix;
 		context.Gpr(0) = address;
 		context.Rip() = mapping;
@@ -5906,6 +5907,22 @@ void TestCpuExtensionPatches() {
 	          std::all_of(data.begin(), data.end(),
 	                      [](uint64_t value) { return value == 0x123456789abcdef0ull; }),
 	      "CLWB direct fallback changed memory or used an unexpected trap path");
+
+	for (const uint8_t prefix: {0x64, 0x65}) {
+		code.reset();
+		code.mov(code.rax, code.rdi);
+		code.db(prefix);
+		code.clzero();
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate prefixed CLZERO fixture");
+		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+		register_module(code_size);
+		const auto prefixed =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true, {}).clzero;
+		Check(test, prefixed.found == 0 &&
+		                std::equal(original.begin(), original.end(), code.getCode()),
+		      "segment-prefixed CLZERO was changed by the flat-address patcher");
+	}
 
 	code.reset();
 	Xbyak::Label zero_address;

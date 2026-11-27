@@ -980,9 +980,14 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 			replacement = InstructionReplacement::ReadProcessorId;
 		} else if (!host_features.clwb && instruction.mnemonic == ZYDIS_MNEMONIC_CLWB) {
 			replacement = InstructionReplacement::CacheLineWriteBack;
-		} else if (!host_features.clzero && instruction.mnemonic == ZYDIS_MNEMONIC_CLZERO &&
-		           (instruction.attributes & (ZYDIS_ATTRIB_HAS_SEGMENT_FS |
-		                                      ZYDIS_ATTRIB_HAS_SEGMENT_GS)) == 0) {
+		} else if (!host_features.clzero && instruction.mnemonic == ZYDIS_MNEMONIC_CLZERO) {
+			// Zydis does not expose CLZERO's segment overrides through instruction attributes.
+			const auto prefixes = std::span {instruction.raw.prefixes, instruction.raw.prefix_count};
+			if (std::ranges::any_of(prefixes, [](const auto& prefix) {
+				    return prefix.value == 0x64 || prefix.value == 0x65;
+			    })) {
+				continue;
+			}
 			replacement = InstructionReplacement::ZeroCacheLine;
 		} else {
 			continue;

@@ -1421,7 +1421,7 @@ void TestShaderFeatureCollection() {
 
   block->AppendNewInst(ValueOpcode::DppMoveU32, {Value(0u), Value(true)});
   block->AppendNewInst(ValueOpcode::ImageQueryLod,
-                       {Value(0u), Value(0u), Value(0u)});
+                       {Value(0u), Value(0u), Value(0u), Value(true)});
   block->AppendNewInst(ValueOpcode::ImageGatherRaw,
                        {Value(0u), Value(0u), Value(0u), Value(0u),
                         Value(0u), Value(0u), Value(0u), Value(true)});
@@ -10106,9 +10106,7 @@ void TestNativeWideValueValidation() {
       const auto sampler =
           ir.Emit(ValueOpcode::GetSamplerResource,
                   {Value(0u), Value(0u), Value(0u), Value(0u)});
-      ir.Emit(opcode, {image, sampler, address}, flags);
-    } else if (opcode == ValueOpcode::ImageQueryDimensions) {
-      ir.Emit(opcode, {image, address}, flags);
+      ir.Emit(opcode, {image, sampler, address, Value(true)}, flags);
     } else {
       ir.Emit(opcode, {image, address, Value(true)}, flags);
     }

@@ -3842,12 +3842,13 @@ private:
 		return found ? SelectorDomain {maximum, counted ? count : Value {}} : SelectorDomain {};
 	}
 
-	SelectorDomain SelectedSelectorDomain(const Inst& lane, Value guard) const {
+	SelectorDomain SelectedSelectorDomain(const Inst& lane, Value guard, uint32_t depth = 0) const {
 		if (guard.IsEmpty() ? !HasActiveLane(lane.Arg(1), lane.Parent())
 		                    : !Implies(guard, lane.Arg(1))) return {};
 		auto result = FiniteSelectorDomain(lane.Arg(0), lane.Arg(1));
 		if (result.maximum == UINT32_MAX)
-			result.maximum = PossibleU32Bits(ActiveValue(lane.Arg(0), lane.Arg(1)));
+			result.maximum = std::min(PossibleU32Bits(ActiveValue(lane.Arg(0), lane.Arg(1))),
+			                          SelectorMaximum(lane.Arg(0), {}, depth + 1u, lane.Arg(1)));
 		return result;
 	}
 
@@ -3901,7 +3902,7 @@ private:
 		};
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::ReadFirstLane:
-				return SelectedSelectorDomain(*inst, guard).maximum;
+				return SelectedSelectorDomain(*inst, guard, depth).maximum;
 			case ValueOpcode::ReadLane: {
 				// ReadLane ignores EXEC; only context-free bounds on every source lane apply,
 				// unless guard proves a waterfall key equal to the executing lanes' local value.

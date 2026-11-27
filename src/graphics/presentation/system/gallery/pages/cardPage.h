@@ -1,0 +1,15 @@
+#ifndef EMULATOR_SRC_GRAPHICS_PRESENTATION_SYSTEM_GALLERY_PAGES_CARD_PAGE_H_
+#define EMULATOR_SRC_GRAPHICS_PRESENTATION_SYSTEM_GALLERY_PAGES_CARD_PAGE_H_
+
+#include "graphics/presentation/system/element.h"
+
+namespace Libs::Graphics::SystemUi::Gallery {
+
+/// Builds the Card page in the current frame and returns its root. It shows the card holding a
+/// heading and reading text beside the tokens of its look, then cards in a row as related groups
+/// sit side by side. It reads the current theme and fonts, so it needs an open FrameScope.
+[[nodiscard]] AnyElement BuildCardPage();
+
+} // namespace Libs::Graphics::SystemUi::Gallery
+
+#endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_SYSTEM_GALLERY_PAGES_CARD_PAGE_H_

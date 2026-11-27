@@ -138,6 +138,7 @@ public:
 	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
+	bool                   reduced_motion_enabled      = false;
 	bool                   perf_overlay_enabled        = false;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
@@ -192,6 +193,7 @@ public:
 		shader_cache_enabled        = other.shader_cache_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
+		reduced_motion_enabled      = other.reduced_motion_enabled;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;

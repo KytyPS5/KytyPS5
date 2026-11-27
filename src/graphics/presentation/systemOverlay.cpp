@@ -11,6 +11,9 @@
 #include "graphics/presentation/ddsImage.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/splashAnimation.h"
+#include "graphics/presentation/system/events.h"
+#include "graphics/presentation/system/instance.h"
+#include "graphics/presentation/system/service.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -247,6 +250,36 @@ struct TrophyNotification {
 std::mutex                     g_trophy_notification_mutex;
 std::deque<TrophyNotification> g_trophy_notifications;
 std::atomic<bool>              g_trophy_notification_active {false};
+// Whether system notices are shown as toasts, set once input starts, from --system-notices.
+std::atomic<bool> g_toasts_enabled {false};
+
+// How many images the toasts' cache holds, an icon for each toast on screen while those that just
+// left are retired. The descriptor pool is sized by the same constant, so the two can't drift.
+constexpr size_t TOAST_IMAGE_CAPACITY = 2 * SystemUi::DEFAULT_VISIBLE_TOASTS;
+
+// The configured trophy duration is in seconds and a toast's hold in milliseconds.
+constexpr float MILLISECONDS_PER_SECOND = 1000.0f;
+
+// Whether the toasts' images are held or still being retired, set by the present thread after it
+// draws the toasts, so frames go on until the renderer has destroyed the last one.
+std::atomic<bool> g_toast_images_need_frames {false};
+
+// The overlay's system UI, null until it is set up at the first frame with any splash gone. Its
+// toasts are asked whether they need frames from any thread and drawn by the present thread. Never
+// destroyed, as the present thread may still draw it while the program shuts down.
+std::atomic<SystemUi::Instance*> g_system_ui {nullptr};
+
+// Whether toasts need frames drawn. False while they are off or not yet set up, so nothing changes
+// for the overlay.
+bool ToastsNeedFrames() {
+	if (!g_toasts_enabled.load(std::memory_order_acquire)) {
+		return false;
+	}
+	SystemUi::Instance* const system_ui = g_system_ui.load(std::memory_order_acquire);
+	return system_ui != nullptr && (system_ui->Toasts().NeedsFrames() ||
+	                                g_toast_images_need_frames.load(std::memory_order_acquire));
+}
+
 std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
@@ -283,9 +316,9 @@ std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_
 	}
 }
 
-// ImGui's built-in font covers Latin only. Merge installed fonts for the selected console language.
-void AddSystemFontFallbacks(ImGuiIO& io) {
-	io.Fonts->AddFontDefault();
+// Merges installed fonts for the selected console language into the font added last, for the
+// scripts it lacks. Shared by the overlay's own font and the toasts' theme fonts.
+void MergeSystemFontFallbacks(ImGuiIO& io) {
 	const auto add = [&](std::initializer_list<const char*> paths) {
 		for (const char* path: paths) {
 			std::error_code error;
@@ -336,6 +369,12 @@ void AddSystemFontFallbacks(ImGuiIO& io) {
 		LOGF("[Trophy] no installed fallback font for %.*s\n", static_cast<int>(locale.size()),
 		     locale.data());
 	}
+}
+
+// ImGui's built-in font covers Latin only. Merge installed fonts for the selected console language.
+void AddSystemFontFallbacks(ImGuiIO& io) {
+	io.Fonts->AddFontDefault();
+	MergeSystemFontFallbacks(io);
 }
 
 void ClearInputEvents() {
@@ -656,11 +695,51 @@ void HideSplashScreen() {
 	g_splash_hidden_at.compare_exchange_strong(expected, Clock::now().time_since_epoch().count());
 }
 
+// Whether the game has presented a frame, set from the first present on.
+static std::atomic<bool> g_game_presented {false};
+
+void NoteGameFramePresented() noexcept {
+	g_game_presented.store(true, std::memory_order_release);
+}
+
+// Sets up the overlay's system UI, once, once the game has presented a frame and any splash is
+// gone, when system notices are on. Its consumers only see what is published after they
+// subscribe, so notices published while the game boots, such as for pads already plugged in, and
+// trophies unlocked before then are never shown, with a splash or without one. Its fonts and image
+// cache wait for the present thread's first toast frame, as the overlay's ImGui context may not
+// exist yet.
+static void InitializeSystemUiOnce() {
+	static std::atomic<bool> initialized {false};
+	if (initialized.load(std::memory_order_acquire) ||
+	    !g_game_presented.load(std::memory_order_acquire) ||
+	    !g_toasts_enabled.load(std::memory_order_acquire)) {
+		return;
+	}
+	// One caller wins, so it runs once without call_once, whose system_error could throw here.
+	bool expected = false;
+	if (initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+		const char* base_path = SDL_GetBasePath();
+		// Each font takes the same installed fallbacks as the overlay's own, so localized text
+		// shows. Merged into whichever context is current when the fonts load.
+		SystemUi::InstanceOptions options {
+		    .fonts  = {.assets_folder =
+		                   std::string(base_path != nullptr ? base_path : "") + "assets/",
+		               .merge_fallbacks = [] { MergeSystemFontFallbacks(ImGui::GetIO()); }},
+		    .images = {.capacity = TOAST_IMAGE_CAPACITY},
+		    .trophy = {.subtitle = PrepareTrophySubtitle(Config::GetConsoleLanguage()),
+		               .hold_ms  = static_cast<float>(Config::GetTrophyDurationSeconds()) *
+		                          MILLISECONDS_PER_SECOND}};
+		g_system_ui.store(new SystemUi::Instance(SystemUi::DEFAULT_THEME, std::move(options)),
+		                  std::memory_order_release);
+	}
+}
+
 void InitializeSystemOverlayInput(SDL_Window* window) {
 	EXIT_IF(window == nullptr);
 	const Uint32 type = SDL_RegisterEvents(1);
 	EXIT_IF(type == static_cast<Uint32>(-1));
 	g_input_window = window;
+	g_toasts_enabled.store(Config::SystemNoticesEnabled(), std::memory_order_release);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = true;
@@ -709,11 +788,19 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
+	// Asked at every vblank, so the system UI is set up on the first one after the game's first
+	// frame with no splash showing.
+	if (!splash) {
+		InitializeSystemUiOnce();
+	}
 	const auto cursor        = GetHostInputTouchPadVisualState();
+	const bool toasts        = ToastsNeedFrames();
+	// Toasts count in the revision too, so the frame after the last one leaves clears it.
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            cursor.enabled,
+	            cursor.enabled || toasts,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
+	            (splash ? 2u : 0u) + (toasts ? 4u : 0u) +
+	            static_cast<decltype(core.revision)>(cursor.revision) +
 	            PerformanceOverlayRevision()};
 }
 
@@ -847,6 +934,18 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 
 void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                           std::span<const std::byte> icon_png) {
+	// With system notices on, a trophy is one of the toasts, so it stacks with them. Its consumer
+	// subscribes once the game has shown a frame with any splash gone, so an unlock before then
+	// is dropped, as boot notices are, and never falls back to the old popup.
+	if (g_toasts_enabled.load(std::memory_order_acquire)) {
+		SystemUi::Publish(SystemUi::TrophyEvent {
+		    .name     = std::string(name),
+		    .grade    = grade,
+		    .icon_png = icon_png.empty() ? nullptr
+		                                 : std::make_shared<const std::vector<std::byte>>(
+		                                       icon_png.begin(), icon_png.end())});
+		return;
+	}
 	std::scoped_lock lock(g_trophy_notification_mutex);
 	g_trophy_notifications.push_back(
 	    {std::string(name), grade, std::vector<std::byte>(icon_png.begin(), icon_png.end())});
@@ -891,6 +990,12 @@ struct SystemOverlay::Impl {
 			for (const auto& texture: retired_trophy_images) {
 				ImGui::UnregisterUserTexture(texture.get());
 			}
+			// After the backend has shut down and before the context goes, as the images' store
+			// asks.
+			if (SystemUi::Instance* const system_ui = g_system_ui.load(std::memory_order_acquire)) {
+				system_ui->ReleaseRendering();
+			}
+			g_toast_images_need_frames.store(false, std::memory_order_release);
 			ImGui::DestroyContext(imgui_context);
 		}
 	}
@@ -918,6 +1023,36 @@ struct SystemOverlay::Impl {
 		style.ItemSpacing    = {8.0f, 8.0f};
 		hand_cursor_image    = LoadTouchCursorImage("hand.png");
 		drawing_cursor_image = LoadTouchCursorImage("drawing.png");
+	}
+
+	// Draws the toasts below `top`, at `now`, and plays the trophy sound once for any trophy that
+	// came on screen, as the old trophy toast did when it appeared. Nothing before the system UI is
+	// set up. The first frame drawn loads its fonts and image cache into the overlay's atlas, later
+	// than the context, which the splash screen may make before the toasts are turned on. The
+	// atlas grows as fonts are added, so late is safe.
+	void DrawToasts(float top, Clock::time_point now) {
+		SystemUi::Instance* const system_ui = g_system_ui.load(std::memory_order_acquire);
+		if (system_ui == nullptr) {
+			return;
+		}
+		SystemUi::ImageCache& images = system_ui->Images();
+		images.BeginFrame();
+		const auto& io = ImGui::GetIO();
+		// The cache goes with the frame, so a trophy's icon is decoded from its bytes.
+		const auto& appeared = system_ui->Toasts().Draw(
+		    {.list   = *ImGui::GetForegroundDrawList(),
+		     .area   = {.width = io.DisplaySize.x, .height = io.DisplaySize.y, .top = top},
+		     .theme  = SystemUi::DEFAULT_THEME,
+		     .fonts  = system_ui->Fonts(),
+		     .images = &images,
+		     .clock  = SystemUi::ClockContext {now},
+		     .motion = {.reduced = Config::ReducedMotionEnabled()}});
+		g_toast_images_need_frames.store(images.NeedsFrames(), std::memory_order_release);
+		if (std::any_of(appeared.begin(), appeared.end(), [](const SystemUi::ToastEntry& entry) {
+			    return entry.toast.options.sound == SystemUi::ToastSound::Unlock;
+		    })) {
+			PlayTrophySound();
+		}
 	}
 
 	void PlayTrophySound() {
@@ -1147,7 +1282,11 @@ struct SystemOverlay::Impl {
 		info.Device                       = static_cast<VkDevice>(graphics.device);
 		info.QueueFamily                  = graphics.queue_family;
 		info.Queue                        = static_cast<VkQueue>(graphics.queue);
-		info.DescriptorPoolSize           = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE;
+		// Room for the toasts' images too when they are on, as each takes a slot in the pool. Read
+		// from the setting the flag is copied from, so the pool is right whenever it is first made.
+		info.DescriptorPoolSize =
+		    IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE +
+		    (Config::SystemNoticesEnabled() ? static_cast<uint32_t>(TOAST_IMAGE_CAPACITY) : 0u);
 		info.MinImageCount                = image_count;
 		info.ImageCount                   = image_count;
 		info.UseDynamicRendering          = true;
@@ -1701,7 +1840,10 @@ struct SystemOverlay::Impl {
 		}
 	}
 
-	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {
+	// Draws the trophy toast below `min_top`, if one is showing. Returns the bottom of its card,
+	// or `min_top` when nothing is showing, so the system UI's toasts can stack below it. Its
+	// shadow reaches a little further, which the toasts' gap covers.
+	float DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {
 		std::erase_if(retired_trophy_images, [](const auto& texture) {
 			if (texture->Status != ImTextureStatus_Destroyed) {
 				return false;
@@ -1726,7 +1868,7 @@ struct SystemOverlay::Impl {
 				if (g_trophy_notifications.empty()) {
 					g_trophy_notification_active.store(!retired_trophy_images.empty(),
 					                                   std::memory_order_release);
-					return;
+					return min_top;
 				}
 				trophy_notification = std::move(g_trophy_notifications.front());
 				g_trophy_notifications.pop_front();
@@ -1829,6 +1971,7 @@ struct SystemOverlay::Impl {
 		draw->AddText(nullptr, fitted_size, {text_left, line_y + 8.0f * screen_scale},
 		              fade(176, 180, 192, 255), trophy_notification_subtitle.c_str());
 		draw->PopClipRect();
+		return bottom_right.y;
 	}
 
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
@@ -1837,7 +1980,8 @@ struct SystemOverlay::Impl {
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
+		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled() &&
+		    !ToastsNeedFrames()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1877,7 +2021,12 @@ struct SystemOverlay::Impl {
 				DrawIme(snapshot.ime, frame_extent);
 			}
 		}
-		DrawTrophyNotification(frame_extent, now, performance_bottom);
+		const float trophy_bottom = DrawTrophyNotification(frame_extent, now, performance_bottom);
+		// Before the touch cursor, so the pointer stays on top of the toasts. Below the panel and
+		// the trophy toast, which share the top right with them.
+		if (g_toasts_enabled.load(std::memory_order_acquire)) {
+			DrawToasts(std::max(performance_bottom, trophy_bottom), now);
+		}
 		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
 		ImGui::Render();
 		extent = frame_extent;

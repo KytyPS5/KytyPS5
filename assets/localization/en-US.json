@@ -1,4 +1,6 @@
 {
+  "controller.toast.connected": "Controller {player} connected",
+  "controller.toast.disconnected": "Controller {player} disconnected",
   "trophy.toast.earned": "Trophy earned!",
   "user.guest": "Guest"
 }

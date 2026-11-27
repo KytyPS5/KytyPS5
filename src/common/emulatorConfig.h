@@ -110,6 +110,11 @@ struct ConfigOptions {
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
+	// Shows system notices, such as a controller connecting, as toasts drawn by the system UI.
+	bool                   system_notices_enabled      = false;
+	// Keeps the system UI from moving, so toasts appear in place rather than sliding in and fade
+	// quickly, for players who find movement uncomfortable.
+	bool                   reduced_motion_enabled      = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 	std::string            launch_activity;
@@ -146,6 +151,9 @@ bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     HideCursorEnabled();
 bool     StretchEnabled();
+bool     SystemNoticesEnabled();
+// Whether the system UI keeps still, from --reduced-motion, so toasts appear in place.
+bool     ReducedMotionEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
 PssrUpscaler GetPssrUpscaler();

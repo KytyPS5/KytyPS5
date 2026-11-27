@@ -1910,6 +1910,18 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                
 	return set_registers_direct(buf, regs, num_regs, Pm4::IT_SET_SH_REG);
 }
 
+uint32_t KYTY_SYSV_ABI AgcCbSetShRegistersDirectGetSize(uint32_t num_regs) {
+	PRINT_NAME();
+
+	AgcTrace("\t num_regs = %" PRIu32 "\n", num_regs);
+
+	// One three-dword packet per register when no two are adjacent; adjacent registers merge
+	// into a range and take less, so this covers the writer's worst case.
+	constexpr uint32_t bytes_per_register = 3u * sizeof(uint32_t);
+	EXIT_IF(num_regs > UINT32_MAX / bytes_per_register);
+	return bytes_per_register * num_regs;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
                                                   const volatile ShaderRegister* regs,
                                                   uint32_t                       num_regs) {

@@ -159,13 +159,16 @@ SysFileTimeStruct SysFileGetLastWriteTimeUtc(const std::filesystem::path& name) 
 
 void SysFileGetLastAccessAndWriteTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& a,
                                          SysFileTimeStruct& w) {
-	sys_file_t* f = SysFileOpenR(name);
-	if (f == nullptr) {
+	// A backup-semantics handle follows symbolic links (GetFileAttributesExW would report the
+	// link itself) and can also open directories, whose timestamps the guest reads too.
+	const HANDLE handle = CreateFileW(name.c_str(), GENERIC_READ, FILE_SHARE_POSIX, nullptr,
+	                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
 		a.is_invalid = w.is_invalid = true;
 		return;
 	}
-	SysFileGetLastAccessAndWriteTimeUtc(*f, a, w);
-	SysFileClose(f);
+	a.is_invalid = w.is_invalid = (GetFileTime(handle, nullptr, &a.time, &w.time) == 0);
+	CloseHandle(handle);
 }
 
 void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a,

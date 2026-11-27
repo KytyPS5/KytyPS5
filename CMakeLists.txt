@@ -507,6 +507,19 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+# The System UI framework, everything under presentation/system but the gallery. Globbed
+# recursively so a new element folder needs no edit here, which is also why its checks belong
+# under tests and not beside the sources. Built only when something links it. Its headers include
+# ImGui but nothing from common, so only ImGui is passed on to whoever links it.
+file(GLOB_RECURSE system_ui_src CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/*.h"
+)
+list(FILTER system_ui_src EXCLUDE REGEX "/graphics/presentation/system/gallery/")
+add_library(system_ui STATIC EXCLUDE_FROM_ALL ${system_ui_src})
+target_include_directories(system_ui PRIVATE ${inc_headers})
+target_link_libraries(system_ui PUBLIC imgui PRIVATE common)
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )

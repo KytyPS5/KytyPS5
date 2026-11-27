@@ -15,6 +15,7 @@ struct GuestInstructionHostFeatures {
 	bool sse4a = false;
 	bool rdpid = false;
 	bool clwb  = false;
+	bool clzero = false;
 };
 
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures();
@@ -50,6 +51,7 @@ struct GuestInstructionPatchResult {
 	InstructionPatchCounts insertq;
 	InstructionPatchCounts rdpid;
 	InstructionPatchCounts clwb;
+	InstructionPatchCounts clzero;
 	InstructionPatchCounts rdtsc;
 };
 

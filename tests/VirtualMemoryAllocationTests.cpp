@@ -5908,19 +5908,61 @@ void TestCpuExtensionPatches() {
 	      "CLWB direct fallback changed memory or used an unexpected trap path");
 
 	code.reset();
+	Xbyak::Label zero_address;
+	code.test(code.rdi, code.rdi);
+	code.jnz(zero_address);
+	// This address is the CLZERO replacement's saved RAX slot.
+	code.lea(code.rdi, code.ptr[code.rsp - 144]);
+	code.mov(code.qword[code.rdi], 1);
+	code.L(zero_address);
 	code.mov(code.rax, code.rdi);
 	code.stc();
 	code.clzero();
 	code.sfence();
 	code.cmovnc(code.rax, code.rsi);
+	code.cmp(code.rdx, code.rcx);
+	code.cmovne(code.rax, code.rsi);
+	code.cmp(code.qword[code.rdi], 0);
+	code.cmovne(code.rax, code.rsi);
 	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate CLZERO fixture");
+	const std::vector<uint8_t> zero_original(code.getCode(), code.getCurr());
 	alignas(64) std::array<uint64_t, 24> lines;
-	lines.fill(~uint64_t {0});
-	auto expected = lines;
-	std::fill_n(expected.begin() + 8, 8, 0);
-	const auto zero = reinterpret_cast<void*(KYTY_SYSV_ABI*)(void*, void*)>(mapping);
-	Check(test, zero(&lines[15], nullptr) == &lines[15] && lines == expected,
-	      "CLZERO failed to preserve RAX, carry or adjacent cache lines");
+	const auto zero = reinterpret_cast<void*(KYTY_SYSV_ABI*)(void*, void*, uint64_t, uint64_t)>(mapping);
+	constexpr uint64_t scratch = 0x123456789abcdef0ull;
+	const auto check_zero = [&] {
+		lines.fill(~uint64_t {0});
+		auto expected = lines;
+		std::fill_n(expected.begin() + 8, 8, 0);
+		Check(test, zero(&lines[15], nullptr, scratch, scratch) == &lines[15] && lines == expected,
+		      "CLZERO failed to preserve RAX, RDX, carry or adjacent cache lines");
+	};
+	register_module(code_size);
+	const auto supported_zero =
+	    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true,
+	                                   {.clzero = true}).clzero;
+	Check(test, supported_zero.found == 0 && std::equal(zero_original.begin(), zero_original.end(),
+	                                                   code.getCode()),
+	      "available host CLZERO was unnecessarily patched");
+	register_module(1);
+	const auto exhausted_zero =
+	    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true, {}).clzero;
+	const auto zero_traps = g_instruction_traps;
+	check_zero();
+	Check(test, exhausted_zero.found == 1 && exhausted_zero.trapped == 1 &&
+	                g_instruction_traps == zero_traps + !host.clzero,
+	      "exhausted CLZERO replacement did not retain its natural trap fallback");
+	register_module(code_size);
+	const auto native_zero =
+	    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true, {}).clzero;
+	const auto native_zero_traps = g_instruction_traps;
+	check_zero();
+	Check(test, native_zero.found == 1 && native_zero.native == 1 &&
+	                g_instruction_traps == native_zero_traps,
+	      "native CLZERO did not eliminate the trap");
+	Check(test, zero(nullptr, nullptr, scratch, scratch) != nullptr &&
+	                g_instruction_traps == native_zero_traps + !host.clzero,
+	      "CLZERO failed to fall back when the cleared line overlaps the spills");
 	std::printf("[host]    %-48s ok\n", test);
 }
 

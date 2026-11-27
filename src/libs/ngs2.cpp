@@ -1847,17 +1847,19 @@ static void Ngs2InitModules(Ngs2RackInternal& rack) {
 	}
 	const auto& custom = rack.option.custom_sampler.custom_rack_option;
 	EXIT_NOT_IMPLEMENTED(custom.num_buffers == 0 || custom.num_buffers > 4 ||
-	                     rack.option.common.max_ports > 16);
+	                     custom.num_modules > std::size(custom.module) ||
+	                     rack.option.common.max_ports > std::size(custom.port));
 	for (uint32_t p = 0; p < rack.option.common.max_ports; ++p) {
 		EXIT_NOT_IMPLEMENTED(custom.port[p].source_buffer_id >= custom.num_buffers);
 	}
 	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(&rack + 1);
 	for (uint32_t m = 0; m < custom.num_modules; ++m) {
-		const auto& info = custom.module[m];
-		// Modules process their source buffer in place, so skipped modules pass audio through.
-		EXIT_NOT_IMPLEMENTED(info.source_buffer_id != info.dest_buffer_id ||
-		                     std::max(info.source_buffer_id, info.extra_buffer_id) >=
-		                         custom.num_buffers);
+		const auto& info    = custom.module[m];
+		const bool  output  = info.module_id == 0x1a && rack.type == Ngs2RackType::CustomMastering;
+		const bool  user_fx = info.module_id == 0x19 || info.module_id == 0x1f;
+		EXIT_NOT_IMPLEMENTED(info.source_buffer_id >= custom.num_buffers ||
+		                     (!output && info.dest_buffer_id >= custom.num_buffers) ||
+		                     (user_fx && info.extra_buffer_id >= custom.num_buffers));
 		if (info.module_id != 0x1f) {
 			continue;
 		}
@@ -2903,36 +2905,54 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 			voice.has_samples = voice.reverb.Process(voice.samples, grain, voice.has_samples);
 		}
 		if (voice.has_samples) {
-			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
-			const auto  rate   = voice.rack->ngs->option.sample_rate;
+			const auto& custom         = voice.rack->option.custom_sampler.custom_rack_option;
+			const auto  rate           = voice.rack->ngs->option.sample_rate;
+			const auto  buffer_samples = size_t(voice.channels) * grain;
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
 				const auto& info   = custom.module[m];
 				auto&       module = voice.modules[m];
-				if (info.module_id == 0x17) {
-					voice.MixChannels(module.channel_matrix, info.source_buffer_id, grain);
+				// A custom mastering voice's Output module reads its buffer after the chain.
+				if (info.module_id == 0x1a && voice.rack->type == Ngs2RackType::CustomMastering) {
 					continue;
 				}
-				if (info.module_id != 0x19 && info.module_id != 0x1f) {
-					// A custom mastering voice's Output module is written after its chain.
-					const bool output = info.module_id == 0x1a &&
-					                    voice.rack->type == Ngs2RackType::CustomMastering;
-					if (!output && !module.render_warned) {
-						Log::WriteToConsoleAndLog(fmt::sprintf(
-						    "warning: NGS2 custom module 0x%02x at index %zu is ignored during render\n",
-						    info.module_id, m));
+				const bool user_fx = info.module_id == 0x19 || info.module_id == 0x1f;
+				const bool run_fx =
+				    user_fx && (info.module_id == 0x1f || module.handler != nullptr);
+				auto* samples = voice.Buffer(info.source_buffer_id, grain);
+				auto* dest    = voice.Buffer(info.dest_buffer_id, grain);
+				if (samples != dest) {
+					// Effects process the main channels in place. Keep the side chain intact
+					// until the callback returns when it shares the destination buffer.
+					if (run_fx && info.extra_buffer_id == info.dest_buffer_id) {
+						voice.mix_samples.assign(samples, samples + buffer_samples);
+						samples = voice.mix_samples.data();
+					} else {
+						std::copy_n(samples, buffer_samples, dest);
+						samples = dest;
+					}
+				}
+				if (info.module_id == 0x17) {
+					voice.MixChannels(module.channel_matrix, info.dest_buffer_id, grain);
+					continue;
+				}
+				if (!user_fx) {
+					if (!module.render_warned) {
+						Log::WriteToConsoleAndLog(
+						    fmt::sprintf("warning: NGS2 custom module 0x%02x at index %zu is "
+						                 "bypassed during render\n",
+						                 info.module_id, m));
 						module.render_warned = true;
 					}
 					continue;
 				}
-				if (info.module_id == 0x19 && module.handler == nullptr) {
+				if (!run_fx) {
 					continue;
 				}
-				// Handlers receive the source channels followed by the extra buffer's channels.
+				// Handlers receive the main channels followed by the side-chain channels.
 				std::vector<float*> channels(2 * size_t(voice.channels));
-				auto*               source = voice.Buffer(info.source_buffer_id, grain);
-				auto*               extra  = voice.Buffer(info.extra_buffer_id, grain);
+				auto*               extra = voice.Buffer(info.extra_buffer_id, grain);
 				for (uint32_t c = 0; c < voice.channels; ++c) {
-					channels[c]                  = source + c * grain;
+					channels[c]                  = samples + c * grain;
 					channels[voice.channels + c] = extra + c * grain;
 				}
 				if (info.module_id == 0x19) {
@@ -2954,6 +2974,9 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					                                   grain,
 					                                   rate};
 					EXIT_NOT_IMPLEMENTED(fx.process(&context) != OK);
+				}
+				if (samples != dest) {
+					std::copy_n(samples, buffer_samples, dest);
 				}
 				module.flags = 0;
 			}

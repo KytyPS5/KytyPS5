@@ -888,6 +888,43 @@ struct RenderRack {
 	}
 };
 
+void TestCustomModuleBufferRouting() {
+	constexpr uint32_t grain = 4;
+	RenderSystem       render(grain);
+	Ngs2CustomSubmixerRackOption option {};
+	auto&                      custom = option.custom_rack_option;
+	custom.rack_option.size            = sizeof(option);
+	custom.rack_option.max_voices      = 1;
+	custom.num_buffers                 = 4;
+	custom.num_modules                 = 3;
+	custom.module[0]                   = {nullptr, 0x15, 0, 0, 2}; // Bypassed gain.
+	custom.module[1]                   = {nullptr, 0x17, 2, 0, 3}; // Channel mixer.
+	custom.module[2]                   = {nullptr, 0x19, 3, 1, 1}; // FX replaces its side chain.
+	RenderRack rack(render.Internal(), 0x4002, custom.rack_option);
+	auto&      voice = rack.Voice();
+	voice.channels   = 1;
+	voice.state      = Ngs2VoicePlayState::Playing;
+	voice.modules[1].channel_matrix.resize(37 * 37);
+	voice.modules[1].channel_matrix[0] = 2.0f;
+	voice.modules[2].handler           = MultiplyBySideChain;
+	voice.modules[2].user_data[0]      = 7;
+	voice.modules[2].flags             = 1;
+
+	Fixture main(48000), side(48000);
+	main.voice.ports.push_back({&voice, 0, 1.0f, -1});
+	side.voice.ports.push_back({&voice, 1, 1.0f, -1});
+	const int16_t main_pcm = 8192, side_pcm = 24576;
+	main.Queue(&main_pcm, 1, 0);
+	side.Queue(&side_pcm, 1, 0);
+	Ngs2RenderVoice(voice, {&main.voice, &side.voice, &voice}, grain);
+	Check(voice.has_samples && voice.Buffer(0, grain)[3] == 0.25f &&
+	          voice.Buffer(2, grain)[3] == 0.25f && voice.Buffer(3, grain)[3] == 0.5f,
+	      "out-of-place modules did not route their results or overwrote a source buffer");
+	Check(voice.Buffer(1, grain)[3] == 0.375f && g_side_chain_flags == 1 &&
+	          voice.modules[2].flags == 0,
+	      "out-of-place user FX overwrote the side-chain input before processing");
+}
+
 void TestPcm16RenderOutput() {
 	RenderSystem render(4);
 	auto&        system = render.Internal();
@@ -4321,6 +4358,7 @@ int main() {
 	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();
 	TestCustomSideChainUserFx();
+	TestCustomModuleBufferRouting();
 	TestWaveformBlockGeometry();
 	TestResamplerStarvation();
 	TestSamplerReuseResetsRouting();

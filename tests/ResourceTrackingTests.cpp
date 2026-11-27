@@ -8241,7 +8241,8 @@ void TestQueryOnlyImageWaterfall() {
                     ? table->table_maximum == 0x3fffu && table->table_scalar && table->key_count.IsEmpty()
                     : table->key_count == Value(0x4000u));
       }) && std::ranges::count_if(plan.info.images, [](const auto &image) { return image.sample_access_only; }) ==
-                (variant == Variant::QueryThenSample ? 1 : 0),
+                (variant == Variant::QueryThenSample ? 1 : 0) &&
+                std::ranges::count_if(plan.info.images, [](const auto &image) { return !image.sample_access_only; }) == 1,
             "query-only waterfall lost the clamped address-table bound of its EXEC predicate");
     }
     CheckFatal([&] { make(Variant::WiderExec, loop)->PlanAndTrack(); }, "not a valid runtime value",

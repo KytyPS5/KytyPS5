@@ -126,6 +126,7 @@ enum class InstructionReplacement {
 	InsertQ,
 	ReadProcessorId,
 	CacheLineWriteBack,
+	ZeroCacheLine,
 	ReadTimeStampCounter
 };
 
@@ -143,6 +144,7 @@ InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
 		case InstructionReplacement::ExtractQ: return result.extrq;
 		case InstructionReplacement::InsertQ: return result.insertq;
 		case InstructionReplacement::ReadProcessorId: return result.rdpid;
+		case InstructionReplacement::ZeroCacheLine: return result.clzero;
 		case InstructionReplacement::ReadTimeStampCounter: return result.rdtsc;
 		default: return result.clwb;
 	}
@@ -919,6 +921,45 @@ void GenerateExtractQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerato
 	generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
 }
 
+void GenerateZeroCacheLine(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerator& generator) {
+	constexpr int CacheLineSize = 64;
+	constexpr int SpillSize     = 3 * sizeof(uint64_t);
+	Xbyak::Label  store;
+	Xbyak::Label  done;
+	const auto    restore = [&] {
+		generator.pop(rdx);
+		generator.pop(rax);
+		generator.popfq();
+		generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+	};
+	generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+	generator.pushfq();
+	generator.push(rax);
+	generator.push(rdx);
+	if (decoded.instruction.address_width == 32) {
+		generator.and_(eax, -CacheLineSize);
+	} else {
+		generator.and_(rax, -CacheLineSize);
+	}
+	// If the cache line intersects the spills, restore them before taking the original trap.
+	generator.lea(rdx, ptr[rsp + SpillSize - 1]);
+	generator.sub(rdx, rax);
+	generator.cmp(rdx, CacheLineSize + SpillSize - 2);
+	generator.ja(store);
+	restore();
+	generator.db(reinterpret_cast<const uint8_t*>(decoded.address), decoded.instruction.length);
+	generator.jmp(done);
+	if (Xbyak::GetError() != 0) return;
+	generator.L(store);
+	// CLZERO uses weakly ordered streaming stores. Leave fencing to guest code.
+	generator.xor_(edx, edx);
+	for (int offset = 0; offset < CacheLineSize; offset += sizeof(uint64_t)) {
+		generator.movnti(ptr[rax + offset], rdx);
+	}
+	restore();
+	if (Xbyak::GetError() == 0) generator.L(done);
+}
+
 void CollectAmdInstructions(const DecodedFunction&                   function,
                             std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                             GuestInstructionPatchResult&             result,
@@ -939,6 +980,15 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 			replacement = InstructionReplacement::ReadProcessorId;
 		} else if (!host_features.clwb && instruction.mnemonic == ZYDIS_MNEMONIC_CLWB) {
 			replacement = InstructionReplacement::CacheLineWriteBack;
+		} else if (!host_features.clzero && instruction.mnemonic == ZYDIS_MNEMONIC_CLZERO) {
+			// Zydis does not expose CLZERO's segment overrides through instruction attributes.
+			const auto prefixes = std::span {instruction.raw.prefixes, instruction.raw.prefix_count};
+			if (std::ranges::any_of(prefixes, [](const auto& prefix) {
+				    return prefix.value == 0x64 || prefix.value == 0x65;
+			    })) {
+				continue;
+			}
+			replacement = InstructionReplacement::ZeroCacheLine;
 		} else {
 			continue;
 		}
@@ -1028,6 +1078,10 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 		}
 		const auto& decoded = function.instructions.at(address);
 		if (NeedsTrapRedZoneProtection(decoded)) {
+			if (rewrite.replacement == InstructionReplacement::ZeroCacheLine) {
+				// Keep the original instruction when no safe relocation span is available.
+				continue;
+			}
 			if (rewrite.replacement != InstructionReplacement::ReciprocalSquareRoot) {
 				// Leaving an unsupported instruction unchanged still traps with a live red zone.
 				EXIT("AMD CPU compatibility: cannot safely trap %s at %p (guest red zone is "
@@ -1091,6 +1145,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 						GenerateReciprocalSquareRoot(*decoded, generator);
 					} else if (replacement == InstructionReplacement::ExtractQ) {
 						GenerateExtractQ(*decoded, generator);
+					} else if (replacement == InstructionReplacement::ZeroCacheLine) {
+						GenerateZeroCacheLine(*decoded, generator);
 					} else if (replacement == InstructionReplacement::ReadTimeStampCounter) {
 						GenerateReadTimeStampCounter(*decoded, tsc_multiplier, generator);
 					} else {
@@ -1527,8 +1583,14 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 			Xbyak::util::Cpu::getCpuidEx(7, 0, leaf);
 			rdpid = (leaf[2] & (1u << 22)) != 0;
 		}
+		bool clzero = false;
+		Xbyak::util::Cpu::getCpuid(0x80000000u, leaf);
+		if (leaf[0] >= 0x80000008u) {
+			Xbyak::util::Cpu::getCpuid(0x80000008u, leaf);
+			clzero = (leaf[1] & 1u) != 0;
+		}
 		return GuestInstructionHostFeatures {cpu.has(Xbyak::util::Cpu::tSSE4a), rdpid,
-		                                     cpu.has(Xbyak::util::Cpu::tCLWB)};
+		                                     cpu.has(Xbyak::util::Cpu::tCLWB), clzero};
 	}();
 	return features;
 }

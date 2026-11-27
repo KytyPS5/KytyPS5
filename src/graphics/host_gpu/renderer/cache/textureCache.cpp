@@ -785,6 +785,21 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (!cached.registered) {
 		return {merged_id};
 	}
+
+	// Each writable block view binds one mip. The final compressed mips can occupy distinct
+	// 1x1 blocks even after an uncompressed image of the block dimensions runs out of levels.
+	if (binding == BindingType::Storage && !requested.IsBlock() && cached.info.IsBlock() &&
+	    requested.type == Prospero::ImageType::kColor2D && requested.type == cached.info.type &&
+	    requested.resources.layers == 1 && requested.resources == cached.info.resources &&
+	    requested.resources.levels > std::bit_width(std::max(requested.extent.width,
+	                                                        requested.extent.height)) &&
+	    requested.samples == cached.info.samples && requested.tile_mode == cached.info.tile_mode &&
+	    requested.data == cached.info.data && requested.BlockExtent() == cached.info.BlockExtent() &&
+	    requested.mip_layout == cached.info.mip_layout &&
+	    ImageViewOps::FormatsCompatible(cached.backing.format, requested.pixel_format) &&
+	    (cached.backing.usage & vk::ImageUsageFlagBits::eStorage)) {
+		return {cached_id};
+	}
 	// PS5: image heaps keep BC images and raw block views of their layers resident together, so a
 	// raw read of a layer subset with the same levels views the BC image instead of evicting it.
 	const bool raw_view = binding == BindingType::Texture && !requested.IsBlock() &&

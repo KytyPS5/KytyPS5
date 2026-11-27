@@ -210,6 +210,23 @@ void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 	}
 }
 
+void File::ReadEx(void* data, uint32_t size, uint32_t* bytes_read, int* err) {
+	EXIT_IF(IsInvalid());
+
+	if (err != nullptr) {
+		*err = 0;
+	}
+
+	if (m_p->archive != nullptr) {
+		m_p->archive->Read(data, size, bytes_read);
+		return;
+	}
+
+	if (m_p->f != nullptr) {
+		SysFileReadEx(data, size, *m_p->f, bytes_read, err);
+	}
+}
+
 void File::Write(const void* data, uint32_t size, uint32_t* bytes_written) {
 	EXIT_IF(IsInvalid());
 

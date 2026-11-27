@@ -10,6 +10,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/descriptors.h"
+#include "kernel/guestFileRead.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -178,6 +180,24 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 		*last_reclen += static_cast<uint16_t>(dirents.size() - offset);
 	}
 	return dirents;
+}
+
+static bool IsKnownUnwritable(const void* dst, uint64_t size) {
+	return Memory::IsKnownUnwritable(reinterpret_cast<uint64_t>(dst), size);
+}
+
+static bool IsGuestWritable(const void* dst, uint64_t size) {
+	return Memory::IsGuestWritable(reinterpret_cast<uint64_t>(dst), size);
+}
+
+// See ReadIntoGuest: 0, or the kernel error for its EFAULT / EIO.
+static int ReadFileIntoGuest(File* file, void* buf, uint32_t want, uint64_t pos, uint32_t* got) {
+	const int err =
+	    ReadIntoGuest(file->f, buf, want, pos, got, IsKnownUnwritable, IsGuestWritable);
+	if (err == 0) {
+		return OK;
+	}
+	return err == EFAULT ? KERNEL_ERROR_EFAULT : KERNEL_ERROR_EIO;
 }
 
 static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
@@ -712,11 +732,18 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	// The read cannot deliver more than is left in the file, so only that part of the buffer
+	// has to be writable.
+	const int read_error = ReadFileIntoGuest(
+	    file, buf, static_cast<uint32_t>(std::min<uint64_t>(nbytes, remaining)), pos, &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
 	file->mutex.Unlock();
 
+	if (read_error != OK) {
+		LOGF("\tread failed after %u bytes\n", bytes_read);
+		return read_error;
+	}
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");
 		return KERNEL_ERROR_EIO;
@@ -840,12 +867,18 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const int read_error = ReadFileIntoGuest(
+	    file, buf, static_cast<uint32_t>(std::min<uint64_t>(nbytes, remaining)),
+	    static_cast<uint64_t>(offset), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
 
+	if (read_error != OK) {
+		LOGF("\tpread failed after %u bytes\n", bytes_read);
+		return read_error;
+	}
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");
 		return KERNEL_ERROR_EIO;
@@ -942,8 +975,14 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
+		const int read_error = ReadFileIntoGuest(
+		    file, buffer.iov_base, count,
+		    static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes_read), &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
+		if (read_error != OK) {
+			file->f.Seek(position);
+			return read_error;
+		}
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {

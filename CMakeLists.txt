@@ -527,6 +527,14 @@ add_executable(system_ui_animation_tests EXCLUDE_FROM_ALL
 target_include_directories(system_ui_animation_tests PRIVATE ${inc_headers})
 target_link_libraries(system_ui_animation_tests PRIVATE system_ui)
 
+# Scrolling in the system UI, from the pointer each frame is given to the boxes that scroll. It
+# links system_ui for the frame and its boxes.
+add_executable(system_ui_scroll_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiScrollTests.cpp"
+)
+target_include_directories(system_ui_scroll_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_scroll_tests PRIVATE system_ui)
+
 # The System UI framework, everything under presentation/system but the gallery. Globbed
 # recursively so a new element folder needs no edit here, which is also why its checks belong
 # under tests and not beside the sources. Built only when something links it. Its headers include
@@ -849,6 +857,7 @@ if(BUILD_TESTING)
 	add_test(NAME system_ui_event_channel COMMAND $<TARGET_FILE:system_ui_event_channel_tests>)
 	add_test(NAME system_ui_gradient COMMAND $<TARGET_FILE:system_ui_gradient_tests>)
 	add_test(NAME system_ui_animation COMMAND $<TARGET_FILE:system_ui_animation_tests>)
+	add_test(NAME system_ui_scroll COMMAND $<TARGET_FILE:system_ui_scroll_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -974,6 +983,7 @@ if(BUILD_TESTING)
 		system_ui_event_channel_tests
 		system_ui_gradient_tests
 		system_ui_animation_tests
+		system_ui_scroll_tests
 		common_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests

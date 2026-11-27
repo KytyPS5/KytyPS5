@@ -517,7 +517,7 @@ target_include_directories(system_ui_event_channel_tests PRIVATE ${inc_headers})
 add_executable(system_ui_toasts_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiToastsTests.cpp"
 	# stb_image's implementation, which the image cache a trophy toast decodes through needs from
-	# whoever links it.
+	# whoever links it, compiled once as for the gallery.
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/stbImage.cpp"
 )
 target_include_directories(system_ui_toasts_tests PRIVATE ${inc_headers})
@@ -557,6 +557,16 @@ add_executable(system_ui_scroll_tests EXCLUDE_FROM_ALL
 target_include_directories(system_ui_scroll_tests PRIVATE ${inc_headers})
 target_link_libraries(system_ui_scroll_tests PRIVATE system_ui)
 
+# The gallery's token formatting and contrast maths, which its Colours page shows. They are gallery
+# code, so their sources are compiled in here, and system_ui is linked for the theme they read.
+add_executable(system_ui_gallery_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiGalleryTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/parts/contrast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/parts/format.cpp"
+)
+target_include_directories(system_ui_gallery_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_gallery_tests PRIVATE system_ui)
+
 # The System UI framework, everything under presentation/system but the gallery. Globbed
 # recursively so a new element folder needs no edit here, which is also why its checks belong
 # under tests and not beside the sources. Built only when something links it. Its headers include
@@ -569,6 +579,37 @@ list(FILTER system_ui_src EXCLUDE REGEX "/graphics/presentation/system/gallery/"
 add_library(system_ui STATIC EXCLUDE_FROM_ALL ${system_ui_src})
 target_include_directories(system_ui PRIVATE ${inc_headers})
 target_link_libraries(system_ui PUBLIC imgui PRIVATE common)
+
+# The System UI gallery, a window of its own for reviewing the design system without a game.
+add_executable(system_ui_gallery EXCLUDE_FROM_ALL
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/main.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/components/nav.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/components/page.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/components/toggle.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/animationsPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/boxPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/cardPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/colourPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/elevationsPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/glyphPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/imagePage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/spacingPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/speedPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/themePage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/timingPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/toastPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/typographyPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/parts/contrast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/parts/format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/parts/motionTrack.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pages/parts/swatch.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pointer.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/stbImage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/vulkanHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/imgui/backends/imgui_impl_sdl3.cpp"
+)
+target_include_directories(system_ui_gallery PRIVATE ${inc_headers})
+target_link_libraries(system_ui_gallery system_ui imgui SDL3::SDL3-static Vulkan::Headers)
 
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
@@ -882,6 +923,7 @@ if(BUILD_TESTING)
 	add_test(NAME system_ui_gradient COMMAND $<TARGET_FILE:system_ui_gradient_tests>)
 	add_test(NAME system_ui_animation COMMAND $<TARGET_FILE:system_ui_animation_tests>)
 	add_test(NAME system_ui_scroll COMMAND $<TARGET_FILE:system_ui_scroll_tests>)
+	add_test(NAME system_ui_gallery COMMAND $<TARGET_FILE:system_ui_gallery_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -1010,6 +1052,7 @@ if(BUILD_TESTING)
 		system_ui_gradient_tests
 		system_ui_animation_tests
 		system_ui_scroll_tests
+		system_ui_gallery_tests
 		common_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
@@ -1089,6 +1132,16 @@ add_custom_target(kyty_noto_sans_fonts
 		"$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_noto_sans_fonts)
+# The gallery is built next to the emulator, so it finds the same fonts.
+add_dependencies(system_ui_gallery kyty_noto_sans_fonts)
+# The images the system UI shows, copied beside the gallery so its image page finds them. The
+# emulator doesn't draw them yet, so only the gallery depends on the copy.
+add_custom_target(kyty_overlay_images
+	COMMAND ${CMAKE_COMMAND} -E copy_directory
+		"${CMAKE_CURRENT_SOURCE_DIR}/assets/images"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/images"
+	VERBATIM)
+add_dependencies(system_ui_gallery kyty_overlay_images)
 install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION assets/fonts)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})

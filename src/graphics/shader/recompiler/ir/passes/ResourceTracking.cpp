@@ -1150,6 +1150,16 @@ private:
 		return true;
 	}
 
+	static bool ImmediateIs(Value value, uint32_t expected) {
+		uint32_t actual = 0;
+		return ImmediateU32(value, actual) && actual == expected;
+	}
+
+	static const Inst* InstOf(Value value, ValueOpcode opcode) {
+		const auto* inst = value.Resolve().TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == opcode ? inst : nullptr;
+	}
+
 	static bool UsesOnlyImageDescriptors(const Inst& value) {
 		if (value.Uses().empty()) return false;
 		std::vector<const Inst*> values {&value};
@@ -1240,6 +1250,70 @@ private:
 			}
 		}
 		return {};
+	}
+
+	bool LiveLaneWord(Value word, uint32_t index) const {
+		if (const auto* both = InstOf(word, ValueOpcode::BitwiseAnd32))
+			return LiveLaneWord(both->Arg(0), index) || LiveLaneWord(both->Arg(1), index);
+		const auto* extract = InstOf(word, ValueOpcode::CompositeExtractU32x4);
+		if (extract == nullptr || !ImmediateIs(extract->Arg(1), index)) return false;
+		return InstOf(extract->Arg(0), ValueOpcode::LiveMask) != nullptr ||
+		       (m_program.stage != ShaderType::Pixel &&
+		        InstOf(extract->Arg(0), ValueOpcode::Ballot) != nullptr);
+	}
+
+	Value MaskWord(Value word, uint32_t index) const {
+		const auto* extract = InstOf(word, ValueOpcode::CompositeExtractU64);
+		if (extract == nullptr || !ImmediateIs(extract->Arg(1), index)) return word;
+		const auto* quad = InstOf(extract->Arg(0), ValueOpcode::WqmU64);
+		const auto* pair = InstOf(quad != nullptr ? quad->Arg(0) : extract->Arg(0),
+		                          ValueOpcode::CompositeConstructU64);
+		return pair != nullptr ? pair->Arg(index) : word;
+	}
+
+	bool ThreadBitOfLiveMask(Value predicate) const {
+		if (const auto* either = InstOf(predicate, ValueOpcode::LogicalOr))
+			return ThreadBitOfLiveMask(either->Arg(0)) || ThreadBitOfLiveMask(either->Arg(1));
+		const auto* test = InstOf(predicate, ValueOpcode::INotEqual32);
+		if (test == nullptr || !ImmediateIs(test->Arg(1), 0u)) return false;
+		const auto* bit = InstOf(test->Arg(0), ValueOpcode::BitwiseAnd32);
+		if (bit == nullptr || !ImmediateIs(bit->Arg(1), 1u)) return false;
+		const auto* shift = InstOf(bit->Arg(0), ValueOpcode::ShiftRightLogical32);
+		if (shift == nullptr) return false;
+		const auto* position = InstOf(shift->Arg(1), ValueOpcode::BitwiseAnd32);
+		if (position == nullptr || !ImmediateIs(position->Arg(1), 31u) ||
+		    InstOf(position->Arg(0), ValueOpcode::LaneId) == nullptr)
+			return false;
+		std::array<Value, 2> words {MaskWord(shift->Arg(0), 0u), {}};
+		if (const auto* half = InstOf(shift->Arg(0), ValueOpcode::SelectU32)) {
+			const auto* low = InstOf(half->Arg(0), ValueOpcode::ULessThan32);
+			if (low == nullptr || InstOf(low->Arg(0), ValueOpcode::LaneId) == nullptr ||
+			    !ImmediateIs(low->Arg(1), 32u))
+				return false;
+			words = {MaskWord(half->Arg(1), 0u), MaskWord(half->Arg(2), 1u)};
+		}
+		if (!LiveLaneWord(words[0], 0u) || (!words[1].IsEmpty() && !LiveLaneWord(words[1], 1u)))
+			return false;
+		const auto tests_words = [&](Value tested) {
+			if (words[1].IsEmpty()) return EquivalentValue(m_program, tested, words[0]);
+			const auto* either = InstOf(tested, ValueOpcode::BitwiseOr32);
+			if (either == nullptr) return false;
+			return std::ranges::any_of(std::array {0u, 1u}, [&](uint32_t first) {
+				return EquivalentValue(m_program, either->Arg(first), words[0]) &&
+				       EquivalentValue(m_program, either->Arg(first ^ 1u), words[1]);
+			});
+		};
+		return GuardedOnEntry(
+		    test->Parent(),
+		    [](const Block* current) { return current->ImmPredecessors().size() != 1u; },
+		    [&](const EdgePredicate& edge) {
+			    const auto* tested = edge.condition.TryInstruction();
+			    if (tested == nullptr || tested->NumArgs() != 2u) return false;
+			    return std::ranges::any_of(std::array {0u, 1u}, [&](uint32_t arg) {
+				    return tests_words(tested->Arg(arg)) &&
+				           ExcludedBy(edge, tested->Arg(arg)) == 0u;
+			    });
+		    });
 	}
 
 	bool NonzeroOnEntry(Value value, const Block* block) const {
@@ -1382,11 +1456,16 @@ private:
 		return edge && edge->positive ? edge->condition : Value {};
 	}
 
-	bool GuardedOnEntry(const Block* block, const auto& stops, const auto& accepts) const {
+	bool GuardedOnEntry(const Block* block, const auto& stops, const auto& accepts,
+	                    bool entry_accepts = false) const {
 		std::vector<const Block*> pending {block};
 		for (size_t i = 0; i < pending.size(); ++i) {
 			const auto* current = pending[i];
-			if (stops(current) || current->ImmPredecessors().empty()) return false;
+			if (stops(current)) return false;
+			if (current->ImmPredecessors().empty()) {
+				if (entry_accepts) continue;
+				return false;
+			}
 			for (const auto* previous: current->ImmPredecessors()) {
 				const auto edge = ConditionalEdge(previous, current);
 				if (edge && accepts(*edge)) continue;
@@ -1397,13 +1476,17 @@ private:
 		return true;
 	}
 
-	bool HasActiveLane(Value mask, const Block* use) const {
+	bool HasActiveLane(Value mask, const Block* use, bool launch_lanes_suffice = false) const {
 		mask = SimplifyGuard(mask);
 		if (mask.IsImmediate()) return mask.GetType() == Type::U1 && mask.U1();
-		const auto incoming_is_nonempty = [&](const Block* from, const Block* to,
-		                                     Value incoming, const Block* header) {
+		const auto incoming_is_nonempty = [&](const Block* from, const Block* to, Value incoming,
+		                                      const Block* header) {
+			if (ThreadBitOfLiveMask(incoming)) return true;
 			const auto accepts = [&](const EdgePredicate& edge) {
-				return edge.positive && Implies(edge.condition, incoming);
+				if (edge.positive) return Implies(edge.condition, incoming);
+				const auto* negated = SimplifyGuard(incoming).TryInstruction();
+				return negated != nullptr && negated->GetOpcode() == ValueOpcode::LogicalNot &&
+				       Implies(negated->Arg(0), edge.condition);
 			};
 			const auto edge = ConditionalEdge(from, to);
 			if (edge && accepts(*edge)) return true;
@@ -1411,7 +1494,7 @@ private:
 			return GuardedOnEntry(from, [&](const Block* block) {
 				// A witness before this definition may belong to an earlier loop iteration.
 				return block == header || (definition != nullptr && block == definition->Parent());
-			}, accepts);
+			}, accepts, launch_lanes_suffice && incoming.Resolve() == Value(true));
 		};
 		const auto* phi = mask.TryInstruction();
 		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
@@ -1447,13 +1530,15 @@ private:
 			return Implies(inst->Arg(0), required, allow_phi) || Implies(inst->Arg(1), required, allow_phi);
 		if (inst->GetOpcode() == ValueOpcode::LogicalOr)
 			return Implies(inst->Arg(0), required, allow_phi) && Implies(inst->Arg(1), required, allow_phi);
-		if (!allow_phi || inst->GetOpcode() != ValueOpcode::Phi || inst->GetType() != Type::U1 ||
-		    test == nullptr || test->Parent() == inst->Parent() || !AvailableBefore(*test, *inst)) return false;
+		if (inst->GetOpcode() != ValueOpcode::Phi || inst->GetType() != Type::U1 ||
+		    test == nullptr || test->Parent() == inst->Parent() || !AvailableBefore(*test, *inst))
+			return false;
 		// The required predicate must be invariant across this loop. Every entry
 		// establishes it; carried masks may only remove lanes from this same Phi.
 		bool entry = false;
 		for (size_t arm = 0; arm < inst->NumArgs(); ++arm) {
 			const bool carried = Dominates(inst->Parent(), inst->PhiBlock(arm));
+			if (carried && !allow_phi) return false;
 			if (!Implies(inst->Arg(arm), carried ? guard : required, false)) return false;
 			entry |= !carried;
 		}
@@ -1484,8 +1569,8 @@ private:
 		uint64_t offset = 0;
 	};
 
-	bool MatchAffineOffset(Value value, Value guard, AffineOffset& out,
-	                       uint32_t depth = 0) const {
+	bool MatchAffineOffset(Value value, Value guard, AffineOffset& out, uint32_t depth = 0,
+	                       bool scaled_index = false) const {
 		if (depth > 16u) return false;
 		value = ActiveValue(value, guard);
 		uint32_t immediate = 0;
@@ -1497,10 +1582,11 @@ private:
 		if (inst == nullptr) return false;
 		if (inst->GetOpcode() == ValueOpcode::IAdd32 && inst->NumArgs() == 2u) {
 			AffineOffset left, right;
-			if (!MatchAffineOffset(inst->Arg(0), guard, left, depth + 1u) ||
-			    !MatchAffineOffset(inst->Arg(1), guard, right, depth + 1u) ||
+			if (!MatchAffineOffset(inst->Arg(0), guard, left, depth + 1u, scaled_index) ||
+			    !MatchAffineOffset(inst->Arg(1), guard, right, depth + 1u, scaled_index) ||
 			    (!left.index.IsEmpty() && !right.index.IsEmpty() &&
-			     !EquivalentValue(m_program, left.index, right.index))) return false;
+			     !EquivalentValue(m_program, left.index, right.index)))
+				return false;
 			out.index = left.index.IsEmpty() ? right.index : left.index;
 			out.stride = left.stride + right.stride;
 			out.offset = left.offset + right.offset;
@@ -1508,10 +1594,22 @@ private:
 		}
 		if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 && inst->NumArgs() == 2u &&
 		    ImmediateU32(inst->Arg(1), immediate) && immediate < 32u) {
-			if (!MatchAffineOffset(inst->Arg(0), guard, out, depth + 1u)) return false;
+			if (!MatchAffineOffset(inst->Arg(0), guard, out, depth + 1u, scaled_index))
+				return false;
 			out.stride <<= immediate;
 			out.offset <<= immediate;
 			return out.stride <= UINT32_MAX && out.offset <= UINT32_MAX;
+		}
+		if (scaled_index && inst->GetOpcode() == ValueOpcode::IMul32 && inst->NumArgs() == 2u) {
+			const bool factor_right = ImmediateU32(inst->Arg(1), immediate);
+			if (factor_right || ImmediateU32(inst->Arg(0), immediate)) {
+				if (!MatchAffineOffset(inst->Arg(factor_right ? 0u : 1u), guard, out, depth + 1u,
+				                       scaled_index))
+					return false;
+				out.stride *= immediate;
+				out.offset *= immediate;
+				return out.stride <= UINT32_MAX && out.offset <= UINT32_MAX;
+			}
 		}
 		out.index = value;
 		out.stride = 1u;
@@ -1668,7 +1766,22 @@ private:
 		return {};
 	}
 
-	const Inst* UniformizedMaterialValue(Value key, const Inst& use, Value executing = {}) const {
+	struct LaneValue {
+		Value active;
+		Value value;
+		bool  operator==(const LaneValue&) const = default;
+	};
+
+	bool UsesFollowLaneRead(const Inst& handle, const Inst& lane_read, Value guard) const {
+		if (!handle.HasUses()) return false;
+		return std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+			return use.user->Parent() == lane_read.Parent() &&
+			       Implies(use.user->Arg(use.user->NumArgs() - 1u), guard);
+		});
+	}
+
+	std::optional<LaneValue> UniformizedMaterialValue(Value key, const Inst& use,
+	                                                  Value executing = {}) const {
 		Value guard;
 		Value local;
 		const auto* first = key.Resolve().TryInstruction();
@@ -1677,18 +1790,21 @@ private:
 			guard = first->Arg(1).Resolve();
 			// Empty EXEC selects lane zero, which may not have loaded a material key.
 			// An executing store also witnesses nonempty EXEC at the lane read.
-			if (executing.IsEmpty() ? !HasActiveLane(guard, first->Parent())
-			                        : !Implies(executing, guard)) return nullptr;
+			if (executing.IsEmpty()
+			        ? !HasActiveLane(guard, first->Parent(), UsesFollowLaneRead(use, *first, guard))
+			        : !Implies(executing, guard))
+				return std::nullopt;
 			local = first->Arg(0).Resolve();
 		} else {
 			guard = PositiveLaneWitness(use.Parent());
-			if (guard.IsEmpty()) return nullptr;
+			if (guard.IsEmpty()) return std::nullopt;
 			local = EqualLocalKey(guard, key);
 		}
 		const auto* selected = local.Resolve().TryInstruction();
-		if (selected == nullptr || selected->GetOpcode() != ValueOpcode::SelectU32 ||
-		    selected->NumArgs() != 3u || !Implies(guard, selected->Arg(0))) return nullptr;
-		return selected;
+		if (selected == nullptr) return std::nullopt;
+		if (selected->GetOpcode() != ValueOpcode::SelectU32) return LaneValue {Value(true), local};
+		if (selected->NumArgs() != 3u || !Implies(guard, selected->Arg(0))) return std::nullopt;
+		return LaneValue {selected->Arg(0).Resolve(), selected->Arg(1)};
 	}
 
 	const Inst* SelectorReadValue(Value value, Value active,
@@ -1724,17 +1840,22 @@ private:
 	}
 
 	const Inst* IndexedMaterialRead(const Inst* read, Value active,
-	                               DescriptorSource::IndirectDescriptor::SelectorRead& selector) const {
+	                                DescriptorSource::IndirectDescriptor::SelectorRead& selector,
+	                                Value use_guard = {}) const {
 		if (read == nullptr) return nullptr;
 		uint32_t lane = 0;
 		const auto op = read->GetOpcode();
-		if (op == ValueOpcode::CompositeExtractU32x2 || op == ValueOpcode::CompositeExtractU32x3) {
-			const bool x3 = op == ValueOpcode::CompositeExtractU32x3;
-			if (!ImmediateU32(read->Arg(1), lane) || lane >= (x3 ? 3u : 2u)) return nullptr;
+		if (op == ValueOpcode::CompositeExtractU32x2 || op == ValueOpcode::CompositeExtractU32x3 ||
+		    op == ValueOpcode::CompositeExtractU32x4) {
+			const uint32_t width = op == ValueOpcode::CompositeExtractU32x2   ? 2u
+			                       : op == ValueOpcode::CompositeExtractU32x3 ? 3u
+			                                                                  : 4u;
+			const auto     load  = width == 2u   ? ValueOpcode::LoadBufferU32x2
+			                       : width == 3u ? ValueOpcode::LoadBufferU32x3
+			                                     : ValueOpcode::LoadBufferU32x4;
+			if (!ImmediateU32(read->Arg(1), lane) || lane >= width) return nullptr;
 			read = read->Arg(0).Resolve().TryInstruction();
-			if (read == nullptr ||
-			    read->GetOpcode() != (x3 ? ValueOpcode::LoadBufferU32x3 : ValueOpcode::LoadBufferU32x2))
-				return nullptr;
+			if (read == nullptr || read->GetOpcode() != load) return nullptr;
 		} else if (op != ValueOpcode::LoadBufferU32) {
 			return nullptr;
 		}
@@ -1742,7 +1863,9 @@ private:
 		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
 		    !memory.idxen || memory.offen || memory.offset > UINT32_MAX - lane * 4u ||
 		    read->Arg(2).Resolve() != Value(0u) || read->Arg(3).Resolve() != Value(0u) ||
-		    !Implies(active, read->Arg(4))) return nullptr;
+		    (!Implies(active, read->Arg(4)) &&
+		     (use_guard.IsEmpty() || !Implies(use_guard, read->Arg(4)))))
+			return nullptr;
 		selector.offset = memory.offset + lane * 4u;
 		return read;
 	}
@@ -1750,15 +1873,32 @@ private:
 	// Predicated writes and SSA joins may retain the original material field or zero.
 	// The outer unsigned check bounds every nonzero field used by this waterfall.
 	const Inst* GuardedMaterialField(const Inst* select, Value active,
-	                                DescriptorSource::IndirectDescriptor::SelectorRead& selector) const {
-		uint32_t limit;
-		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 ||
-		    select->Arg(2).Resolve() != Value(0u) ||
-		    !ImmediateU32(UnsignedBound(select->Arg(0), select->Arg(1)), limit) || limit == 0u) return nullptr;
+	                                 DescriptorSource::IndirectDescriptor::SelectorRead& selector,
+	                                 Value& use_guard) const {
+		uint32_t limit = 0;
+		Value    start;
+		if (select != nullptr && select->GetOpcode() == ValueOpcode::SMax32) {
+			if (select->Arg(0).Resolve() == Value(0u))
+				start = select->Arg(1);
+			else if (select->Arg(1).Resolve() == Value(0u))
+				start = select->Arg(0);
+			else
+				return nullptr;
+			limit = static_cast<uint32_t>(INT32_MAX) + 1u;
+		} else if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 ||
+		           select->Arg(2).Resolve() != Value(0u) ||
+		           !ImmediateU32(UnsignedBound(select->Arg(0), select->Arg(1)), limit) ||
+		           limit == 0u) {
+			return nullptr;
+		} else {
+			start = select->Arg(1);
+		}
 		const Inst* field = nullptr;
-		std::vector<Value> pending {select->Arg(1)};
+		Value                                field_guard;
+		std::vector<std::pair<Value, Value>> pending {{start, active}};
 		for (size_t i = 0; i < pending.size(); ++i) {
-			auto value = pending[i].Resolve();
+			auto       value = pending[i].first.Resolve();
+			const auto guard = pending[i].second;
 			if (value == Value(0u)) continue;
 			const auto* inst = value.TryInstruction();
 			if (inst == nullptr || inst->Parent() == nullptr || InCycle(inst->Parent())) return nullptr;
@@ -1766,16 +1906,20 @@ private:
 			if (phi && inst->NumArgs() == 0u) return nullptr;
 			if (!phi && inst->GetOpcode() != ValueOpcode::SelectU32) {
 				if (field != nullptr && field != inst) return nullptr;
+				field_guard = field == nullptr || field_guard == guard ? guard : active;
 				field = inst;
 				continue;
 			}
-			const auto end = !phi && Implies(active, inst->Arg(0)) ? 2u : inst->NumArgs();
+			const bool taken = !phi && Implies(active, inst->Arg(0));
+			const auto end   = taken ? 2u : inst->NumArgs();
 			for (size_t arm = phi ? 0u : 1u; arm < end; ++arm) {
-				value = inst->Arg(arm).Resolve();
-				if (std::ranges::find(pending, value) == pending.end()) pending.push_back(value);
+				const std::pair next {inst->Arg(arm).Resolve(),
+				                      !phi && !taken && arm == 1u ? inst->Arg(0).Resolve() : guard};
+				if (std::ranges::find(pending, next) == pending.end()) pending.push_back(next);
 			}
 		}
 		selector.zero_above = limit - 1u;
+		use_guard           = field_guard;
 		return field;
 	}
 
@@ -1784,17 +1928,18 @@ private:
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
 	                                DescriptorSource& material_source, MaterialKey kind) {
-		if (m_program.stage != ShaderType::Compute &&
-		    (kind == MaterialKey::Indexed || kind == MaterialKey::Heap)) return false;
-		const auto* selected = UniformizedMaterialValue(key, image);
-		if (selected == nullptr) return false;
-		const auto active = selected->Arg(0).Resolve();
+		if (m_program.stage != ShaderType::Compute && kind == MaterialKey::Heap) return false;
+		const auto selected = UniformizedMaterialValue(key, image);
+		if (!selected) return false;
+		const auto active = selected->active;
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
+		Value                                              use_guard;
 		const auto* read = kind == MaterialKey::Guarded
-		    ? GuardedMaterialField(selected->Arg(1).Resolve().TryInstruction(), active, selector)
-		    : SelectorReadValue(selected->Arg(1), active, selector);
+		                       ? GuardedMaterialField(selected->value.Resolve().TryInstruction(),
+		                                              active, selector, use_guard)
+		                       : SelectorReadValue(selected->value, active, selector);
 		if (kind != MaterialKey::Global) {
-			read = IndexedMaterialRead(read, active, selector);
+			read = IndexedMaterialRead(read, active, selector, use_guard);
 			// Bounded heaps keep their full domain when the material may alias a write: written
 			// buffers are checked at dispatch, storage images and address writes here. Pointer
 			// tables have no such domain, so a key that a same-dispatch write changes selects
@@ -1808,10 +1953,20 @@ private:
 				    });
 			    })) || !MakeRuntimeTableSource(*read, material_source)) return false;
 			// Wrapped U32 indices preserve the stride's power-of-two congruence class.
+			const auto   row_guard = use_guard.IsEmpty() ? active : use_guard;
 			AffineOffset row;
-			if (MatchAffineOffset(read->Arg(1), active, row) && row.stride != 0u) {
-				selector.record_step = 1u << std::countr_zero(static_cast<uint32_t>(row.stride));
-				selector.first_record = static_cast<uint32_t>(row.offset) % selector.record_step;
+			uint32_t     rows = 0;
+			if (MatchAffineOffset(read->Arg(1), row_guard, row, 0u, true) && row.stride != 0u) {
+				if (ImmediateU32(UnsignedBound(row_guard, row.index), rows) && rows != 0u &&
+				    row.offset + row.stride * (rows - 1u) <= UINT32_MAX) {
+					selector.record_step  = static_cast<uint32_t>(row.stride);
+					selector.first_record = static_cast<uint32_t>(row.offset);
+				} else {
+					selector.record_step = 1u
+					                       << std::countr_zero(static_cast<uint32_t>(row.stride));
+					selector.first_record =
+					    static_cast<uint32_t>(row.offset) % selector.record_step;
+				}
 			}
 			selector.source = InternSource(material_source);
 			indirect.selector = std::move(selector);
@@ -2629,12 +2784,15 @@ private:
 	}
 
 	void FoldBoundedLoopSelectors() {
-		const auto fold = [&](const Inst& compare, const auto& bounds, const Block* header) {
+		const auto enters = [&](const EdgePredicate& edge, const Inst& compare, const Inst* mask) {
+			return edge.positive && Implies(edge.condition, Value(const_cast<Inst*>(&compare))) &&
+			       (mask == nullptr || Implies(edge.condition, Value(const_cast<Inst*>(mask))));
+		};
+		const auto fold = [&](const Inst& compare, const auto& bounds, const Block* header,
+		                      const Inst* mask = nullptr) {
 			for (auto* block: m_program.blocks) {
 				if (!GuardedOnEntry(block, [&](const Block* at) { return at == header; },
-				    [&](const EdgePredicate& edge) {
-					    return edge.positive && Implies(edge.condition, Value(const_cast<Inst*>(&compare)));
-				    })) continue;
+				    [&](const EdgePredicate& edge) { return enters(edge, compare, mask); })) continue;
 				for (auto& inst: *block)
 					if (inst.GetOpcode() == ValueOpcode::SelectU32 &&
 					    SelectorPredicateFalse(inst.Arg(0), bounds)) inst.ReplaceUsesWith(inst.Arg(2));
@@ -2643,6 +2801,7 @@ private:
 		for (auto* header: m_program.blocks) {
 			for (auto& induction: *header) {
 				const Inst* carried = nullptr;
+				const Inst* mask = nullptr;
 				uint32_t maximum = 0;
 				if (const auto* compare = DescendingLoop(Value(&induction), nullptr, maximum)) {
 					const std::array bounds {std::pair {static_cast<const Inst*>(&induction), maximum}};
@@ -2658,7 +2817,25 @@ private:
 					    carried->NumArgs() != 2u || carried->NumPhiBlocks() != 2u ||
 					    carried->PhiBlock(0) != induction.PhiBlock(0) ||
 					    carried->PhiBlock(1) != induction.PhiBlock(1)) return false;
+					mask = nullptr;
 					maximum = SelectorMaximum(carried->Arg(initial));
+					const auto* step = induction.Arg(initial ^ 1u).Resolve().TryInstruction();
+					for (const auto& lanes: *header) {
+						if (maximum != UINT32_MAX || lanes.GetOpcode() != ValueOpcode::Phi) break;
+						if (lanes.GetType() != Type::U1 || lanes.NumArgs() != 2u ||
+						    lanes.PhiBlock(0) != induction.PhiBlock(0) ||
+						    lanes.PhiBlock(1) != induction.PhiBlock(1) ||
+						    !Implies(lanes.Arg(initial ^ 1u), Value(const_cast<Inst*>(&lanes))) ||
+						    !GuardedOnEntry(
+						        step->Parent(), [&](const Block* at) { return at == header; },
+						        [&](const EdgePredicate& edge) {
+							        return enters(edge, test, &lanes);
+						        }))
+							continue;
+						mask = &lanes;
+						maximum =
+						    SelectorMaximum(carried->Arg(initial), {}, 0u, lanes.Arg(initial));
+					}
 					if (maximum == 0u || maximum == UINT32_MAX) return false;
 					const std::array assumptions {std::pair {static_cast<const Inst*>(&induction), maximum - 1u},
 					                             std::pair {carried, maximum}};
@@ -2671,7 +2848,8 @@ private:
 				// Native scalar branches advance the zero/+1 induction uniformly, so
 				// even an any-lane bound test limits it by the largest carried bound.
 				// Per-lane edges instead require the comparison on every executing lane.
-				fold(*compare, assumptions, header);
+				fold(*compare, std::span(assumptions).first(mask == nullptr ? 2u : 1u), header,
+				     mask);
 			}
 		}
 	}
@@ -3088,9 +3266,9 @@ private:
 			const bool indexed = memory == nullptr;
 			if (indexed) {
 				if (handle.NumArgs() != 8u) return false;
-				const auto* selected = UniformizedMaterialValue(descriptor.dwords[dword], handle);
-				if (selected == nullptr) return false;
-				const auto* extract = selected->Arg(1).Resolve().TryInstruction();
+				const auto selected = UniformizedMaterialValue(descriptor.dwords[dword], handle);
+				if (!selected) return false;
+				const auto* extract = selected->value.Resolve().TryInstruction();
 				if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 				    !ImmediateU32(extract->Arg(1), component) || component >= 4u) return false;
 				read = extract->Arg(0).Resolve().TryInstruction();
@@ -3101,11 +3279,11 @@ private:
 				uint32_t offset = 1u, scalar = 1u;
 				if (memory->kind != ResourceKind::Buffer || memory->typed || memory->formatted ||
 				    !memory->idxen || memory->offen || memory->data_bits != 32u ||
-				    memory->data_dwords != 4u ||
-				    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
-				    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
-				    !EquivalentValue(m_program, read->Arg(4), selected->Arg(0)) ||
-				    (dword != 0u && !EquivalentValue(m_program, table_guard, read->Arg(4)))) return false;
+				    memory->data_dwords != 4u || !ImmediateU32(read->Arg(2), offset) ||
+				    offset != 0u || !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
+				    !EquivalentValue(m_program, read->Arg(4), selected->active) ||
+				    (dword != 0u && !EquivalentValue(m_program, table_guard, read->Arg(4))))
+					return false;
 				table_guard = read->Arg(4);
 			}
 			if (memory->offset > INT32_MAX || (!allow_fixed && (memory->offset & 3u) != 0u) ||
@@ -3738,16 +3916,17 @@ private:
 		const auto* lane_read = key.Resolve().TryInstruction();
 		if (lane_read == nullptr || lane_read->GetOpcode() != ValueOpcode::ReadFirstLane)
 			return false;
-		const Inst* selected = nullptr;
+		std::optional<LaneValue> selected;
 		for (const auto& use: handle.Uses()) {
-			const auto* value = UniformizedMaterialValue(
-			    key, *use.user, use.user->Arg(use.user->NumArgs() - 1u));
-			if (value == nullptr || (selected != nullptr && selected != value)) return false;
+			const auto value =
+			    UniformizedMaterialValue(key, *use.user, use.user->Arg(use.user->NumArgs() - 1u));
+			if (!value || (selected && *selected != *value)) return false;
 			selected = value;
 		}
+		if (!selected) return false;
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
-		const auto* read = IndexedMaterialRead(selected->Arg(1).Resolve().TryInstruction(),
-		                                       selected->Arg(0), selector);
+		const auto* read = IndexedMaterialRead(selected->value.Resolve().TryInstruction(),
+		                                       selected->active, selector);
 		if (read == nullptr || !MakeRuntimeTableSource(*read, material_source) ||
 		    !BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) return false;
 		selector.source = InternSource(material_source);

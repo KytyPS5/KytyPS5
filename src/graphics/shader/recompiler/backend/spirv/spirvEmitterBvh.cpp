@@ -146,34 +146,42 @@ uint32_t EmitBvhTriangle(EmitterState& s, const std::array<Vec3, 3>& positions,
 
 namespace {
 
-std::array<uint32_t, 6> Box(EmitterState& s, uint32_t first, uint32_t second,
-                           uint32_t half, uint32_t child) {
+using NodeBounds = std::array<std::array<uint32_t, 6>, 4>;
+
+NodeBounds ReadNodeBounds(EmitterState& s, uint32_t first, uint32_t second, uint32_t half) {
 	const auto f = TypeF32(s);
 	const auto half_label = s.builder.AllocateId(), full_label = s.builder.AllocateId();
 	const auto merge = s.builder.AllocateId();
 	s.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
 	s.builder.AddFunction(spv::OpBranchConditional, half, half_label, full_label);
 	EmitLabel(s, half_label);
-	std::array<uint32_t, 6> packed, full, result;
-	for (uint32_t pair = 0; pair < 3; ++pair) {
-		const auto word = BvhNodeWord(s, first, ConstantU32(s, 4 + child * 3 + pair));
-		const auto unpacked = EmitGlsl<GLSLstd450UnpackHalf2x16, IR::Type::F32x2>(s, word);
-		packed[pair * 2] = Extract(s, f, unpacked, 0);
-		packed[pair * 2 + 1] = Extract(s, f, unpacked, 1);
+	NodeBounds packed, full, result;
+	for (uint32_t child = 0; child < packed.size(); ++child) {
+		for (uint32_t pair = 0; pair < 3; ++pair) {
+			const auto word = BvhNodeWord(s, first, ConstantU32(s, 4 + child * 3 + pair));
+			const auto unpacked = EmitGlsl<GLSLstd450UnpackHalf2x16, IR::Type::F32x2>(s, word);
+			packed[child][pair * 2] = Extract(s, f, unpacked, 0);
+			packed[child][pair * 2 + 1] = Extract(s, f, unpacked, 1);
+		}
 	}
 	s.builder.AddFunction(spv::OpBranch, merge);
 	EmitLabel(s, full_label);
-	for (uint32_t component = 0; component < 6; ++component) {
-		const auto word = 4 + child * 6 + component;
-		full[component] = Unary(s, spv::OpBitcast, f,
-		    BvhNodeWord(s, word < 16 ? first : second, ConstantU32(s, word % 16)));
+	for (uint32_t child = 0; child < full.size(); ++child) {
+		for (uint32_t component = 0; component < full[child].size(); ++component) {
+			const auto word = 4 + child * 6 + component;
+			full[child][component] = Unary(s, spv::OpBitcast, f,
+			    BvhNodeWord(s, word < 16 ? first : second, ConstantU32(s, word % 16)));
+		}
 	}
 	s.builder.AddFunction(spv::OpBranch, merge);
 	EmitLabel(s, merge);
-	for (uint32_t component = 0; component < 6; ++component) {
-		result[component] = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpPhi, f, result[component], packed[component], half_label,
-		                      full[component], full_label);
+	for (uint32_t child = 0; child < result.size(); ++child) {
+		for (uint32_t component = 0; component < result[child].size(); ++component) {
+			auto& bound = result[child][component];
+			bound = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpPhi, f, bound, packed[child][component], half_label,
+			                      full[child][component], full_label);
+		}
 	}
 	return result;
 }
@@ -186,8 +194,9 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 	Vec3 forward;
 	for (uint32_t axis = 0; axis < 3; ++axis)
 		forward[axis] = Binary(s, spv::OpFOrdGreaterThanEqual, b, inverse[axis], zero);
-	for (uint32_t child = 0; child < 4; ++child) {
-		const auto box = Box(s, first, second, half, child);
+	const auto boxes = ReadNodeBounds(s, first, second, half);
+	for (uint32_t child = 0; child < boxes.size(); ++child) {
+		const auto& box = boxes[child];
 		Vec3 near, far;
 		for (uint32_t axis = 0; axis < 3; ++axis) {
 			const auto lo = Binary(s, spv::OpFMul, f,

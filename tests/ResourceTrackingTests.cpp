@@ -4229,6 +4229,75 @@ void TestGuardedMaterialImageKey() {
   }
 }
 
+void TestSignedGuardedMaterialImageKey() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  constexpr uint32_t first_row = 0x13u, row_stride = 14u, materials = 4u, records = 64u, decoy = 7u;
+  const auto make = [](bool foreign_load_mask) {
+    Fixture f(ShaderType::Pixel);
+    auto* entry = f.block;
+    auto* other = f.AddBlock();
+    auto* merge = f.AddBlock();
+    entry->AddBranch(other);
+    entry->AddBranch(merge);
+    other->AddBranch(merge);
+    const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+    const auto id = f.Emit(ValueOpcode::LaneId);
+    const auto in_table = f.Emit(ValueOpcode::UGreaterThan32, {Value(materials), id});
+    const auto foreign = f.Emit(ValueOpcode::IEqual32, {id, f.UserData(6)});
+    const auto fallback = f.Emit(ValueOpcode::SelectU32, {Value(true), Value(0u), f.UserData(7)});
+    const auto branch = f.Emit(ValueOpcode::IEqual32, {f.UserData(0), Value(0u)});
+    entry->condition = f.Emit(ValueOpcode::ConditionRef, {branch}, CFG::BranchCondition::SccNonZero);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = other, .false_block = merge};
+    other->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    merge->terminator.kind = CFG::TerminatorKind::Return;
+    const auto scaled = f.Emit(ValueOpcode::IMul32, {Value(row_stride), id}, 0, other);
+    const auto row = f.Emit(ValueOpcode::IAdd32, {Value(first_row), scaled}, 0, other);
+    const auto load = f.Emit(ValueOpcode::LoadBufferU32x4,
+        {material, row, Value(0u), Value(0u), foreign_load_mask ? foreign : in_table},
+        f.AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x10u), other);
+    const auto field = f.Emit(ValueOpcode::CompositeExtractU32x4, {load, Value(3u)}, 0, other);
+    const auto picked = f.Emit(ValueOpcode::SelectU32, {in_table, field, fallback}, 0, other);
+    f.block = merge;
+    auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, fallback);
+    phi.AddPhiOperand(other, picked);
+    const auto clamped = f.Emit(ValueOpcode::SMax32, {Value(0u), Value(&phi)});
+    const auto selected = f.Emit(ValueOpcode::SelectU32, {Value(true), clamped, id});
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    const auto table = f.Address(f.UserData(4), f.UserData(5));
+    std::array<Value, 8> words;
+    for (uint32_t i = 0; i < words.size(); ++i)
+      words[i] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+          f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = i * 4u}, 0x20u));
+    const auto sampler = f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    f.Emit(ValueOpcode::ImageSampleRaw, {f.Image(words), sampler, f.ImageAddress(), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Image, .image_dimension = Decoder::ImageDimension::Dim2D}, 0x28u));
+    f.PlanAndTrack();
+    return ExtractResourcePlan(f.program);
+  };
+  CheckFatal([&] { make(true); }, "not a valid runtime value",
+             "signed material key used a field on lanes its load did not execute");
+  const auto plan = make(false);
+  LinearTestMemory memory;
+  const uint32_t table = uint32_t(memory.base) + records * 16u;
+  const std::array<uint32_t, 8> data{uint32_t(memory.base), 16u << 16u, records, 0x5204u, table, 0u, 0u, 0u};
+  constexpr std::array<uint32_t, materials> fields{3u, 5u, UINT32_MAX, 9u};
+  for (uint32_t material = 0; material < materials; ++material)
+    memory.words[(first_row + row_stride * material) * 4u + 3u] = fields[material];
+  memory.words[(first_row + 2u) * 4u + 3u] = decoy;
+  const SrtRuntime runtime{.user_data = data, .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto read_row = [&](uint32_t row) {
+    return std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{table + row * 32u, 32u}) !=
+           snapshot.specialization_reads.end();
+  };
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptor_reads == 4u &&
+            read_row(0u) && read_row(3u) && read_row(5u) && read_row(9u) && !read_row(decoy),
+        "signed material key read a texture row outside its bounded material records");
+}
+
 void TestImageDescriptorFields() {
   constexpr std::array<std::pair<uint32_t, uint32_t>, 5> reserved{
       {{1u, 0x20000000u}, {2u, 0x70003000u}, {4u, 0xe000e000u},
@@ -10120,6 +10189,7 @@ int main() {
     Run("indexed material image keys", TestIndexedMaterialImageKeys);
     Run("pointer-table indexed material keys", TestPointerTableIndexedMaterialKeys);
     Run("guarded material image key", TestGuardedMaterialImageKey);
+    Run("signed guarded material image key", TestSignedGuardedMaterialImageKey);
     Run("graphics pointer-table material keys", TestGraphicsPointerTableMaterialKeys);
     Run("graphics thread-bit material keys", TestGraphicsThreadBitMaterialKeys);
     Run("image descriptor fields", TestImageDescriptorFields);

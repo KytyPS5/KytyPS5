@@ -241,6 +241,10 @@ uint32_t GetFlushDraws() {
 	return g_config->flush_draws;
 }
 
+bool FunctionTableCallsEnabled() {
+	return g_config->function_table_calls;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

@@ -116,11 +116,10 @@ struct Graph {
 Graph       BuildGraph(const Decoder::Program& program);
 bool        ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size);
-// Returns the one instruction defining `code` that reaches `before` (UINT32_MAX: the entry value),
-// or nullopt if several do.
-std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                                             uint32_t before, uint32_t code, uint32_t wave_size,
-                                             std::vector<uint32_t>& crossed_calls);
+// Every reaching definition of a scalar register, sorted and de-duplicated.
+std::vector<uint32_t> FindScalarDefinitions(const Decoder::Program& program, const Graph& graph,
+                                            uint32_t before, uint32_t code, uint32_t wave_size,
+                                            std::vector<uint32_t>& crossed_calls);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);

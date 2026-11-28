@@ -13465,6 +13465,157 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Two-entry function table selected by a lane-derived index: the linked dispatcher must
+  // choose each target at runtime, and the chosen target plus its result stay visible in the
+  // output buffer. A direct literal-target call is the control.
+  void CheckMultiTargetTableCall() {
+    constexpr const char *name = "MultiTargetTableCall";
+    constexpr uintptr_t base = 0x0000000205800000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto table = base + 0x100;
+    constexpr auto first = base + 0x1000;
+    constexpr auto second = base + 0x2000;
+    constexpr auto output = base + 0x4000;
+
+    // Each leaf reports its own low address (the selected target) and a result dword.
+    const std::array<u32, 4> leaf_a{EncodeSMovB32(20, InlineU32(41)), EncodeSMovB32(21, 255),
+                                    static_cast<u32>(first), EncodeSop1(0x21, 125, 14)};
+    // 73 is outside the inline-constant range, so it needs an explicit literal move.
+    const std::array<u32, 5> leaf_b{EncodeSMovB32(20, 255), 73u, EncodeSMovB32(21, 255),
+                                    static_cast<u32>(second), EncodeSop1(0x21, 125, 14)};
+
+    const auto append_stores = [](std::vector<u32> &code) {
+      code.push_back(EncodeVop1(0x01, 1, 20)); // v_mov_b32 v1, s20
+      code.push_back(EncodeMubuf0(0x1c, 0, false, false));
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      code.push_back(EncodeVop1(0x01, 2, 21)); // v_mov_b32 v2, s21
+      code.push_back(EncodeMubuf0(0x1c, 4, false, false));
+      code.push_back(EncodeMubuf1(2, 0, 0));
+    };
+    // s20 = (lane's v0) * 16 selects the table entry; s[4:7] is the table descriptor.
+    const auto make_table_caller = [&](u32 lane) {
+      std::vector<u32> code;
+      AppendVop3(&code, 0x360u, 20, Vgpr(0), InlineU32(lane)); // v_readlane_b32 s20, v0, lane
+      code.push_back(EncodeSop2(0x1e, 20, 20, 132));           // s_lshl_b32 s20, s20, 4
+      code.push_back(EncodeSmem0(0x09, 14, 2));
+      code.push_back(EncodeSmem1(0, 20)); // s_buffer_load_dwordx2 s14, s[4:7], s20
+      code.push_back(0xbf8cc07fu);        // s_waitcnt
+      code.push_back(0xbf130e80u);        // s_cmp_lg_u64 0, s14
+      code.push_back(EncodeSopp(0x04, 1)); // s_cbranch_scc0 skip
+      code.push_back(0xbe8e210eu);        // s_swappc_b64 s14, s14
+      append_stores(code);
+      AppendEnd(&code);
+      return code;
+    };
+    const auto make_direct_caller = [&] {
+      std::vector<u32> code;
+      code.push_back(EncodeSMovB32(14, 255));
+      code.push_back(static_cast<u32>(first));
+      code.push_back(EncodeSMovB32(15, 255));
+      code.push_back(static_cast<u32>(first >> 32u));
+      code.push_back(0xbe8e210eu); // s_swappc_b64 s14, s14
+      append_stores(code);
+      AppendEnd(&code);
+      return code;
+    };
+
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "table fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 &&
+        mapped == reinterpret_cast<void *>(base), "table fixture mapping failed");
+    std::memset(mapped, 0, size);
+    LibKernel::Memory::WriteBacking(first, leaf_a.data(), sizeof(leaf_a));
+    LibKernel::Memory::WriteBacking(second, leaf_b.data(), sizeof(leaf_b));
+    const uint64_t entry_a = first, entry_b = second;
+    LibKernel::Memory::WriteBacking(table, &entry_a, sizeof(entry_a));
+    LibKernel::Memory::WriteBacking(table + 16, &entry_b, sizeof(entry_b));
+
+    // The pipeline only links function-table calls when the option is on.
+    EnsureConfigInitialized();
+    Config::ConfigOptions config;
+    config.printf_direction     = Config::LogDirection::Silent;
+    config.function_table_calls = true;
+    Config::Load(config);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 8;
+      out.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      const ShaderBufferResource table_desc{{static_cast<u32>(table),
+          static_cast<u32>(table >> 32u) | (16u << 16u), 2, 0x5204u}};
+      struct Case {
+        std::vector<u32> code;
+        u32 threads;
+        u32 expected_result;
+        uint64_t expected_target;
+        const char *label;
+      };
+      const std::array<Case, 3> cases{{
+          {make_table_caller(0), 2, 41, first, "table entry 0"},
+          {make_table_caller(1), 2, 73, second, "table entry 1"},
+          {make_direct_caller(), 1, 41, first, "direct call"},
+      }};
+      for (const auto &test : cases) {
+        ShaderMapUserData(reinterpret_cast<uint64_t>(test.code.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(test.code.size() * sizeof(u32))});
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(test.code.data()),
+                             .num_thread_x = test.threads,
+                             .num_thread_y = 1,
+                             .num_thread_z = 1,
+                             .wave_size = 64,
+                             .user_sgpr = 8});
+        for (u32 i = 0; i < 4; ++i) {
+          shaders.SetCsUserSgpr(i, out.fields[i]);
+          shaders.SetCsUserSgpr(i + 4, table_desc.fields[i]);
+        }
+        Require(name, "reset output", context.InvalidateMemory(output, 8),
+                "table output escaped mapped memory");
+        std::array<u32, 2> zero{};
+        LibKernel::Memory::WriteBacking(output, zero.data(), sizeof(zero));
+        ShaderComputeInputInfo input{};
+        const auto program = context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), input);
+        Require(name, "link", program != nullptr, "function table dispatch was skipped");
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        cache.ReadMemory(output, 8);
+        std::array<u32, 2> actual{};
+        const bool read_ok =
+            LibKernel::Memory::TryReadBacking(output, actual.data(), sizeof(actual));
+        Require(name, test.label,
+                read_ok && actual[0] == test.expected_result &&
+                    actual[1] == static_cast<u32>(test.expected_target),
+                std::string(test.label) + " result=" + std::to_string(actual[0]) +
+                    " target=" + std::to_string(actual[1]));
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    config.function_table_calls = false;
+    Config::Load(config);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "table fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // An empty binding is a null descriptor, so loads and stores without shader checks touch no memory.
   void CheckNullStorageBufferDescriptor() {
     constexpr const char *name = "NullStorageBufferDescriptor";
@@ -58917,6 +59068,11 @@ int main(int argc, char **argv) {
     vulkan.CheckScalarLeafCall();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--multi-target-table-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMultiTargetTableCall();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
     CheckPm4Flip();
     return 0;
@@ -58946,6 +59102,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
     vulkan.CheckScalarLeafCall();
+    vulkan.CheckMultiTargetTableCall();
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
@@ -59583,6 +59740,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
+  vulkan.CheckMultiTargetTableCall();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

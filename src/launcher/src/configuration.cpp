@@ -38,6 +38,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(readback_storage_images);
 	KYTY_CFG_SET(sync_raw_image_buffers);
 	KYTY_CFG_SET(flush_draws);
+	KYTY_CFG_SET(function_table_calls);
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(relaxed_shader_float);
@@ -103,6 +104,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(readback_storage_images);
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(flush_draws);
+	KYTY_CFG_GET(function_table_calls);
 	KYTY_CFG_GET(tessellation_enabled);
 	KYTY_CFG_GET(occlusion_queries_enabled);
 	KYTY_CFG_GET(relaxed_shader_float);

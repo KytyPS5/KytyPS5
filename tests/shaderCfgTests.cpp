@@ -7492,6 +7492,15 @@ void TestMemoryFedScalarLeafCall() {
                   std::pair<uint64_t, uint64_t>{base + 0x100, 12}) != snapshot.specialization_reads.end(),
           "call dependencies or writable ranges were lost before binding validation");
   }
+  // A written buffer that overlaps a captured function-table range cannot be specialized: the
+  // linked target was resolved from what the CPU read.
+  write_plan.call_table_reads = {{base + 0x100, 4}};
+  user_data[24]                = base + 0x100;
+  bool retry                   = false;
+  Check(!IR::MaterializeResources(write_plan, write_runtime, snapshot, specialization, &retry) &&
+            retry,
+        "write overlapping a captured function table was not a retryable rejection");
+  write_plan.call_table_reads.clear();
 
   // Relocating identical code updates dependencies without rebuilding the source.
   std::copy_n(memory.words.begin() + 64, 3, memory.words.begin() + 96);
@@ -7538,13 +7547,49 @@ void TestMemoryFedScalarLeafCall() {
   std::vector<uint32_t> flat;
   uint32_t high = 1;
   Check(IR::WalkSrt(pair_source.call_targets, runtime, flat, nullptr) &&
-            IR::WalkedValue(pair_source.call_targets, pair_source.calls.front().target[1], high) && high == 0,
+            IR::WalkedValue(pair_source.call_targets, pair_source.calls.front().target[1].front(), high) &&
+            high == 0,
         "scalar pair producer used a stale preceding high-half definition");
   const uint32_t joined[] = {
-      EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
-      EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
-              "ambiguous reaching definitions were accepted for a call target");
+      EncodeSopp(0x04, 2), EncodeSMovB32(14, 132), EncodeSopp(0x02, 1),
+      EncodeSMovB32(14, 136), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  // Both reaching definitions are candidates now; they may only disagree at dispatch time.
+  std::array<uint32_t, 64> ambiguous_user_data{};
+  auto ambiguous_options = options;
+  ambiguous_options.user_data = ambiguous_user_data;
+  auto ambiguous_runtime = runtime;
+  ambiguous_runtime.user_data = ambiguous_user_data;
+  auto joined_source = PrepareShaderSource(joined, ambiguous_options);
+  Check(joined_source.unsupported_call_pc == UINT32_MAX && joined_source.calls.size() == 1 &&
+            joined_source.calls.front().target[0].size() == 2,
+        "reaching call-target definitions were not kept as candidates");
+  // Two distinct aligned callees (4 and 8): the refresh must report the dispatch as unlinkable
+  // rather than terminate emulation, so a call re-entered with a different target is skipped.
+  (void)RefreshShaderSource(joined_source, ambiguous_runtime);
+  Check(joined_source.unlinkable_call_pc == 16u && !joined_source.linked.has_value(),
+        "candidates selecting different callees were not skipped");
+  // SWAPPC ignores the target's low two bits, so candidates that differ only there are one
+  // callee and must still link.
+  ambiguous_user_data[15] = static_cast<uint32_t>(base >> 32u);
+  const uint32_t masked[] = {
+      EncodeSopp(0x04, 3), EncodeSMovB32(14, 255), static_cast<uint32_t>(base + 0x100),
+      EncodeSopp(0x02, 2), EncodeSMovB32(14, 255), static_cast<uint32_t>(base + 0x103),
+      EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  auto masked_source = PrepareShaderSource(masked, ambiguous_options);
+  (void)RefreshShaderSource(masked_source, ambiguous_runtime);
+  Check(masked_source.unlinkable_call_pc == UINT32_MAX && masked_source.linked.has_value() &&
+            masked_source.calls.front().address == base + 0x100,
+        "candidates differing only in the ignored low bits were not one callee");
+  // A launch register the call query cannot evaluate takes the dispatch-skip fallback instead
+  // of terminating emulation.
+  std::array<uint32_t, 4> tiny_user_data{};
+  auto tiny_options = options;
+  tiny_options.user_data = tiny_user_data;
+  const uint32_t launch[] = {EncodeSopp(0x04, 2), EncodeSMovB32(14, 128), EncodeSopp(0x02, 1),
+      EncodeSMovB32(14, 10), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  const auto launch_source = PrepareShaderSource(launch, tiny_options);
+  Check(launch_source.unsupported_call_pc == 16u && launch_source.calls.empty(),
+        "out-of-range launch register did not take the dispatch-skip fallback");
   const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
               "a native return pair was accepted as a later call target");
@@ -7556,7 +7601,7 @@ void TestMemoryFedScalarLeafCall() {
     auto neighbor_options = options;
     neighbor_options.wave_size = wave_size;
     const auto neighbor_source = PrepareShaderSource(neighbor, neighbor_options);
-    const auto* target = neighbor_source.calls.front().target[0].TryInstruction();
+    const auto* target = neighbor_source.calls.front().target[0].front().TryInstruction();
     Check(target != nullptr && target->GetOpcode() == IR::ValueOpcode::GetUserData &&
               IR::RegIndex(target->Arg(0).ScalarRegister()) == 14u,
           "a single-SGPR vector write was taken as the next SGPR's call-target definition");
@@ -7603,6 +7648,295 @@ void TestNewShaderRecompilerSetpcLongBranch() {
             jump->terminator.true_block == target->id,
         "S_GETPC/S_ADD/S_ADDC long jump through VCC missed its target");
   CheckSpirvBinaryValidates(RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute)).spirv);
+}
+
+// A function table read at a lane-selected entry (a waterfall over a per-lane index):
+// every distinct entry is linked and a compare chain on the target pair selects the callee.
+void TestFunctionTableLeafCall() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0080000ull;
+  constexpr uint64_t callee_a = base + 0x100, callee_b = base + 0x140;
+  // v_readfirstlane_b32 s4, v0 ; s_lshl_b32 s4, s4, 4
+  // s_buffer_load_dwordx2 s[14:15], s[0:3], s4 ; s_swappc_b64 s[14:15], s[14:15] ; s_endpgm
+  const uint32_t shader[] = {EncodeVop1(0x02, 4, 256), EncodeSop2(0x1e, 4, 4, 132),
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 128> words{};
+    uint64_t end = base + 0x14c;
+  } memory;
+  const auto set_entry = [&](uint32_t entry, uint64_t target) {
+    memory.words[entry * 4u] = static_cast<uint32_t>(target);
+    memory.words[entry * 4u + 1u] = static_cast<uint32_t>(target >> 32u);
+  };
+  set_entry(0, callee_a);
+  set_entry(1, callee_b | 1u); // SWAPPC ignores the low two bits; the chain compares the raw pair.
+  set_entry(2, callee_a);      // duplicate
+  set_entry(3, 0);             // empty slot
+  // Each callee: s_mov_b32 s5, literal ; s_setpc_b64 s[14:15] (NULL-destination SWAPPC).
+  memory.words[0x40] = EncodeSMovB32(5, 255);
+  memory.words[0x41] = 0x11111111u;
+  memory.words[0x42] = EncodeSop1(0x21, 125, 14);
+  memory.words[0x50] = EncodeSMovB32(5, 255);
+  memory.words[0x51] = 0x22222222u;
+  memory.words[0x52] = EncodeSop1(0x21, 125, 14);
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    if (address < base || address > m.end || out.size_bytes() > m.end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[0] = static_cast<uint32_t>(base);
+  user_data[1] = static_cast<uint32_t>(base >> 32u); // stride 0: records are bytes
+  user_data[2] = 64;                                 // four 16-byte entries
+  user_data[3] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.function_table_calls = true;
+  options.user_data = user_data;
+  IR::SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                         .read_specialization_memory = read};
+
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.unsupported_call_pc == UINT32_MAX && source.calls.size() == 1 &&
+            source.calls[0].table && source.calls[0].table->stride == 16 &&
+            source.calls[0].table->low_offset == 0,
+        "lane-selected function table was not recognized");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 &&
+            source.calls[0].table_targets == std::vector<uint64_t>{callee_a, callee_b | 1u} &&
+            source.linked->callees == std::vector<uint64_t>{callee_a, callee_b},
+        "function table entries were not deduplicated into callees");
+  const auto& native = linked.instructions[source.calls[0].instruction];
+  Check(native.opcode == Decoder::Opcode::S_BRANCH && native.branch_target == 24u,
+        "native table call did not jump to the dispatcher");
+  uint32_t calls = 0;
+  for (const auto& inst : linked.instructions) {
+    if (inst.opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
+    ++calls;
+    const auto body = std::ranges::find(linked.instructions, inst.branch_target, &Decoder::Instruction::pc);
+    Check(body != linked.instructions.end() && body->opcode == Decoder::Opcode::S_MOV_B32,
+          "dispatcher call does not reach a callee body");
+    const auto ret = std::find_if(body, linked.instructions.end(), [](const auto& i) {
+      return i.opcode == Decoder::Opcode::S_BRANCH;
+    });
+    Check(ret != linked.instructions.end() && ret->branch_target == inst.pc + 4u,
+          "callee body does not return to its dispatcher entry");
+  }
+  Check(calls == 2, "dispatcher did not link one call per distinct target");
+  Check(std::ranges::is_sorted(linked.instructions, {}, &Decoder::Instruction::pc),
+        "linked instructions are not in pc order");
+  (void)TranslateProgram(linked, options);
+
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1, "unchanged function table relinked");
+  set_entry(1, callee_a);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 2 && source.linked->callees == std::vector<uint64_t>{callee_a},
+        "changed function table kept stale callees");
+  memory.words[0x41] = 0x33333333u;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 3, "changed callee code kept stale source");
+}
+
+// A table larger than one 1 MiB read chunk: entry 16384 starts in the second chunk, so the scan
+// must not stop at the first chunk. Also checks that a call target computed from GPU data without
+// a table read takes the dispatch-skip fallback instead of aborting, and that a non-power-of-two
+// stride is rejected because a wrapped 32-bit index could select an entry between scan positions.
+void TestFunctionTableChunkBoundary() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0100000ull;
+  constexpr uint32_t stride = 64, low_offset = 16, entries = 16385;
+  constexpr uint32_t second_chunk = 16384;
+  constexpr uint64_t table_bytes = uint64_t{stride} * entries;
+  constexpr uint64_t callee_a = base + 0x110000, callee_b = base + 0x110040;
+  static_assert(second_chunk * stride == 0x100000u);
+  // v_readfirstlane_b32 s4, v0 ; s_mul_i32 s4, s4, 64
+  // s_buffer_load_dwordx2 s[14:15], s[0:3], s4 offset:16 ; s_swappc_b64 s[14:15], s[14:15] ; s_endpgm
+  const uint32_t shader[] = {EncodeVop1(0x02, 4, 256), EncodeSop2(0x26, 4, 4, 128 + stride),
+      EncodeSmem0(0x09, 14, 0), (4u << 25u) | low_offset, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  struct Memory {
+    std::vector<uint32_t> words = std::vector<uint32_t>(0x110080 / 4);
+  } memory;
+  const auto set_entry = [&](uint32_t entry, uint64_t target) {
+    const auto word = (entry * stride + low_offset) / 4u;
+    memory.words[word] = static_cast<uint32_t>(target);
+    memory.words[word + 1u] = static_cast<uint32_t>(target >> 32u);
+  };
+  set_entry(0, callee_a);
+  set_entry(second_chunk, callee_b);
+  for (const auto callee : {callee_a, callee_b}) {
+    const auto word = (callee - base) / 4u;
+    memory.words[word] = EncodeSMovB32(5, 255);
+    memory.words[word + 1u] = static_cast<uint32_t>(callee);
+    memory.words[word + 2u] = EncodeSop1(0x21, 125, 14);
+  }
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    const auto end = base + m.words.size() * sizeof(uint32_t);
+    if (address < base || address > end || out.size_bytes() > end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[0] = static_cast<uint32_t>(base);
+  user_data[1] = static_cast<uint32_t>(base >> 32u); // stride 0: records are bytes
+  user_data[2] = static_cast<uint32_t>(table_bytes);
+  user_data[3] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.function_table_calls = true;
+  options.user_data = user_data;
+  IR::SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                         .read_specialization_memory = read};
+
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.unsupported_call_pc == UINT32_MAX && source.calls.size() == 1 &&
+            source.calls[0].table && source.calls[0].table->stride == stride &&
+            source.calls[0].table->low_offset == low_offset,
+        "multiplied function-table index was not recognized");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(source.calls[0].table_targets == std::vector<uint64_t>{callee_a, callee_b},
+        "function-table entry in the second read chunk was skipped");
+  // Two live entries synthesize a dispatcher: SCC is saved once, each entry compares both words,
+  // restores SCC and calls its own linked body.
+  const auto call = linked.instructions[source.calls[0].instruction];
+  Check(call.opcode == Decoder::Opcode::S_BRANCH &&
+            call.branch_target == source.code.size() * sizeof(uint32_t),
+        "table call did not branch to the dispatcher");
+  Check(std::ranges::count_if(linked.instructions, [](const auto& inst) {
+          return inst.opcode == Decoder::Opcode::S_CMP_LG_U32;
+        }) == 4 &&
+            std::ranges::count_if(linked.instructions, [](const auto& inst) {
+              return inst.opcode == Decoder::Opcode::S_SWAPPC_B64;
+            }) == 2,
+        "dispatcher did not compare both words and call one body per target");
+  (void)TranslateProgram(linked, options);
+
+  // v_readfirstlane_b32 s14, v0 ; v_readfirstlane_b32 s15, v1 ; s_swappc_b64 s[14:15], s[14:15]
+  const uint32_t lane_target[] = {EncodeVop1(0x02, 14, 256), EncodeVop1(0x02, 15, 257),
+      EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  const auto skipped = PrepareShaderSource(lane_target, options);
+  Check(skipped.unsupported_call_pc == 8u && skipped.calls.empty(),
+        "GPU-computed call target without a table did not take the dispatch-skip fallback");
+}
+
+// A 32-bit index product wraps modulo 2^32. A non-power-of-two stride can therefore select an
+// offset that is not on the stride grid, so recognition must reject it rather than link the
+// scanned target for every call.
+void TestFunctionTableNonPowerOfTwoStrideRejected() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe00a0000ull;
+  constexpr uint32_t stride = 12;
+  constexpr uint32_t wrapped_index = 357913942u; // * 12 wraps to offset 8
+  static_assert(wrapped_index * stride == 8u);
+  // v_readfirstlane_b32 s4, v0 ; s_mul_i32 s4, s4, 12
+  // s_buffer_load_dwordx2 s[14:15], s[0:3], s4 ; s_swappc_b64 s[14:15], s[14:15] ; s_endpgm
+  const uint32_t shader[] = {EncodeVop1(0x02, 4, 256), EncodeSop2(0x26, 4, 4, 128 + stride),
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  std::array<uint32_t, 64> user_data{};
+  user_data[0] = static_cast<uint32_t>(base);
+  user_data[1] = static_cast<uint32_t>(base >> 32u);
+  user_data[2] = 24; // two 12-byte entries
+  user_data[3] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.function_table_calls = true;
+  options.user_data = user_data;
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.unsupported_call_pc == 16u && source.calls.empty(),
+        "wrapping non-power-of-two table stride was not rejected");
+}
+
+void TestFunctionTableSingleTargetAndEmpty() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0090000ull;
+  constexpr uint64_t callee = base + 0x100;
+  // v_readfirstlane_b32 s4, v0 ; s_lshl_b32 s4, s4, 4
+  // s_buffer_load_dwordx2 s[14:15], s[0:3], s4 ; s_swappc_b64 s[14:15], s[14:15] ; s_endpgm
+  const uint32_t shader[] = {EncodeVop1(0x02, 4, 256), EncodeSop2(0x1e, 4, 4, 132),
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 128> words{};
+    uint64_t end = base + 0x10c;
+  } memory;
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    if (address < base || address > m.end || out.size_bytes() > m.end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[0] = static_cast<uint32_t>(base);
+  user_data[1] = static_cast<uint32_t>(base >> 32u);
+  user_data[2] = 16; // one 16-byte entry
+  user_data[3] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.function_table_calls = true;
+  options.user_data = user_data;
+  IR::SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                         .read_specialization_memory = read};
+
+  memory.words[0] = static_cast<uint32_t>(callee);
+  memory.words[1] = static_cast<uint32_t>(callee >> 32u);
+  memory.words[0x40] = EncodeSMovB32(5, 255);
+  memory.words[0x41] = 0x11111111u;
+  memory.words[0x42] = EncodeSop1(0x21, 125, 14);
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.unsupported_call_pc == UINT32_MAX && source.calls.size() == 1 &&
+            source.calls[0].table && source.calls[0].table->stride == 16,
+        "single-entry function table was not recognized");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(source.calls[0].table_targets == std::vector<uint64_t>{callee} &&
+            source.linked->callees == std::vector<uint64_t>{callee},
+        "single-entry function table was not reduced to one callee");
+  const auto& native = linked.instructions[source.calls[0].instruction];
+  Check(native.opcode == Decoder::Opcode::S_SWAPPC_B64 && native.branch_target == 24u,
+        "single-entry table call was not linked directly");
+  Check(std::ranges::none_of(linked.instructions, [](const auto& inst) {
+          return inst.opcode == Decoder::Opcode::S_CMP_LG_U32;
+        }),
+        "single-entry table synthesized a dispatcher");
+  (void)TranslateProgram(linked, options);
+
+  // An empty table cannot be linked: the caller must skip the dispatch instead of running a
+  // shader whose call would be dropped.
+  memory.words[0] = 0;
+  memory.words[1] = 0;
+  auto empty = PrepareShaderSource(shader, options);
+  (void)RefreshShaderSource(empty, runtime);
+  Check(empty.unlinkable_call_pc != UINT32_MAX && empty.unsupported_call_pc == UINT32_MAX &&
+            !empty.linked.has_value() && empty.revision == 0,
+        "empty function table did not take the dispatch-skip fallback");
+  // A table that cannot be read at refresh time is a retryable skip, not a fatal error.
+  auto unreadable = PrepareShaderSource(shader, options);
+  const auto saved_end = memory.end;
+  memory.end = base;
+  (void)RefreshShaderSource(unreadable, runtime);
+  Check(unreadable.unlinkable_call_pc != UINT32_MAX &&
+            unreadable.unsupported_call_pc == UINT32_MAX && !unreadable.linked.has_value(),
+        "unreadable function table did not take the dispatch-skip fallback");
+  memory.end = saved_end;
+  // The table is re-read on every refresh, so an upload after the first build still links.
+  memory.words[0] = static_cast<uint32_t>(callee);
+  memory.words[1] = static_cast<uint32_t>(callee >> 32u);
+  (void)RefreshShaderSource(empty, runtime);
+  Check(empty.unlinkable_call_pc == UINT32_MAX && empty.linked.has_value() &&
+            empty.linked->callees == std::vector<uint64_t>{callee},
+        "populated function table was not linked on a later refresh");
+  // A table that reads but whose leaf code is not mapped is a retryable skip.
+  auto       unreadable_leaf = PrepareShaderSource(shader, options);
+  const auto saved_leaf_end  = memory.end;
+  memory.end                 = base + 0x80;
+  (void)RefreshShaderSource(unreadable_leaf, runtime);
+  Check(unreadable_leaf.unlinkable_call_pc != UINT32_MAX &&
+            !unreadable_leaf.linked.has_value(),
+        "unreadable table callee was not a retryable skip");
+  memory.end = saved_leaf_end;
+  (void)RefreshShaderSource(unreadable_leaf, runtime);
+  Check(unreadable_leaf.unlinkable_call_pc == UINT32_MAX &&
+            unreadable_leaf.linked.has_value(),
+        "table callee did not link after its code became readable");
 }
 
 void TestFusedShaderHandoffPreservesRegisters() {
@@ -13746,6 +14080,10 @@ int main() {
   TestNewShaderRecompilerSetpcLongBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestFunctionTableLeafCall();
+  TestFunctionTableChunkBoundary();
+  TestFunctionTableNonPowerOfTwoStrideRejected();
+  TestFunctionTableSingleTargetAndEmpty();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

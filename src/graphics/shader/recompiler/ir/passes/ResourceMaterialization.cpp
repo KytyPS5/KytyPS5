@@ -1631,7 +1631,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          bool* retry) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1747,13 +1748,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
-	if (validate_buffer_keys) {
-		// Only the resolved destinations can write. Check after all indirect children exist.
-		for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
-			const auto root = i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
-			const auto& resource = program.info.buffers[root];
-			if (resource.written && BufferWriteOverlaps(resource, snapshot.buffers[i], reads))
-				return SpecializationFail("buffer write overlaps its descriptor selection");
+	// Only the resolved destinations can write. Check after all indirect children exist.
+	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
+		const auto root = i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
+		const auto& resource = program.info.buffers[root];
+		if (!resource.written) continue;
+		if (validate_buffer_keys && BufferWriteOverlaps(resource, snapshot.buffers[i], reads))
+			return SpecializationFail("buffer write overlaps its descriptor selection");
+		// A linked call resolves its target from the function table. A store into that range
+		// would make the shader run the refresh-time link instead of the target it loaded, so
+		// reject the dispatch; the next dispatch refreshes the table and re-links.
+		if (!program.call_table_reads.empty() &&
+		    BufferWriteOverlaps(resource, snapshot.buffers[i], program.call_table_reads)) {
+			if (retry != nullptr) *retry = true;
+			return SpecializationFail("buffer write overlaps a captured call table");
 		}
 	}
 	snapshot.images.resize(program.info.images.size());
@@ -2188,14 +2196,16 @@ void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
 // Binds every plan field: one added later fails to compile here until it is stored or derived.
 template <class S, class P> void IoPlan(S& io, P& plan) {
 	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info, descriptor_sources,
-	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
-	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
+	       selector_groups, control_flow, control_phis, srt_reads, source_reads, call_table_reads,
+	       capture_specialization_reads, srt_plan_complete, resource_tracking_complete, info,
+	       uniform_fill,
 	       // Derived on load.
 	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
-	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,
-	      srt_plan_complete, resource_tracking_complete, info, uniform_fill);
+	      selector_groups, control_flow, srt_reads, source_reads, call_table_reads,
+	      capture_specialization_reads, srt_plan_complete, resource_tracking_complete, info,
+	      uniform_fill);
 }
 
 } // namespace

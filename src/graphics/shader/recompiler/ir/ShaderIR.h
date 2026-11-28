@@ -728,6 +728,9 @@ struct ResourcePlan {
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
+	// Function-table ranges a linked call was resolved from. A write overlapping one of them
+	// makes the linked target stale, so the dispatch must be rejected.
+	std::vector<std::pair<uint64_t, uint64_t>> call_table_reads;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;

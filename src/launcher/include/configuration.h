@@ -131,6 +131,7 @@ public:
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	int                    flush_draws                 = 0;
+	bool                   function_table_calls        = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
@@ -185,6 +186,7 @@ public:
 		readback_storage_images     = other.readback_storage_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		flush_draws                 = other.flush_draws;
+		function_table_calls        = other.function_table_calls;
 		tessellation_enabled        = other.tessellation_enabled;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		relaxed_shader_float        = other.relaxed_shader_float;
